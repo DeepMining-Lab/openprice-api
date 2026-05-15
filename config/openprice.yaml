@@ -1,0 +1,43 @@
+api:
+  name: "OpenPrice API"
+  version: "0.1.0"
+  default_limit: 1000
+  max_limit: 10000
+
+paths:
+  datasets_root: "~/openprice/datasets"
+
+thresholds:
+  seuil_TVL_min_usd: 1000000
+  seuil_vol_min_usd_24h: 10000
+  fenetre_inactivite_jours: 30
+  min_swaps_for_stat_score: 3
+  s_stat_floor: 0.2
+  slip_reference_order_usd: 1000
+  slip_max: 0.005
+  sigma_mad: 3.5
+  cross_rate_max_lag_seconds: 3600
+  chainlink_default_heartbeat_seconds: 86400
+
+confidence_weights:
+  w_stat: 0.3333333333
+  w_liq: 0.3333333333
+  w_coh: 0.3333333334
+
+chainlink:
+  default_deviation_threshold: 0.005
+  deviation_threshold_by_asset:
+    ETH: 0.005
+    LINK: 0.005
+    UNI: 0.005
+    AAVE: 0.005
+    COMP: 0.01
+  heartbeat_seconds_by_asset:
+    ETH: 86400
+    LINK: 86400
+    UNI: 86400
+    AAVE: 86400
+    COMP: 86400
+
+scoring:
+  tvl_score_mode: "linear_to_threshold"
