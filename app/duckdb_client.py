@@ -115,13 +115,17 @@ def range_query(
     limit: int,
     timestamp_col: str = "timestamp",
 ) -> list[dict[str, Any]]:
-    """Return rows between start and end."""
+    """Return rows where start <= timestamp < end (right-exclusive).
+
+    The right-exclusive convention prevents a swap exactly on a window boundary
+    from being attributed to two consecutive windows simultaneously.
+    """
     safe_cols = ", ".join(f'"{c}"' for c in columns)
     ts = _ts_cast(timestamp_col)
     src = _src(str(path))
     sql = (
         f'SELECT {safe_cols} FROM {src} '
-        f'WHERE {ts} BETWEEN ? AND ? '
+        f'WHERE {ts} >= ? AND {ts} < ? '
         f'ORDER BY {ts} LIMIT ?'
     )
     con = _conn()
@@ -135,8 +139,33 @@ def count_rows_in_range(
     end: datetime,
     timestamp_col: str = "timestamp",
 ) -> int:
+    """Count rows where start <= timestamp <= end (both inclusive).
+
+    Used for activity checks (b_ref(T) semantics: observations up to and
+    including T are considered current). Not used for VWMP windows.
+    """
     ts = _ts_cast(timestamp_col)
     src = _src(str(path))
     sql = f'SELECT COUNT(*) FROM {src} WHERE {ts} BETWEEN ? AND ?'
     con = _conn()
     return con.execute(sql, [start, end]).fetchone()[0]  # type: ignore[index]
+
+
+def sum_column_in_range(
+    path: Path,
+    col: str,
+    start: datetime,
+    end: datetime,
+    timestamp_col: str = "timestamp",
+) -> float | None:
+    """Return SUM(col) for rows in [start, end], or None when no rows match.
+
+    Uses TRY_CAST so non-numeric values are silently treated as NULL rather
+    than raising an error (consistent with strict_mode=false elsewhere).
+    """
+    ts = _ts_cast(timestamp_col)
+    src = _src(str(path))
+    sql = f'SELECT SUM(TRY_CAST("{col}" AS DOUBLE)) FROM {src} WHERE {ts} BETWEEN ? AND ?'
+    con = _conn()
+    result = con.execute(sql, [start, end]).fetchone()[0]  # type: ignore[index]
+    return float(result) if result is not None else None

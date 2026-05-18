@@ -19,12 +19,11 @@ The API selects the best available price source by trying levels in order until 
 | Level | Label | Description |
 |-------|-------|-------------|
 | `0a` | `direct_stable` | TOKEN/USDC or TOKEN/USDT Uniswap V3 pool — highest-TVL non-zombie pool wins |
-| `0b` | `cross_rate` | TOKEN/WETH × WETH/USD cross-rate — both legs matched as-of timestamp |
-| `2` | `alternative_amm` | Curve or SushiSwap pool (asset-specific) |
+| `0b` | `cross_rate` | TOKEN/WETH × WETH/USD cross-rate, Uniswap V3 — both legs matched as-of timestamp |
+| `1` | `alternative_pool` | Same pair on Uniswap V2 — direct stable (ETH) or cross-rate (others); same endogenous auditability, older protocol version |
+| `2` | `alternative_amm` | Curve (ETH via crvUSD/WETH, inverted) or SushiSwap TOKEN/ETH cross-rate for other assets |
 | `3` | `chainlink_fallback` | Chainlink oracle — latest observation at or before `T` |
 | `4` | `unavailable` | Explicit NULL — no reliable source found |
-
-Level `1` (alternative Uniswap pool) is treated as a candidate within the `0a`/`0b` pool selection logic rather than a separate fallback step.
 
 ### Zombie pool rules
 

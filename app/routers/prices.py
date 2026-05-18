@@ -152,6 +152,7 @@ def _to_response(
         branch_label=result.branch_label,
         data_status=result.data_status,
         granularity=granularity,
+        n_raw=result.n_raw,
         swap_count=result.swap_count,
         window_seconds=result.window_seconds,
         unavailable_reason=result.unavailable_reason,

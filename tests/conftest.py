@@ -133,14 +133,14 @@ def client(cfg, tmp_dataset_root, monkeypatch):
     """FastAPI test client with patched config and registry paths."""
     from fastapi.testclient import TestClient
 
-    # Patch registry to resolve paths under tmp_dataset_root
-    import app.registry as reg_module
-    orig_get_config = config_module.get_config
-    monkeypatch.setattr(config_module, "get_config", lambda: cfg)
-    monkeypatch.setattr(reg_module, "get_config", lambda: cfg)
-
+    # Import app.main FIRST so all routers bind get_config to the original function,
+    # not to a monkeypatched lambda.  If we patched config_module.get_config before
+    # this import, prices.py (and other routers) would permanently capture the lambda.
     from app.main import app
+
+    # Patch _config directly.  All get_config() calls use the original function which
+    # reads _config, so this single patch is sufficient for every router and service.
+    monkeypatch.setattr(config_module, "_config", cfg)
+
     with TestClient(app) as c:
         yield c
-
-    monkeypatch.setattr(config_module, "get_config", orig_get_config)

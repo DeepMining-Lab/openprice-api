@@ -18,6 +18,7 @@ def build_provenance(result: PriceResult, extra_warnings: list[Warning] | None =
         token_leg_timestamp=result.token_leg_timestamp,
         eth_usd_leg_timestamp=result.eth_usd_leg_timestamp,
         cross_rate_lag_seconds=result.cross_rate_lag_seconds,
+        n_raw=result.n_raw,
         swap_count=result.swap_count,
         window_seconds=result.window_seconds,
         excluded_swaps=result.excluded_swaps,

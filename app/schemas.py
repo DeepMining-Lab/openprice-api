@@ -33,6 +33,7 @@ class Provenance(BaseModel):
     token_leg_timestamp: datetime | None = None
     eth_usd_leg_timestamp: datetime | None = None
     cross_rate_lag_seconds: float | None = None
+    n_raw: int | None = None
     swap_count: int | None = None
     window_seconds: float | None = None
     excluded_swaps: int | None = None
@@ -50,6 +51,7 @@ class PriceResponse(BaseModel):
     branch_label: str
     data_status: str
     granularity: str = "raw"
+    n_raw: int | None = None
     swap_count: int | None = None
     window_seconds: float | None = None
     unavailable_reason: str | None = None
