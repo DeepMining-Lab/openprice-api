@@ -424,17 +424,16 @@ def _try_level_0a_windowed(
 ) -> PriceResult | None:
     """Level 0a using VWMP over a symmetric window around T.
 
-    Pool selection (best non-zombie by TVL) uses a point read at T,
-    then all swaps in the window are collected for VWMP computation.
-    Window is expanded per R1 if no swaps are found.
+    All viable (non-zombie, recently active) pools are collected and sorted
+    by TVL descending.  For each pool, R1 window expansion is attempted in
+    order.  The first pool that yields at least one swap in some window wins.
+    Only if every pool fails every window does the function return None,
+    letting the caller fall through to level 0b.
     """
     candidates = registry.get_level_0a_paths(asset)
 
-    best_path: Path | None = None
-    best_tvl = -1.0
-    best_schema: csv_adapter.SchemaInfo | None = None
-    best_viability_row: dict[str, Any] | None = None
-    pool_warnings: list[Warning] = []
+    # Collect all viable pools with their viability metadata
+    viable: list[tuple[float, Path, csv_adapter.SchemaInfo, dict[str, Any], list[Warning]]] = []
 
     for path in candidates:
         if not path.exists():
@@ -467,97 +466,93 @@ def _try_level_0a_windowed(
         except (ValueError, TypeError):
             tvl = 0.0
 
-        if tvl > best_tvl or best_path is None:
-            best_tvl = tvl
-            best_path = path
-            best_schema = schema
-            best_viability_row = viability_row
-            pool_warnings = z_warns
+        viable.append((tvl, path, schema, viability_row, z_warns))
 
-    if best_path is None or best_schema is None:
-        return None
+    # Highest-TVL pool tried first; if it has no data in any R1 window,
+    # the next viable pool is attempted before giving up on level 0a.
+    viable.sort(key=lambda x: x[0], reverse=True)
 
-    schema = best_schema
-    ts_col = schema.mapping.get("timestamp")
-    price_col = schema.mapping.get("price_usd")
-    vol_col = schema.mapping.get("volume_usd")
-    slip_col = schema.mapping.get("slippage")
-    tvl_col = schema.mapping.get("tvl_usd")
+    for tvl, best_path, schema, best_viability_row, pool_warnings in viable:
+        ts_col = schema.mapping.get("timestamp")
+        price_col = schema.mapping.get("price_usd")
+        vol_col = schema.mapping.get("volume_usd")
+        slip_col = schema.mapping.get("slippage")
+        tvl_col = schema.mapping.get("tvl_usd")
 
-    cols = [ts_col, price_col]
-    for c in (vol_col, slip_col, tvl_col):
-        if c:
-            cols.append(c)
+        cols = [ts_col, price_col]
+        for c in (vol_col, slip_col, tvl_col):
+            if c:
+                cols.append(c)
 
-    for window_s in _WINDOW_STEPS[granularity]:
-        half = window_s / 2.0
-        w_start = timestamp - timedelta(seconds=half)
-        w_end = timestamp + timedelta(seconds=half)
+        for window_s in _WINDOW_STEPS[granularity]:
+            half = window_s / 2.0
+            w_start = timestamp - timedelta(seconds=half)
+            w_end = timestamp + timedelta(seconds=half)
 
-        rows = duckdb_client.range_query(best_path, w_start, w_end, cols, cfg.api.max_limit, ts_col)
-        if not rows:
-            continue
+            rows = duckdb_client.range_query(best_path, w_start, w_end, cols, cfg.api.max_limit, ts_col)
+            if not rows:
+                continue
 
-        prices = [float(r[price_col]) for r in rows if r.get(price_col) is not None]
-        volumes = (
-            [float(r[vol_col]) if r.get(vol_col) is not None else 1.0
-             for r in rows if r.get(price_col) is not None]
-            if vol_col else [1.0] * len(prices)
-        )
-        if not prices:
-            continue
+            prices = [float(r[price_col]) for r in rows if r.get(price_col) is not None]
+            volumes = (
+                [float(r[vol_col]) if r.get(vol_col) is not None else 1.0
+                 for r in rows if r.get(price_col) is not None]
+                if vol_col else [1.0] * len(prices)
+            )
+            if not prices:
+                continue
 
-        prices_clean, volumes_clean, excluded = _filter_mad_outliers(
-            prices, volumes, cfg.thresholds.sigma_mad
-        )
-        warns: list[Warning] = list(pool_warnings)
+            prices_clean, volumes_clean, excluded = _filter_mad_outliers(
+                prices, volumes, cfg.thresholds.sigma_mad
+            )
+            warns: list[Warning] = list(pool_warnings)
 
-        if excluded > 0:
-            warns.append(Warning(
-                code="mad_outliers_excluded",
-                message=f"{excluded} swap(s) excluded by MAD filter (sigma_mad={cfg.thresholds.sigma_mad}).",
-            ))
-        if not prices_clean:
-            prices_clean, volumes_clean = prices, volumes
-            warns.append(Warning(
-                code="mad_filter_fallback",
-                message="All swaps flagged by MAD filter; using unfiltered data.",
-            ))
-        if len(prices_clean) < cfg.thresholds.min_swaps_for_stat_score:
-            warns.append(Warning(
-                code="low_swap_count",
-                message=(
-                    f"Only {len(prices_clean)} clean swap(s) in window "
-                    f"(recommended min: {cfg.thresholds.min_swaps_for_stat_score})."
-                ),
-                severity="info",
-            ))
+            if excluded > 0:
+                warns.append(Warning(
+                    code="mad_outliers_excluded",
+                    message=f"{excluded} swap(s) excluded by MAD filter (sigma_mad={cfg.thresholds.sigma_mad}).",
+                ))
+            if not prices_clean:
+                prices_clean, volumes_clean = prices, volumes
+                warns.append(Warning(
+                    code="mad_filter_fallback",
+                    message="All swaps flagged by MAD filter; using unfiltered data.",
+                ))
+            if len(prices_clean) < cfg.thresholds.min_swaps_for_stat_score:
+                warns.append(Warning(
+                    code="low_swap_count",
+                    message=(
+                        f"Only {len(prices_clean)} clean swap(s) in window "
+                        f"(recommended min: {cfg.thresholds.min_swaps_for_stat_score})."
+                    ),
+                    severity="info",
+                ))
 
-        price_vwmp = _compute_vwmp(prices_clean, volumes_clean)
-        if price_vwmp is None:
-            continue
+            price_vwmp = _compute_vwmp(prices_clean, volumes_clean)
+            if price_vwmp is None:
+                continue
 
-        rel = str(best_path.relative_to(cfg.paths.datasets_path))
-        return PriceResult(
-            price_usd=price_vwmp,
-            timestamp_observed=timestamp,
-            branch_level="0a",
-            branch_label="direct_stable",
-            data_status="observed",
-            files_used=[rel],
-            calculation_path=[
-                f"VWMP({len(prices_clean)} swaps, window ±{half:.0f}s)",
-                "Direct stablecoin VWMP",
-            ],
-            detected_columns={best_path.name: schema.raw_columns},
-            source_row=best_viability_row,
-            source_schema=schema,
-            warnings=warns,
-            granularity=granularity,
-            swap_count=len(prices_clean),
-            window_seconds=float(window_s),
-            excluded_swaps=excluded,
-        )
+            rel = str(best_path.relative_to(cfg.paths.datasets_path))
+            return PriceResult(
+                price_usd=price_vwmp,
+                timestamp_observed=timestamp,
+                branch_level="0a",
+                branch_label="direct_stable",
+                data_status="observed",
+                files_used=[rel],
+                calculation_path=[
+                    f"VWMP({len(prices_clean)} swaps, window ±{half:.0f}s)",
+                    "Direct stablecoin VWMP",
+                ],
+                detected_columns={best_path.name: schema.raw_columns},
+                source_row=best_viability_row,
+                source_schema=schema,
+                warnings=warns,
+                granularity=granularity,
+                swap_count=len(prices_clean),
+                window_seconds=float(window_s),
+                excluded_swaps=excluded,
+            )
 
     return None
 
