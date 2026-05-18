@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 from fastapi import APIRouter, HTTPException, Query
@@ -22,6 +22,7 @@ router = APIRouter(prefix="/v1")
 
 VALID_BRANCHES = {"auto", "0a", "0b", "1", "2", "3", "4"}
 VALID_SOURCES = {"auto", "dex", "chainlink"}
+VALID_GRANULARITIES = {"raw", "minute", "hour", "day"}
 
 
 def _validate_asset(asset: str) -> str:
@@ -41,6 +42,15 @@ def _validate_source(source: str) -> str:
     if source not in VALID_SOURCES:
         raise HTTPException(status_code=422, detail=f"Invalid source '{source}'. Valid: {sorted(VALID_SOURCES)}")
     return source
+
+
+def _validate_granularity(granularity: str) -> str:
+    if granularity not in VALID_GRANULARITIES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Invalid granularity '{granularity}'. Valid: {sorted(VALID_GRANULARITIES)}",
+        )
+    return granularity
 
 
 def _build_confidence(
@@ -117,6 +127,7 @@ def _to_response(
     include_confidence: bool,
     include_provenance: bool,
     cfg,
+    granularity: str = "raw",
 ) -> PriceResponse:
     confidence = None
     if include_confidence and result.price_usd is not None:
@@ -140,6 +151,9 @@ def _to_response(
         branch_level=result.branch_level,
         branch_label=result.branch_label,
         data_status=result.data_status,
+        granularity=granularity,
+        swap_count=result.swap_count,
+        window_seconds=result.window_seconds,
         unavailable_reason=result.unavailable_reason,
         confidence=confidence,
         provenance=provenance,
@@ -154,17 +168,17 @@ def _to_response(
     description=(
         "Returns the best available price for the given asset at or before `timestamp`, "
         "following the source hierarchy `0a → 0b → 2 → 3 → 4`.\n\n"
+        "**Granularity:**\n"
+        "- `raw` (default) — latest single observation at or before T\n"
+        "- `minute` — VWMP over T ± 30 s; expands to ± 1 min, 2.5 min, 7.5 min if empty\n"
+        "- `hour` — VWMP over T ± 30 min; expands to ± 1 h, 2 h, 4 h if empty\n"
+        "- `day` — VWMP over T ± 12 h; no expansion (falls to next source level)\n\n"
         "**Source hierarchy:**\n"
         "- `0a` — Direct TOKEN/USDC or TOKEN/USDT pool (Uniswap V3)\n"
-        "- `0b` — Cross-rate TOKEN/WETH × WETH/USD\n"
+        "- `0b` — Cross-rate TOKEN/WETH VWMP × WETH/USD point read\n"
         "- `2` — Alternative AMM (Curve, SushiSwap)\n"
-        "- `3` — Chainlink oracle fallback\n"
+        "- `3` — Chainlink oracle fallback (always a point read)\n"
         "- `4` — Explicit NULL (no reliable source)\n\n"
-        "**Optional parameters:**\n"
-        "- `source`: `auto` (default) | `dex` (DEX only) | `chainlink` (oracle only)\n"
-        "- `branch`: `auto` | `0a` | `0b` | `2` | `3` | `4` — force a specific level\n"
-        "- `include_confidence`: add S_stat, S_liq, S_coh sub-scores and final score\n"
-        "- `include_provenance`: add files used, calculation path, timestamps, and lags\n\n"
         "When no reliable source is available, returns `price_usd: null` and "
         "`data_status: unavailable` with an `unavailable_reason`."
     ),
@@ -175,19 +189,21 @@ def price_at(
     timestamp: datetime = Query(..., description="ISO 8601 timestamp (e.g. 2024-01-01T00:00:00Z)"),
     source: str = Query("auto", description="Source filter: auto | dex | chainlink"),
     branch: str = Query("auto", description="Force source level: auto | 0a | 0b | 2 | 3 | 4"),
+    granularity: str = Query("raw", description="Price granularity: raw | minute | hour | day"),
     include_confidence: bool = Query(True, description="Include S_stat, S_liq, S_coh confidence sub-scores"),
     include_provenance: bool = Query(True, description="Include files used, calculation path, and lags"),
 ):
     asset = _validate_asset(asset)
     branch = _validate_branch(branch)
     source = _validate_source(source)
+    granularity = _validate_granularity(granularity)
     cfg = get_config()
 
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
 
-    result = price_service.get_price_at(asset, timestamp, cfg, branch=branch, source=source)
-    return _to_response(asset, timestamp, result, include_confidence, include_provenance, cfg)
+    result = price_service.get_price_at(asset, timestamp, cfg, branch=branch, source=source, granularity=granularity)
+    return _to_response(asset, timestamp, result, include_confidence, include_provenance, cfg, granularity)
 
 
 @router.get(
@@ -195,12 +211,14 @@ def price_at(
     response_model=list[PriceResponse],
     summary="Price time series over a date range",
     description=(
-        "Returns a list of price observations for the given asset between `start` and `end`. "
-        "Timestamps are taken directly from the CSV of the winning source (`granularity=raw`); "
-        "no synthetic resampling is performed.\n\n"
+        "Returns a list of price observations for the given asset between `start` and `end`.\n\n"
+        "**Granularity behaviour:**\n"
+        "- `raw` (default) — timestamps from the winning source CSV; no resampling\n"
+        "- `minute` — one VWMP point per minute from `start` to `end`\n"
+        "- `hour` — one VWMP point per hour from `start` to `end`\n"
+        "- `day` — one VWMP point per day from `start` to `end`\n\n"
         "Results are capped at `limit` (max 10 000). "
-        "Confidence and provenance are disabled by default for performance — enable them with "
-        "`include_confidence=true` and `include_provenance=true`."
+        "Confidence and provenance are disabled by default for performance."
     ),
     tags=["Prices"],
 )
@@ -211,13 +229,14 @@ def price_range(
     limit: int = Query(1000, description="Maximum number of rows to return (hard cap: 10 000)"),
     source: str = Query("auto", description="Source filter: auto | dex | chainlink"),
     branch: str = Query("auto", description="Force source level: auto | 0a | 0b | 2 | 3 | 4"),
+    granularity: str = Query("raw", description="Granularity: raw | minute | hour | day"),
     include_confidence: bool = Query(False, description="Include confidence sub-scores (slower)"),
     include_provenance: bool = Query(False, description="Include full provenance for each point"),
-    granularity: str = Query("raw", description="Only 'raw' is supported in this PoC"),
 ):
     asset = _validate_asset(asset)
     branch = _validate_branch(branch)
     source = _validate_source(source)
+    granularity = _validate_granularity(granularity)
     cfg = get_config()
 
     if start.tzinfo is None:
@@ -227,14 +246,23 @@ def price_range(
 
     limit = min(limit, cfg.api.max_limit)
 
-    # Collect timestamps from the best source file for this asset/branch
-    # For raw granularity: use timestamps from the winning source's CSV
-    # We do a quick probe to find which branch would win and get its timestamps
+    if granularity != "raw":
+        # Generate evenly-spaced timestamps and compute VWMP at each point
+        step_map = {"minute": 60, "hour": 3600, "day": 86400}
+        step = timedelta(seconds=step_map[granularity])
+        ts = start
+        results = []
+        while ts <= end and len(results) < limit:
+            r = price_service.get_price_at(asset, ts, cfg, branch=branch, source=source, granularity=granularity)
+            results.append(_to_response(asset, ts, r, include_confidence, include_provenance, cfg, granularity))
+            ts += step
+        return results
+
+    # raw: enumerate timestamps from the winning source CSV
     probe = price_service.get_price_at(asset, end, cfg, branch=branch, source=source)
     if probe.branch_level == "4" or not probe.files_used:
         return []
 
-    # Use the first file of the winning branch to enumerate timestamps
     from app import duckdb_client as dc
     first_path = registry.resolve_path(probe.files_used[0])
     if not first_path.exists():
@@ -253,5 +281,5 @@ def price_range(
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
         r = price_service.get_price_at(asset, ts, cfg, branch=branch, source=source)
-        results.append(_to_response(asset, ts, r, include_confidence, include_provenance, cfg))
+        results.append(_to_response(asset, ts, r, include_confidence, include_provenance, cfg, granularity))
     return results

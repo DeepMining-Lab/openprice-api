@@ -33,6 +33,9 @@ class Provenance(BaseModel):
     token_leg_timestamp: datetime | None = None
     eth_usd_leg_timestamp: datetime | None = None
     cross_rate_lag_seconds: float | None = None
+    swap_count: int | None = None
+    window_seconds: float | None = None
+    excluded_swaps: int | None = None
     parameters: dict[str, Any] = {}
     detected_columns: dict[str, list[str]] = {}
     warnings: list[Warning] = []
@@ -46,6 +49,9 @@ class PriceResponse(BaseModel):
     branch_level: str
     branch_label: str
     data_status: str
+    granularity: str = "raw"
+    swap_count: int | None = None
+    window_seconds: float | None = None
     unavailable_reason: str | None = None
     confidence: ConfidenceDetail | None = None
     provenance: Provenance | None = None

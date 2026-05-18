@@ -40,6 +40,62 @@ When a required column is absent, the check is skipped and a warning is added to
 
 For level `0b`, both the TOKEN/WETH leg and the WETH/USD leg are matched using an as-of strategy (latest observation ≤ T). If the two legs are more than `cross_rate_max_lag_seconds` apart (default: 3600 s), the cross-rate is rejected and the API falls to the next level.
 
+## Granularity and VWMP
+
+The API supports four price-calculation modes controlled by the `granularity` parameter.
+
+| Granularity | Initial window | Symmetric window around T |
+|-------------|---------------|--------------------------|
+| `raw` | — | Latest single observation ≤ T (no aggregation) |
+| `minute` | 60 s | T ± 30 s |
+| `hour` | 3 600 s | T ± 30 min |
+| `day` | 86 400 s | T ± 12 h |
+
+Sub-minute granularity is intentionally excluded: Ethereum blocks are ~12 s apart, which makes a stable per-block price definition unreliable.
+
+### Price formula (minute / hour / day)
+
+For each `(asset, T, granularity)`, the pipeline:
+
+1. Selects the best non-zombie pool (same pool-selection logic as the source hierarchy).
+2. Queries all swaps in `[T − Δ/2, T + Δ/2]`.
+3. Applies the MAD outlier filter (which also removes MEV sandwich trades) with `sigma_mad` from config.
+4. Computes the **VWMP** — Volume-Weighted Median Price:
+
+```
+P(asset, T, g) = VWMP({ p_i, v_i }_{i=1..N})
+```
+
+where `p_i` is the implicit price of swap `i` and `v_i` its volume.  The VWMP is the price at which cumulative sorted volume first reaches ≥ 50 % of total volume.
+
+For level `0b`, only the TOKEN/WETH leg uses VWMP; the ETH/USD reference is always a point read from the WETH/USDC 0.05 % pool.
+
+### Window expansion (rule R1)
+
+If no swap is found in the initial window, the pipeline expands progressively:
+
+| Granularity | Expansion steps |
+|-------------|----------------|
+| `minute` | 60 s → 2 min → 5 min → 15 min |
+| `hour` | 1 h → 2 h → 4 h → 8 h |
+| `day` | no expansion — falls directly to the next source level |
+
+After all expansion steps are exhausted, the pipeline falls to the next branch level (`0a → 0b → 2 → 3 → 4`).
+
+### Response fields (windowed granularities)
+
+```json
+{
+  "granularity": "hour",
+  "swap_count": 12,
+  "window_seconds": 3600
+}
+```
+
+- `swap_count` — number of clean swaps used for the VWMP (after MAD filtering).
+- `window_seconds` — actual window size used (may be larger than the initial window if R1 fired).
+- `provenance.excluded_swaps` — number of swaps removed by the MAD filter.
+
 ## Confidence index
 
 Each price response optionally includes three sub-scores composed as a weighted geometric mean:
@@ -246,38 +302,12 @@ curl "http://127.0.0.1:8000/v1/prices/LINK/at?timestamp=2024-01-01T00:00:00Z&inc
   "branch_level": "0a",
   "branch_label": "direct_stable",
   "data_status": "observed",
+  "granularity": "raw",
+  "swap_count": null,
+  "window_seconds": null,
   "unavailable_reason": null,
-  "confidence": {
-    "score": 0.84,
-    "S_stat": 0.91,
-    "S_liq": 0.78,
-    "S_coh": 0.87,
-    "coherence_mode": null,
-    "weights": {"w_stat": 0.3333333333, "w_liq": 0.3333333333, "w_coh": 0.3333333334},
-    "parameters": {
-      "seuil_TVL_min_usd": 1000000,
-      "seuil_vol_min_usd_24h": 10000,
-      "fenetre_inactivite_jours": 30,
-      "sigma_mad": 3.5,
-      "slip_max": 0.005
-    },
-    "warnings": []
-  },
-  "provenance": {
-    "files_used": ["link/link_usdc_uniswap_v3_03.csv", "link/chainlink_link_usd.csv"],
-    "branch_level": "0a",
-    "branch_label": "direct_stable",
-    "calculation_path": ["direct LINK/USDC price"],
-    "token_leg_timestamp": null,
-    "eth_usd_leg_timestamp": null,
-    "cross_rate_lag_seconds": null,
-    "parameters": {
-      "seuil_TVL_min_usd": 1000000,
-      "seuil_vol_min_usd_24h": 10000,
-      "fenetre_inactivite_jours": 30
-    },
-    "warnings": []
-  },
+  "confidence": { ... },
+  "provenance": { ... },
   "warnings": []
 }
 ```
@@ -286,6 +316,7 @@ Optional query parameters:
 
 | Parameter | Values | Default | Description |
 |-----------|--------|---------|-------------|
+| `granularity` | `raw`, `minute`, `hour`, `day` | `raw` | Price calculation mode (see below) |
 | `source` | `auto`, `dex`, `chainlink` | `auto` | Restrict source type |
 | `branch` | `auto`, `0a`, `0b`, `2`, `3`, `4` | `auto` | Force a specific branch level |
 | `include_confidence` | `true`, `false` | `true` | Include S_stat, S_liq, S_coh |
@@ -306,14 +337,17 @@ When no reliable source is found:
 ### Price range
 
 ```bash
+# Raw timestamps from the source CSV
 curl "http://127.0.0.1:8000/v1/prices/UNI?start=2021-09-01&end=2021-09-02&limit=100"
+
+# One VWMP point per hour
+curl "http://127.0.0.1:8000/v1/prices/LINK?start=2024-01-01&end=2024-01-31&granularity=hour&limit=500"
+
+# One VWMP point per day with confidence scores
+curl "http://127.0.0.1:8000/v1/prices/LINK?start=2024-01-01&end=2024-01-31&granularity=day&include_confidence=true"
 ```
 
-Returns a list of `PriceResponse` objects at the raw timestamps present in the winning source CSV (no synthetic resampling). Confidence and provenance are disabled by default for performance.
-
-```bash
-curl "http://127.0.0.1:8000/v1/prices/LINK?start=2024-01-01&end=2024-01-31&limit=500&include_confidence=true"
-```
+With `granularity=raw` (default), timestamps come from the winning source CSV with no synthetic resampling. With `minute`, `hour`, or `day`, the API generates evenly-spaced timestamps from `start` to `end` and computes a VWMP at each point.
 
 ### Confidence only
 

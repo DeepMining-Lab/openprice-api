@@ -11,6 +11,14 @@ from app import csv_adapter, duckdb_client, registry
 from app.config import AppConfig
 from app.schemas import Warning
 
+# Window sizes in seconds for each expansion step (R1 rule).
+# Day has no expansion: falls directly to the next source level.
+_WINDOW_STEPS: dict[str, list[int]] = {
+    "minute": [60, 120, 300, 900],
+    "hour":   [3600, 7200, 14400, 28800],
+    "day":    [86400],
+}
+
 
 @dataclass
 class PriceResult:
@@ -29,6 +37,10 @@ class PriceResult:
     unavailable_reason: str | None = None
     source_row: dict[str, Any] | None = None
     source_schema: csv_adapter.SchemaInfo | None = None
+    granularity: str = "raw"
+    swap_count: int | None = None
+    window_seconds: float | None = None
+    excluded_swaps: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -88,6 +100,75 @@ def _is_recently_active(
     window_start = timestamp - timedelta(days=cfg.thresholds.fenetre_inactivite_jours)
     count = duckdb_client.count_rows_in_range(path, window_start, timestamp, ts_col)
     return count > 0
+
+
+# ---------------------------------------------------------------------------
+# VWMP and MAD utilities (windowed granularities)
+# ---------------------------------------------------------------------------
+
+def _compute_vwmp(prices: list[float], volumes: list[float]) -> float | None:
+    """Volume-Weighted Median Price.
+
+    Sort swaps by price; return the price where cumulative volume first reaches
+    >= 50 % of total volume.  This is the operational definition of VWMP used
+    in the research methodology (mémoire, 2026).
+    """
+    if not prices:
+        return None
+    if len(prices) == 1:
+        return prices[0]
+
+    total = sum(volumes)
+    if total <= 0:
+        sorted_prices = sorted(prices)
+        return sorted_prices[len(sorted_prices) // 2]
+
+    pairs = sorted(zip(prices, volumes), key=lambda x: x[0])
+    cumulative = 0.0
+    half = total / 2.0
+    for price, volume in pairs:
+        cumulative += volume
+        if cumulative >= half:
+            return price
+    return pairs[-1][0]
+
+
+def _filter_mad_outliers(
+    prices: list[float],
+    volumes: list[float],
+    sigma_mad: float,
+) -> tuple[list[float], list[float], int]:
+    """Remove price outliers via the modified Z-score (MAD) method.
+
+    Returns (kept_prices, kept_volumes, n_excluded).
+    Also filters MEV-like outliers because extreme sandwich prices have
+    z_MAD >> sigma_mad and are caught by the same criterion.
+    """
+    if len(prices) < 3:
+        return prices, volumes, 0
+
+    sorted_p = sorted(prices)
+    n = len(sorted_p)
+    median = sorted_p[n // 2]
+    abs_devs = [abs(p - median) for p in prices]
+    sorted_devs = sorted(abs_devs)
+    mad = sorted_devs[n // 2]
+
+    if mad == 0:
+        return prices, volumes, 0
+
+    kept_p: list[float] = []
+    kept_v: list[float] = []
+    excluded = 0
+    for p, v, dev in zip(prices, volumes, abs_devs):
+        z = 0.6745 * dev / mad
+        if z <= sigma_mad:
+            kept_p.append(p)
+            kept_v.append(v)
+        else:
+            excluded += 1
+
+    return kept_p, kept_v, excluded
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +413,398 @@ def _try_level_3(asset: str, timestamp: datetime, cfg: AppConfig) -> PriceResult
 
 
 # ---------------------------------------------------------------------------
+# Windowed VWMP variants (granularity = minute | hour | day)
+# ---------------------------------------------------------------------------
+
+def _try_level_0a_windowed(
+    asset: str,
+    timestamp: datetime,
+    cfg: AppConfig,
+    granularity: str,
+) -> PriceResult | None:
+    """Level 0a using VWMP over a symmetric window around T.
+
+    Pool selection (best non-zombie by TVL) uses a point read at T,
+    then all swaps in the window are collected for VWMP computation.
+    Window is expanded per R1 if no swaps are found.
+    """
+    candidates = registry.get_level_0a_paths(asset)
+
+    best_path: Path | None = None
+    best_tvl = -1.0
+    best_schema: csv_adapter.SchemaInfo | None = None
+    best_viability_row: dict[str, Any] | None = None
+    pool_warnings: list[Warning] = []
+
+    for path in candidates:
+        if not path.exists():
+            continue
+        schema = csv_adapter.inspect(path)
+        ts_col = schema.mapping.get("timestamp")
+        price_col = schema.mapping.get("price_usd")
+        if not ts_col or not price_col:
+            continue
+
+        cols: list[str] = [ts_col, price_col]
+        for c in ("tvl_usd", "volume_usd", "slippage"):
+            mapped = schema.mapping.get(c)
+            if mapped:
+                cols.append(mapped)
+
+        viability_row = duckdb_client.latest_at_or_before(path, timestamp, cols, ts_col)
+        if viability_row is None:
+            continue
+
+        zombie, z_warns = _is_zombie(schema, viability_row, timestamp, cfg)
+        if zombie:
+            continue
+        if not _is_recently_active(path, ts_col, timestamp, cfg):
+            continue
+
+        tvl_col = schema.mapping.get("tvl_usd")
+        try:
+            tvl = float(viability_row[tvl_col]) if tvl_col and viability_row.get(tvl_col) else 0.0
+        except (ValueError, TypeError):
+            tvl = 0.0
+
+        if tvl > best_tvl or best_path is None:
+            best_tvl = tvl
+            best_path = path
+            best_schema = schema
+            best_viability_row = viability_row
+            pool_warnings = z_warns
+
+    if best_path is None or best_schema is None:
+        return None
+
+    schema = best_schema
+    ts_col = schema.mapping.get("timestamp")
+    price_col = schema.mapping.get("price_usd")
+    vol_col = schema.mapping.get("volume_usd")
+    slip_col = schema.mapping.get("slippage")
+    tvl_col = schema.mapping.get("tvl_usd")
+
+    cols = [ts_col, price_col]
+    for c in (vol_col, slip_col, tvl_col):
+        if c:
+            cols.append(c)
+
+    for window_s in _WINDOW_STEPS[granularity]:
+        half = window_s / 2.0
+        w_start = timestamp - timedelta(seconds=half)
+        w_end = timestamp + timedelta(seconds=half)
+
+        rows = duckdb_client.range_query(best_path, w_start, w_end, cols, cfg.api.max_limit, ts_col)
+        if not rows:
+            continue
+
+        prices = [float(r[price_col]) for r in rows if r.get(price_col) is not None]
+        volumes = (
+            [float(r[vol_col]) if r.get(vol_col) is not None else 1.0
+             for r in rows if r.get(price_col) is not None]
+            if vol_col else [1.0] * len(prices)
+        )
+        if not prices:
+            continue
+
+        prices_clean, volumes_clean, excluded = _filter_mad_outliers(
+            prices, volumes, cfg.thresholds.sigma_mad
+        )
+        warns: list[Warning] = list(pool_warnings)
+
+        if excluded > 0:
+            warns.append(Warning(
+                code="mad_outliers_excluded",
+                message=f"{excluded} swap(s) excluded by MAD filter (sigma_mad={cfg.thresholds.sigma_mad}).",
+            ))
+        if not prices_clean:
+            prices_clean, volumes_clean = prices, volumes
+            warns.append(Warning(
+                code="mad_filter_fallback",
+                message="All swaps flagged by MAD filter; using unfiltered data.",
+            ))
+        if len(prices_clean) < cfg.thresholds.min_swaps_for_stat_score:
+            warns.append(Warning(
+                code="low_swap_count",
+                message=(
+                    f"Only {len(prices_clean)} clean swap(s) in window "
+                    f"(recommended min: {cfg.thresholds.min_swaps_for_stat_score})."
+                ),
+                severity="info",
+            ))
+
+        price_vwmp = _compute_vwmp(prices_clean, volumes_clean)
+        if price_vwmp is None:
+            continue
+
+        rel = str(best_path.relative_to(cfg.paths.datasets_path))
+        return PriceResult(
+            price_usd=price_vwmp,
+            timestamp_observed=timestamp,
+            branch_level="0a",
+            branch_label="direct_stable",
+            data_status="observed",
+            files_used=[rel],
+            calculation_path=[
+                f"VWMP({len(prices_clean)} swaps, window ±{half:.0f}s)",
+                "Direct stablecoin VWMP",
+            ],
+            detected_columns={best_path.name: schema.raw_columns},
+            source_row=best_viability_row,
+            source_schema=schema,
+            warnings=warns,
+            granularity=granularity,
+            swap_count=len(prices_clean),
+            window_seconds=float(window_s),
+            excluded_swaps=excluded,
+        )
+
+    return None
+
+
+def _try_level_0b_windowed(
+    asset: str,
+    timestamp: datetime,
+    cfg: AppConfig,
+    granularity: str,
+) -> PriceResult | None:
+    """Level 0b cross-rate with VWMP on the TOKEN/WETH leg.
+
+    TOKEN/USD = VWMP(TOKEN/WETH swaps in window) × ETH/USD (point read).
+    The ETH/USD reference is always a point read from the WETH/USDC 0.05 % pool.
+    Window expansion R1 applies to the TOKEN/WETH leg only.
+    """
+    eth_price, eth_ts, eth_file = _get_eth_usd_at(timestamp, cfg, asset)
+    if eth_price is None:
+        return None
+
+    token_paths = registry.get_level_0b_token_paths(asset)
+
+    for path in token_paths:
+        if not path.exists():
+            continue
+        schema = csv_adapter.inspect(path)
+        ts_col = schema.mapping.get("timestamp")
+        price_col = schema.mapping.get("price_token_eth")
+        if not ts_col or not price_col:
+            continue
+
+        cols_check: list[str] = [ts_col, price_col]
+        for c in ("tvl_usd", "volume_usd", "volume_token", "slippage"):
+            mapped = schema.mapping.get(c)
+            if mapped:
+                cols_check.append(mapped)
+
+        viability_row = duckdb_client.latest_at_or_before(path, timestamp, cols_check, ts_col)
+        if viability_row is None:
+            continue
+
+        zombie, z_warns = _is_zombie(schema, viability_row, timestamp, cfg)
+        if zombie:
+            continue
+
+        # Check that the latest swap is not too far from the ETH/USD reference
+        if (
+            eth_ts is not None
+            and viability_row.get(ts_col) is not None
+            and hasattr(viability_row[ts_col], "timestamp")
+        ):
+            lag = abs((viability_row[ts_col] - eth_ts).total_seconds())
+            if lag > cfg.thresholds.cross_rate_max_lag_seconds:
+                continue
+
+        # Prefer USD-denominated volume; fall back to ETH-denominated (also valid weight)
+        vol_col = schema.mapping.get("volume_usd") or schema.mapping.get("volume_token")
+        cols = [ts_col, price_col]
+        if vol_col:
+            cols.append(vol_col)
+
+        for window_s in _WINDOW_STEPS[granularity]:
+            half = window_s / 2.0
+            w_start = timestamp - timedelta(seconds=half)
+            w_end = timestamp + timedelta(seconds=half)
+
+            rows = duckdb_client.range_query(path, w_start, w_end, cols, cfg.api.max_limit, ts_col)
+            if not rows:
+                continue
+
+            prices_eth = [float(r[price_col]) for r in rows if r.get(price_col) is not None]
+            volumes = (
+                [float(r[vol_col]) if r.get(vol_col) is not None else 1.0
+                 for r in rows if r.get(price_col) is not None]
+                if vol_col else [1.0] * len(prices_eth)
+            )
+            if not prices_eth:
+                continue
+
+            prices_clean, volumes_clean, excluded = _filter_mad_outliers(
+                prices_eth, volumes, cfg.thresholds.sigma_mad
+            )
+            warns: list[Warning] = list(z_warns)
+
+            if excluded > 0:
+                warns.append(Warning(
+                    code="mad_outliers_excluded",
+                    message=f"{excluded} swap(s) excluded by MAD filter.",
+                ))
+            if not prices_clean:
+                prices_clean, volumes_clean = prices_eth, volumes
+                warns.append(Warning(
+                    code="mad_filter_fallback",
+                    message="All swaps flagged by MAD filter; using unfiltered data.",
+                ))
+            if len(prices_clean) < cfg.thresholds.min_swaps_for_stat_score:
+                warns.append(Warning(
+                    code="low_swap_count",
+                    message=f"Only {len(prices_clean)} clean swap(s) in window.",
+                    severity="info",
+                ))
+
+            token_eth_vwmp = _compute_vwmp(prices_clean, volumes_clean)
+            if token_eth_vwmp is None:
+                continue
+
+            price_usd = token_eth_vwmp * eth_price
+            eth_lag = (
+                abs((timestamp - eth_ts).total_seconds()) if eth_ts is not None else None
+            )
+
+            rel_token = str(path.relative_to(cfg.paths.datasets_path))
+            files = [rel_token]
+            if eth_file:
+                files.append(eth_file)
+
+            return PriceResult(
+                price_usd=price_usd,
+                timestamp_observed=timestamp,
+                branch_level="0b",
+                branch_label="cross_rate",
+                data_status="observed",
+                files_used=files,
+                calculation_path=[
+                    f"{asset}/ETH VWMP({len(prices_clean)} swaps, ±{half:.0f}s): {rel_token}",
+                    f"ETH/USD point read: {eth_file}",
+                    f"{asset}/USD = {asset}/ETH VWMP × ETH/USD",
+                ],
+                token_leg_timestamp=timestamp,
+                eth_usd_leg_timestamp=eth_ts,
+                cross_rate_lag_seconds=eth_lag,
+                detected_columns={path.name: schema.raw_columns},
+                source_row=viability_row,
+                source_schema=schema,
+                warnings=warns,
+                granularity=granularity,
+                swap_count=len(prices_clean),
+                window_seconds=float(window_s),
+                excluded_swaps=excluded,
+            )
+
+    return None
+
+
+def _try_level_2_eth_curve_windowed(
+    timestamp: datetime,
+    cfg: AppConfig,
+    granularity: str,
+) -> PriceResult | None:
+    """Level 2 ETH — Curve crvUSD/WETH pool with VWMP.
+
+    ETH/USD = 1 / VWMP(price_weth_per_crvusd swaps in window).
+    """
+    paths = registry.REGISTRY.get("ETH", {}).get("level_2_amm", [])
+    for rel in paths:
+        path = registry.resolve_path(rel)
+        if not path.exists():
+            continue
+        schema = csv_adapter.inspect(path)
+        ts_col = schema.mapping.get("timestamp")
+        inv_col = schema.mapping.get("price_inverse_eth")
+        if not ts_col or not inv_col:
+            continue
+
+        cols_check = [ts_col, inv_col]
+        for c in ("tvl_usd", "slippage"):
+            mapped = schema.mapping.get(c)
+            if mapped:
+                cols_check.append(mapped)
+
+        viability_row = duckdb_client.latest_at_or_before(path, timestamp, cols_check, ts_col)
+        if viability_row is None:
+            continue
+        zombie, z_warns = _is_zombie(schema, viability_row, timestamp, cfg)
+        if zombie:
+            continue
+
+        vol_col = schema.mapping.get("volume_usd") or schema.mapping.get("volume_token")
+        cols = [ts_col, inv_col]
+        if vol_col:
+            cols.append(vol_col)
+
+        for window_s in _WINDOW_STEPS[granularity]:
+            half = window_s / 2.0
+            w_start = timestamp - timedelta(seconds=half)
+            w_end = timestamp + timedelta(seconds=half)
+
+            rows = duckdb_client.range_query(path, w_start, w_end, cols, cfg.api.max_limit, ts_col)
+            valid = [r for r in rows if r.get(inv_col) is not None and float(r[inv_col]) != 0]
+            if not valid:
+                continue
+
+            prices = [1.0 / float(r[inv_col]) for r in valid]
+            volumes = (
+                [float(r[vol_col]) if r.get(vol_col) is not None else 1.0 for r in valid]
+                if vol_col else [1.0] * len(prices)
+            )
+
+            prices_clean, volumes_clean, excluded = _filter_mad_outliers(
+                prices, volumes, cfg.thresholds.sigma_mad
+            )
+            warns: list[Warning] = list(z_warns)
+            if excluded > 0:
+                warns.append(Warning(
+                    code="mad_outliers_excluded",
+                    message=f"{excluded} swap(s) excluded by MAD filter.",
+                ))
+            if not prices_clean:
+                prices_clean, volumes_clean = prices, volumes
+                warns.append(Warning(
+                    code="mad_filter_fallback",
+                    message="All swaps flagged by MAD filter; using unfiltered data.",
+                ))
+
+            price_vwmp = _compute_vwmp(prices_clean, volumes_clean)
+            if price_vwmp is None:
+                continue
+
+            return PriceResult(
+                price_usd=price_vwmp,
+                timestamp_observed=timestamp,
+                branch_level="2",
+                branch_label="alternative_amm",
+                data_status="observed",
+                files_used=[rel],
+                calculation_path=[
+                    f"Curve VWMP({len(prices_clean)} swaps, ±{half:.0f}s)",
+                    "ETH/USD = 1 / VWMP(price_weth_per_crvusd)",
+                ],
+                detected_columns={path.name: schema.raw_columns},
+                source_row=viability_row,
+                source_schema=schema,
+                warnings=warns,
+                granularity=granularity,
+                swap_count=len(prices_clean),
+                window_seconds=float(window_s),
+                excluded_swaps=excluded,
+            )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Level 4 — explicit NULL
 # ---------------------------------------------------------------------------
 
-def _level_4(reason: str) -> PriceResult:
+def _level_4(reason: str, granularity: str = "raw") -> PriceResult:
     return PriceResult(
         price_usd=None,
         timestamp_observed=None,
@@ -343,6 +812,7 @@ def _level_4(reason: str) -> PriceResult:
         branch_label="unavailable",
         data_status="unavailable",
         unavailable_reason=reason,
+        granularity=granularity,
     )
 
 
@@ -356,35 +826,76 @@ def get_price_at(
     cfg: AppConfig,
     branch: str = "auto",
     source: str = "auto",
+    granularity: str = "raw",
 ) -> PriceResult:
-    """Run the source hierarchy and return the best available price."""
+    """Run the source hierarchy and return the best available price.
 
-    if branch in ("auto", "0a") and source in ("auto", "dex"):
-        result = _try_level_0a(asset, timestamp, cfg)
-        if result:
-            return result
-        if branch == "0a":
-            return _level_4("no_observation_in_window")
+    granularity="raw"    — point read (latest observation at or before T).
+    granularity="minute" — VWMP over T ± 30 s, expanding per R1 up to ± 7.5 min.
+    granularity="hour"   — VWMP over T ± 30 min, expanding per R1 up to ± 4 h.
+    granularity="day"    — VWMP over T ± 12 h (no expansion; falls to next level).
+    """
+    if granularity == "raw":
+        if branch in ("auto", "0a") and source in ("auto", "dex"):
+            result = _try_level_0a(asset, timestamp, cfg)
+            if result:
+                return result
+            if branch == "0a":
+                return _level_4("no_observation_in_window", granularity)
 
-    if branch in ("auto", "0b") and source in ("auto", "dex"):
-        result = _try_level_0b(asset, timestamp, cfg)
-        if result:
-            return result
-        if branch == "0b":
-            return _level_4("no_observation_in_window")
+        if branch in ("auto", "0b") and source in ("auto", "dex"):
+            result = _try_level_0b(asset, timestamp, cfg)
+            if result:
+                return result
+            if branch == "0b":
+                return _level_4("no_observation_in_window", granularity)
 
-    if branch in ("auto", "2") and source in ("auto", "dex") and asset == "ETH":
-        result = _try_level_2_eth_curve(timestamp, cfg)
-        if result:
-            return result
-        if branch == "2":
-            return _level_4("no_observation_in_window")
+        if branch in ("auto", "2") and source in ("auto", "dex") and asset == "ETH":
+            result = _try_level_2_eth_curve(timestamp, cfg)
+            if result:
+                return result
+            if branch == "2":
+                return _level_4("no_observation_in_window", granularity)
 
-    if branch in ("auto", "3") or source == "chainlink":
-        result = _try_level_3(asset, timestamp, cfg)
-        if result:
-            return result
-        if branch == "3":
-            return _level_4("missing_source")
+        if branch in ("auto", "3") or source == "chainlink":
+            result = _try_level_3(asset, timestamp, cfg)
+            if result:
+                return result
+            if branch == "3":
+                return _level_4("missing_source", granularity)
 
-    return _level_4("missing_source")
+        return _level_4("missing_source", granularity)
+
+    else:
+        # Windowed VWMP path (minute / hour / day)
+        if branch in ("auto", "0a") and source in ("auto", "dex"):
+            result = _try_level_0a_windowed(asset, timestamp, cfg, granularity)
+            if result:
+                return result
+            if branch == "0a":
+                return _level_4("no_observation_in_window", granularity)
+
+        if branch in ("auto", "0b") and source in ("auto", "dex"):
+            result = _try_level_0b_windowed(asset, timestamp, cfg, granularity)
+            if result:
+                return result
+            if branch == "0b":
+                return _level_4("no_observation_in_window", granularity)
+
+        if branch in ("auto", "2") and source in ("auto", "dex") and asset == "ETH":
+            result = _try_level_2_eth_curve_windowed(timestamp, cfg, granularity)
+            if result:
+                return result
+            if branch == "2":
+                return _level_4("no_observation_in_window", granularity)
+
+        # Level 3 (Chainlink) stays as a point read regardless of granularity:
+        # Chainlink rounds are not individual swaps and cannot be VWMP-aggregated.
+        if branch in ("auto", "3") or source == "chainlink":
+            result = _try_level_3(asset, timestamp, cfg)
+            if result:
+                return result
+            if branch == "3":
+                return _level_4("missing_source", granularity)
+
+        return _level_4("missing_source", granularity)
