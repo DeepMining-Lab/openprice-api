@@ -182,6 +182,20 @@ def _to_response(
         }
         provenance = prov
 
+    # Build deduplicated top-level warnings (by code) from all sources so that
+    # warnings already visible in provenance or confidence are not repeated.
+    seen_codes: set[str] = set()
+    top_warnings: list[Warning] = []
+    all_src = list(result.warnings)
+    if provenance:
+        all_src.extend(provenance.warnings)
+    if confidence:
+        all_src.extend(confidence.warnings)
+    for w in all_src:
+        if w.code not in seen_codes:
+            seen_codes.add(w.code)
+            top_warnings.append(w)
+
     return PriceResponse(
         asset=asset,
         timestamp_requested=timestamp,
@@ -197,7 +211,7 @@ def _to_response(
         unavailable_reason=result.unavailable_reason,
         confidence=confidence,
         provenance=provenance,
-        warnings=result.warnings,
+        warnings=top_warnings,
     )
 
 

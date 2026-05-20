@@ -35,6 +35,15 @@ A pool is excluded from selection when any of the following conditions is true (
 
 When a required column is absent, the check is skipped and a warning is added to the response — the API never invents liquidity data.
 
+**Historically low TVL pools**: early-date observations of newer DEX
+pools may show very low TVL (e.g., a Uniswap V3 LINK/WETH pool with
+$3 791 TVL in February 2022, versus a $1 000 000 threshold). These pools
+are correctly classified as zombie and the pipeline falls to the next
+level — typically a Uniswap V2 pool whose TVL column is absent, which
+allows it to pass the check (with a `missing_tvl_column` warning). This
+behaviour is expected: during the early months of Uniswap V3 adoption,
+liquidity was concentrated on V2, and the zombie filter reflects that.
+
 ### Cross-rate lag
 
 For level `0b`, both the TOKEN/WETH leg and the WETH/USD leg are matched using an as-of strategy (latest observation ≤ T). If the two legs are more than `cross_rate_max_lag_seconds` apart (default: 3600 s), the cross-rate is rejected and the API falls to the next level.
@@ -216,17 +225,64 @@ Typical documented values include:
 - 0.5% for ETH/USD
 - 1% for COMP/USD
 
-### Chainlink fallback
+### Confidence scores by branch type
 
-When the pipeline falls back to Chainlink as the primary source, the DEX
-vs oracle comparison is no longer computable. In that case, coherence is
-computed from oracle freshness:
+The three sub-scores are only meaningful when an independent reference
+exists. The table below summarises what is computed for each branch:
 
+| Branch | S_stat | S_liq | S_coh | Overall score |
+|--------|--------|-------|-------|---------------|
+| `0a` direct stable | computed | computed | DEX vs CL | computed |
+| `0b` cross-rate (V3) | from CL history¹ | geometric mean of both legs² | DEX vs CL | computed |
+| `1` alternative pool | from CL history¹ | geometric mean of both legs² (cross-rate) or direct | DEX vs CL | computed |
+| `2` alternative AMM | from CL history¹ | geometric mean of both legs² (cross-rate) or direct | DEX vs CL | computed |
+| `3` chainlink_fallback | **N/A** | **N/A** | **N/A** | **null** |
+| `4` unavailable | **N/A** | **N/A** | **N/A** | **null** |
+
+**Note 1 — S_stat for cross-rate branches**: TOKEN/WETH files do not
+contain a USD price series. S_stat is therefore computed by comparing the
+final USD cross-rate price against the 7-day rolling history of the asset's
+Chainlink feed, which is the only available independent USD reference.
+
+**Note 2 — S_liq for cross-rate branches**: when the TOKEN/WETH leg CSV
+has no TVL or slippage columns (common for Uniswap V2 and SushiSwap files),
+S_liq falls back to the ETH/USDC leg alone and the warning
+`s_liq_cross_rate_token_leg_missing` is added to the response.
+
+**Level 3 — all scores are N/A**: when Chainlink is the primary source,
+there is no independent reference against which to measure statistical
+coherence, liquidity, or inter-source deviation. All three sub-scores
+are `null` and the overall confidence is `null`.
+
+## Structured warnings
+
+Every response may carry structured warnings at three levels:
+
+- **top-level `warnings`** — deduplicated union of all warnings from every
+  source; convenient for a single scan.
+- **`provenance.warnings`** — warnings tied to the data source (pool
+  viability checks, volume type, swap count).
+- **`confidence.warnings`** — warnings tied to confidence score computation.
+
+Each warning has the shape:
+
+```json
+{"code": "string_code", "message": "human-readable text", "severity": "info|warning|error"}
 ```
-S_coh_oracle_only = exp(−oracle_staleness / heartbeat)
-```
 
-`coherence_mode: "oracle_only_staleness"`
+### Warning catalogue
+
+| Code | Severity | Where | Meaning |
+|------|----------|-------|---------|
+| `volume_not_usd` | warning | provenance | Volume column is token-denominated (ETH/WETH/crvUSD). The 24 h USD volume zombie check cannot be evaluated and is skipped. Common for all TOKEN/WETH cross-rate files. |
+| `low_swap_count` | info | provenance | Fewer than `min_swaps_for_stat_score` clean swaps in the window (default: 3). The VWMP is based on very few trades; reliability is reduced. |
+| `mad_outliers_excluded` | info | provenance | One or more swaps were removed by the MAD outlier filter before VWMP computation. |
+| `missing_tvl_column` | warning | confidence | TVL column not found in the source file. S_TVL cannot be computed; S_liq degrades to S_slip alone, or to `null` if slippage is also absent. |
+| `missing_slippage_column` | warning | confidence | Slippage column not found. S_slip cannot be computed; S_liq degrades to S_TVL alone. |
+| `liquidity_score_unavailable` | warning | confidence | Neither TVL nor slippage columns exist in the source file. S_liq is `null` and the overall confidence score is `null`. |
+| `s_liq_cross_rate_token_leg_missing` | info | confidence | For a cross-rate branch, the TOKEN/WETH leg has no TVL or slippage data. S_liq is estimated from the ETH/USD leg only instead of the geometric mean of both legs. |
+| `s_stat_insufficient_data` | warning | confidence | Fewer than `min_swaps_for_stat_score` observations in the 7-day window. S_stat is capped at `s_stat_floor` (default: 0.2). |
+| `s_coh_no_chainlink_observation` | warning | confidence | No Chainlink observation found at or before the requested timestamp. S_coh is `null`. |
 
 ## Installation
 
