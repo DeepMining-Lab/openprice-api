@@ -27,7 +27,8 @@ import duckdb
 
 # null_padding=true: tolerate rows with more or fewer fields than the header.
 # strict_mode=false: allow large integers (Chainlink global_round_id).
-_CSV_OPTS = "delim=',', header=true, max_line_size=102400, strict_mode=false, null_padding=true"
+# ignore_errors=true: skip duplicate header rows embedded in data (seen in eth_usdc_uniswap_v3_005.csv at line ~1.5M).
+_CSV_OPTS = "delim=',', header=true, max_line_size=102400, strict_mode=false, null_padding=true, ignore_errors=true"
 
 
 def _conn() -> duckdb.DuckDBPyConnection:

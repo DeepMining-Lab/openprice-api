@@ -40,4 +40,6 @@ chainlink:
     COMP: 86400
 
 scoring:
-  tvl_score_mode: "linear_to_threshold"
+  tvl_score_mode: "log_memoire"
+  tvl_log_min_usd: 10000
+  tvl_log_ref_usd: 1000000

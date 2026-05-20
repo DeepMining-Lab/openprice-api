@@ -97,55 +97,136 @@ After all expansion steps are exhausted, the pipeline falls to the next branch l
 
 ## Confidence index
 
-Each price response optionally includes three sub-scores composed as a weighted geometric mean:
+Each price response may include a confidence index C(asset, T) ∈ [0, 1],
+computed from three bounded sub-scores:
 
 ```
 C = S_stat^w_stat × S_liq^w_liq × S_coh^w_coh
 ```
 
-Default weights: `w_stat = w_liq = w_coh ≈ 1/3` (must sum to exactly 1.0).
+with:
+
+```
+w_stat + w_liq + w_coh = 1
+```
+
+Default initial calibration:
+
+```
+w_stat = 1/3
+w_liq  = 1/3
+w_coh  = 1/3
+```
+
+These weights are the initial equal-weight calibration and are intended
+to be validated empirically.
 
 ### S_stat — Statistical hygiene
 
-Modified Z-score (MAD method) measuring how far the current price sits from a 7-day rolling median:
+S_stat measures the statistical coherence of the published VWMP against
+a 7-day rolling median of prior daily VWMP values.
 
 ```
 M_7j   = rolling median of prior 7-day VWMP values
 MAD_7j = median(|p_j − M_7j|)
 z_MAD  = 0.6745 × |VWMP(T) − M_7j| / MAD_7j
-S_stat = exp(−z_MAD² / (2 × sigma_mad²))      sigma_mad default: 3.5
+
+S_stat = exp(−z_MAD² / (2 × sigma_mad²))
 ```
 
-Falls back to `s_stat_floor` (default: 0.2) when fewer than `min_swaps_for_stat_score` observations exist.
+Default:
+
+```
+sigma_mad = 3.5
+```
+
+The threshold z_MAD = 3.5 is used as a calibration point for continuous
+penalization, not as a hard rejection rule inside the confidence index.
+Hard outlier rejection is handled upstream by the curation pipeline.
+
+If N_valid < 3, S_stat is capped at:
+
+```
+s_stat_floor = 0.2
+```
+
+This reflects high statistical uncertainty. It does not make the price
+unavailable: the price is unavailable only when N_valid = 0.
 
 ### S_liq — Deep liquidity
 
-Combines TVL score and slippage score into a geometric mean:
+S_liq combines a TVL score and a slippage score through a geometric mean.
 
 ```
-S_TVL = min(1, TVL / seuil_TVL_min_usd)       (linear_to_threshold mode)
-S_slip = exp(−slip_1k / slip_max)              slip_max default: 0.005
-S_liq  = sqrt(S_TVL × S_slip)
+S_TVL = max(
+  0,
+  min(
+    1,
+    log10(TVL(T) / TVL_min) / log10(TVL_ref / TVL_min)
+  )
+)
 ```
 
-Degrades gracefully when TVL or slippage columns are absent (uses whichever is available; `null` if neither exists).
-
-### S_coh — Coherence
-
-For DEX branches (`0a`, `0b`, `2`): relative deviation between DEX price and Chainlink oracle:
+with:
 
 ```
-δ(T)  = |P_DEX(T) − P_CL(T)| / P_CL(T)
-S_coh = exp(−(δ(T) / δ_tol)²)
+TVL_min = 10,000 USD
+TVL_ref = 1,000,000 USD
 ```
 
-Tolerance `δ_tol` is asset-specific (default 0.5 % for most assets, 1 % for COMP).
+```
+S_slip = exp(−slip_1k(T) / slip_max)
+```
 
-For Chainlink fallback (level `3`): oracle staleness replaces the DEX comparison:
+with:
 
 ```
-S_coh = exp(−staleness / heartbeat)       coherence_mode: "oracle_only_staleness"
+slip_max = 0.005
 ```
+
+```
+S_liq = sqrt(S_TVL × S_slip)
+```
+
+For the cross-rate branch via WETH:
+
+```
+S_liq_cross = sqrt(S_liq(TOKEN/WETH) × S_liq(WETH/USDC))
+```
+
+When TVL or slippage columns are absent, the available sub-score is used alone;
+`S_liq` is `null` only when neither column is present.
+
+### S_coh — Inter-source coherence
+
+For DEX branches (`0a`, `0b`, `1`, `2`), S_coh measures the relative deviation
+between the DEX-derived price and the Chainlink reference feed.
+
+```
+δ(T) = |P_DEX(T) − P_CL(T)| / P_CL(T)
+
+S_coh = exp(−(δ(T) / δ_tol(asset))²)
+```
+
+`δ_tol(asset)` is the native deviation threshold of the relevant Chainlink
+feed, stored as `feed_deviation_threshold` in the provenance table.
+
+Typical documented values include:
+
+- 0.5% for ETH/USD
+- 1% for COMP/USD
+
+### Chainlink fallback
+
+When the pipeline falls back to Chainlink as the primary source, the DEX
+vs oracle comparison is no longer computable. In that case, coherence is
+computed from oracle freshness:
+
+```
+S_coh_oracle_only = exp(−oracle_staleness / heartbeat)
+```
+
+`coherence_mode: "oracle_only_staleness"`
 
 ## Installation
 
@@ -186,7 +267,9 @@ confidence_weights:
   w_coh: 0.3333333334
 
 scoring:
-  tvl_score_mode: "linear_to_threshold"  # or "binary_threshold" or "log_memoire"
+  tvl_score_mode: "log_memoire"          # or "linear_to_threshold" or "binary_threshold"
+  tvl_log_min_usd: 10000                 # S_TVL = 0 at this TVL (log_memoire mode)
+  tvl_log_ref_usd: 1000000              # S_TVL = 1 at this TVL (log_memoire mode)
 ```
 
 The effective config is always visible at `GET /v1/config`.

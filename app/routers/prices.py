@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from datetime import datetime, timedelta, timezone
 from typing import Literal
 
@@ -61,38 +62,76 @@ def _build_confidence(
 ) -> ConfidenceDetail:
     all_warnings: list[Warning] = []
 
-    # S_stat
+    # S_stat — not applicable for Chainlink fallback (level 3): comparing the oracle
+    # price against its own historical series is circular and not meaningful as a
+    # confidence indicator.
     s_stat: float | None = None
-    if result.price_usd is not None and result.files_used:
-        first_path = registry.resolve_path(result.files_used[0])
-        if first_path.exists():
+    if result.price_usd is not None and result.branch_level != "3":
+        cl_paths_stat = registry.get_chainlink_paths(asset)
+        stat_ref_path = (
+            cl_paths_stat[0]
+            if (result.eth_source_row is not None and cl_paths_stat and cl_paths_stat[0].exists())
+            else (registry.resolve_path(result.files_used[0]) if result.files_used else None)
+        )
+        if stat_ref_path is not None and stat_ref_path.exists():
             s_stat, stat_warns = confidence_service.compute_s_stat(
-                first_path, timestamp, result.price_usd, cfg
+                stat_ref_path, timestamp, result.price_usd, cfg
             )
             all_warnings.extend(stat_warns)
 
     # S_liq
     s_liq: float | None = None
     if result.source_schema and result.source_row:
-        s_liq, liq_warns = confidence_service.compute_s_liq(
+        s_liq_token, token_liq_warns = confidence_service.compute_s_liq(
             result.source_schema, result.source_row, cfg
         )
-        all_warnings.extend(liq_warns)
+
+        if result.eth_source_schema and result.eth_source_row:
+            # Cross-rate branch: S_liq_cross = sqrt(S_liq(TOKEN/WETH) × S_liq(WETH/USDC))
+            s_liq_eth, eth_liq_warns = confidence_service.compute_s_liq(
+                result.eth_source_schema, result.eth_source_row, cfg
+            )
+            if s_liq_token is not None and s_liq_eth is not None:
+                s_liq = math.sqrt(s_liq_token * s_liq_eth)
+                all_warnings.extend(token_liq_warns)
+                all_warnings.extend(eth_liq_warns)
+            elif s_liq_token is not None:
+                s_liq = s_liq_token
+                all_warnings.extend(token_liq_warns)
+                all_warnings.extend(eth_liq_warns)
+            elif s_liq_eth is not None:
+                # TOKEN/WETH leg has no TVL/slippage; ETH/USD leg used alone.
+                s_liq = s_liq_eth
+                all_warnings.extend(
+                    w for w in token_liq_warns
+                    if w.code not in ("liquidity_score_unavailable",
+                                      "missing_tvl_column",
+                                      "missing_slippage_column")
+                )
+                all_warnings.extend(eth_liq_warns)
+                all_warnings.append(Warning(
+                    code="s_liq_cross_rate_token_leg_missing",
+                    message=(
+                        "TOKEN/WETH leg has no TVL or slippage data; "
+                        "S_liq estimated from ETH/USD leg only."
+                    ),
+                    severity="info",
+                ))
+            else:
+                all_warnings.extend(token_liq_warns)
+                all_warnings.extend(eth_liq_warns)
+        else:
+            s_liq = s_liq_token
+            all_warnings.extend(token_liq_warns)
 
     # S_coh
+    # S_coh — not applicable for Chainlink fallback (level 3): there is no independent
+    # DEX source to compare against, so coherence cannot be assessed.
     s_coh: float | None = None
     coherence_mode: str | None = None
     cl_paths = registry.get_chainlink_paths(asset)
 
-    if result.branch_level == "3":
-        # Oracle-only staleness
-        if cl_paths and cl_paths[0].exists():
-            s_coh, coh_warns = confidence_service.compute_s_coh_oracle_staleness(
-                asset, cl_paths[0], timestamp, cfg
-            )
-            coherence_mode = "oracle_only_staleness"
-            all_warnings.extend(coh_warns)
-    elif result.price_usd is not None and cl_paths and cl_paths[0].exists():
+    if result.branch_level != "3" and result.price_usd is not None and cl_paths and cl_paths[0].exists():
         s_coh, coh_warns = confidence_service.compute_s_coh_dex_vs_chainlink(
             asset, result.price_usd, cl_paths[0], timestamp, cfg
         )

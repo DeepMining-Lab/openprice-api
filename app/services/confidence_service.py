@@ -114,10 +114,14 @@ def compute_s_liq(
         elif mode == "binary_threshold":
             s_tvl = 1.0 if tvl_val >= threshold else 0.0
         elif mode == "log_memoire":
-            if tvl_val <= 0:
+            tvl_min = cfg.scoring.tvl_log_min_usd
+            tvl_ref = cfg.scoring.tvl_log_ref_usd
+            if tvl_val <= 0 or tvl_min <= 0 or tvl_ref <= tvl_min:
                 s_tvl = 0.0
             else:
-                s_tvl = max(0.0, min(1.0, math.log10(tvl_val / threshold)))
+                s_tvl = max(0.0, min(1.0,
+                    math.log10(tvl_val / tvl_min) / math.log10(tvl_ref / tvl_min)
+                ))
     else:
         warnings.append(Warning(code="missing_tvl_column",
                                 message="TVL viability check could not be evaluated."))

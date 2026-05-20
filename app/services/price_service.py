@@ -37,6 +37,8 @@ class PriceResult:
     unavailable_reason: str | None = None
     source_row: dict[str, Any] | None = None
     source_schema: csv_adapter.SchemaInfo | None = None
+    eth_source_row: dict[str, Any] | None = None
+    eth_source_schema: csv_adapter.SchemaInfo | None = None
     granularity: str = "raw"
     n_raw: int | None = None
     swap_count: int | None = None
@@ -182,8 +184,8 @@ def _filter_mad_outliers(
 
 def _get_eth_usd_at(
     timestamp: datetime, cfg: AppConfig, asset: str = "ETH"
-) -> tuple[float | None, datetime | None, str | None]:
-    """Return (eth_price, obs_timestamp, relative_path) from best ETH/USD reference."""
+) -> tuple[float | None, datetime | None, str | None, dict | None, "csv_adapter.SchemaInfo | None"]:
+    """Return (eth_price, obs_timestamp, relative_path, row, schema) from best ETH/USD reference."""
     for path in registry.get_eth_usd_reference_paths(asset):
         if not path.exists():
             continue
@@ -192,11 +194,16 @@ def _get_eth_usd_at(
         price_col = schema.mapping.get("price_usd")
         if not ts_col or not price_col:
             continue
-        row = duckdb_client.latest_at_or_before(path, timestamp, [ts_col, price_col], ts_col)
+        cols = [ts_col, price_col]
+        for c in ("tvl_usd", "slippage"):
+            mapped = schema.mapping.get(c)
+            if mapped:
+                cols.append(mapped)
+        row = duckdb_client.latest_at_or_before(path, timestamp, cols, ts_col)
         if row and row.get(price_col) is not None:
             rel = str(path.relative_to(cfg.paths.datasets_path))
-            return float(row[price_col]), row[ts_col], rel
-    return None, None, None
+            return float(row[price_col]), row[ts_col], rel, row, schema
+    return None, None, None, None, None
 
 
 # ---------------------------------------------------------------------------
@@ -282,7 +289,7 @@ def _try_cross_rate_pools(
     Used by levels 0b (Uniswap V3), 1 (Uniswap V2), and 2 (SushiSwap).
     Returns the first viable pool that passes zombie and lag checks.
     """
-    eth_price, eth_ts, eth_file = _get_eth_usd_at(timestamp, cfg, asset)
+    eth_price, eth_ts, eth_file, eth_row, eth_schema = _get_eth_usd_at(timestamp, cfg, asset)
     if eth_price is None:
         return None
 
@@ -344,6 +351,8 @@ def _try_cross_rate_pools(
             detected_columns={path.name: schema.raw_columns},
             source_row=row,
             source_schema=schema,
+            eth_source_row=eth_row,
+            eth_source_schema=eth_schema,
             warnings=z_warns,
         )
     return None
@@ -503,7 +512,7 @@ def _try_cross_rate_pools_windowed(
     The ETH/USD reference is always a point read.
     Used by levels 0b (Uniswap V3), 1 (Uniswap V2), and 2 (SushiSwap).
     """
-    eth_price, eth_ts, eth_file = _get_eth_usd_at(timestamp, cfg, asset)
+    eth_price, eth_ts, eth_file, eth_row, eth_schema = _get_eth_usd_at(timestamp, cfg, asset)
     if eth_price is None:
         return None
 
@@ -618,6 +627,8 @@ def _try_cross_rate_pools_windowed(
                 detected_columns={path.name: schema.raw_columns},
                 source_row=viability_row,
                 source_schema=schema,
+                eth_source_row=eth_row,
+                eth_source_schema=eth_schema,
                 warnings=warns,
                 granularity=granularity,
                 n_raw=n_raw,

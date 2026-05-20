@@ -108,6 +108,8 @@ class ChainlinkConfig(BaseModel):
 
 class ScoringConfig(BaseModel):
     tvl_score_mode: Literal["linear_to_threshold", "binary_threshold", "log_memoire"]
+    tvl_log_min_usd: float = 10_000.0
+    tvl_log_ref_usd: float = 1_000_000.0
 
 
 class AppConfig(BaseModel):
