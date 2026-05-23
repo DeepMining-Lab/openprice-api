@@ -55,6 +55,7 @@ def _is_zombie(
     row: dict[str, Any],
     timestamp: datetime,
     cfg: AppConfig,
+    eth_usd_price: float | None = None,
 ) -> tuple[bool, list[Warning]]:
     warnings: list[Warning] = []
     is_zombie = False
@@ -66,8 +67,12 @@ def _is_zombie(
     if tvl_col:
         tvl = row.get(tvl_col)
         try:
-            if tvl is not None and float(tvl) < cfg.thresholds.seuil_TVL_min_usd:
-                is_zombie = True
+            if tvl is not None:
+                tvl_float = float(tvl)
+                if schema.tvl_unit == "eth" and eth_usd_price is not None:
+                    tvl_float *= eth_usd_price
+                if tvl_float < cfg.thresholds.seuil_TVL_min_usd:
+                    is_zombie = True
         except (ValueError, TypeError):
             warnings.append(Warning(code="tvl_parse_error",
                                     message=f"TVL value could not be parsed as a number (got {tvl!r}); viability check skipped."))
@@ -321,7 +326,7 @@ def _try_cross_rate_pools(
         if lag > cfg.thresholds.cross_rate_max_lag_seconds:
             continue
 
-        zombie, z_warns = _is_zombie(schema, row, timestamp, cfg)
+        zombie, z_warns = _is_zombie(schema, row, timestamp, cfg, eth_usd_price=eth_price)
         if zombie:
             continue
 
@@ -535,7 +540,7 @@ def _try_cross_rate_pools_windowed(
         if viability_row is None:
             continue
 
-        zombie, z_warns = _is_zombie(schema, viability_row, timestamp, cfg)
+        zombie, z_warns = _is_zombie(schema, viability_row, timestamp, cfg, eth_usd_price=eth_price)
         if zombie:
             continue
 
@@ -708,7 +713,7 @@ def _try_level_2_eth_curve(timestamp: datetime, cfg: AppConfig) -> PriceResult |
             continue
 
         eth_usd = 1.0 / float(row[inv_col])
-        zombie, z_warns = _is_zombie(schema, row, timestamp, cfg)
+        zombie, z_warns = _is_zombie(schema, row, timestamp, cfg, eth_usd_price=eth_usd)
         if zombie:
             continue
 
@@ -808,7 +813,12 @@ def _try_level_2_eth_curve_windowed(
         viability_row = duckdb_client.latest_at_or_before(path, timestamp, cols_check, ts_col)
         if viability_row is None:
             continue
-        zombie, z_warns = _is_zombie(schema, viability_row, timestamp, cfg)
+        eth_usd_viability = (
+            1.0 / float(viability_row[inv_col])
+            if viability_row.get(inv_col) and float(viability_row[inv_col]) != 0
+            else None
+        )
+        zombie, z_warns = _is_zombie(schema, viability_row, timestamp, cfg, eth_usd_price=eth_usd_viability)
         if zombie:
             continue
 

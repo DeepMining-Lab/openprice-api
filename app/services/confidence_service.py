@@ -82,6 +82,7 @@ def compute_s_liq(
     schema: csv_adapter.SchemaInfo,
     row: dict[str, Any],
     cfg: AppConfig,
+    eth_usd_price: float | None = None,
 ) -> tuple[float | None, list[Warning]]:
     """Liquidity score from TVL and slippage."""
     warnings: list[Warning] = []
@@ -94,6 +95,8 @@ def compute_s_liq(
     if tvl_col and row.get(tvl_col) is not None:
         try:
             tvl_val = float(row[tvl_col])
+            if schema.tvl_unit == "eth" and eth_usd_price is not None:
+                tvl_val *= eth_usd_price
         except (ValueError, TypeError):
             warnings.append(Warning(code="tvl_parse_error",
                                     message=f"TVL value could not be parsed ({row[tvl_col]!r}); skipped."))

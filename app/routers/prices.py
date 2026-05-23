@@ -79,11 +79,20 @@ def _build_confidence(
             )
             all_warnings.extend(stat_warns)
 
-    # S_liq
+    # S_liq — not applicable for Chainlink fallback (level 3): oracle CSVs carry no
+    # TVL or slippage data, so computing S_liq would only produce noise warnings.
     s_liq: float | None = None
-    if result.source_schema and result.source_row:
+    if result.branch_level != "3" and result.source_schema and result.source_row:
+        # For TOKEN/WETH pools, TVL is stored in ETH — pass the ETH/USD price so
+        # compute_s_liq can convert to USD before comparing to seuil_TVL_min_usd.
+        eth_usd_for_liq: float | None = None
+        if result.eth_source_schema and result.eth_source_row:
+            _eth_price_col = result.eth_source_schema.mapping.get("price_usd")
+            if _eth_price_col and result.eth_source_row.get(_eth_price_col) is not None:
+                eth_usd_for_liq = float(result.eth_source_row[_eth_price_col])
+
         s_liq_token, token_liq_warns = confidence_service.compute_s_liq(
-            result.source_schema, result.source_row, cfg
+            result.source_schema, result.source_row, cfg, eth_usd_price=eth_usd_for_liq
         )
 
         if result.eth_source_schema and result.eth_source_row:

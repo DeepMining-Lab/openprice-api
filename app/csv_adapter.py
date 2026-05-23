@@ -109,6 +109,7 @@ class SchemaInfo:
     raw_columns: list[str]
     mapping: dict[str, str]   # canonical → actual column name in file
     warnings: list[dict[str, str]] = field(default_factory=list)
+    tvl_unit: str = "usd"     # "eth" for TOKEN/WETH and TOKEN/ETH pool files
 
     def has(self, canonical: str) -> bool:
         return canonical in self.mapping
@@ -136,7 +137,8 @@ def inspect(path: Path) -> SchemaInfo:
             if pattern.match(col) and canon not in mapping:
                 mapping[canon] = col
                 break
-    return SchemaInfo(path=path, raw_columns=raw_cols, mapping=mapping)
+    tvl_unit = "eth" if "price_token_eth" in mapping or "price_inverse_eth" in mapping else "usd"
+    return SchemaInfo(path=path, raw_columns=raw_cols, mapping=mapping, tvl_unit=tvl_unit)
 
 
 def warn_missing(schema: SchemaInfo, canonical: str, context: str = "") -> dict[str, str]:
