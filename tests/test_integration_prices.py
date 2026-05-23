@@ -123,25 +123,26 @@ class TestRawBranchSelection:
         assert d["branch_level"] == "0a"
         assert d["price_usd"] == pytest.approx(18.567710623625604, rel=1e-4)
 
-    def test_link_jun2023_is_3_zombie(self, real_client):
-        # LINK/USDC TVL=$272k at this date → zombie; ETH ref files are empty → 0b fails
+    def test_link_jun2023_is_0b_cross_rate(self, real_client):
+        # LINK/USDC TVL=$272k → 0a zombie; LINK/WETH TVL in ETH correctly converted
+        # to ~$10M USD → 0b viable. ETH ref file has data → cross-rate succeeds.
         d = _get(real_client, "LINK", "2023-06-01T12:00:00Z")
-        assert d["branch_level"] == "3"
-        assert d["branch_label"] == "chainlink_fallback"
-        assert d["data_status"] == "oracle_fallback"
-        assert d["price_usd"] == pytest.approx(6.409, rel=1e-4)
+        assert d["branch_level"] == "0b"
+        assert d["branch_label"] == "cross_rate"
+        assert d["data_status"] == "observed"
+        assert d["price_usd"] == pytest.approx(6.4244000148400655, rel=1e-4)
 
-    def test_aave_jan2025_is_3_zombie(self, real_client):
-        # AAVE/USDC TVL=$52k, AAVE/USDT also below threshold → all 0a pools zombie
+    def test_aave_jan2025_is_0b_cross_rate(self, real_client):
+        # AAVE/USDC TVL=$52k → 0a zombie; AAVE/WETH TVL in ETH correctly converted → 0b viable
         d = _get(real_client, "AAVE", "2025-01-15T12:00:00Z")
-        assert d["branch_level"] == "3"
-        assert d["price_usd"] == pytest.approx(287.0119, rel=1e-4)
+        assert d["branch_level"] == "0b"
+        assert d["price_usd"] == pytest.approx(287.7793433237273, rel=1e-4)
 
-    def test_comp_jan2025_is_3_zombie(self, real_client):
-        # COMP/USDC TVL=$159 → permanently dead pool
+    def test_comp_jan2025_is_0b_cross_rate(self, real_client):
+        # COMP/USDC TVL=$159 → 0a zombie; COMP/WETH TVL in ETH correctly converted → 0b viable
         d = _get(real_client, "COMP", "2025-01-15T12:00:00Z")
-        assert d["branch_level"] == "3"
-        assert d["price_usd"] == pytest.approx(77.61517253, rel=1e-4)
+        assert d["branch_level"] == "0b"
+        assert d["price_usd"] == pytest.approx(78.06636921441036, rel=1e-4)
 
     def test_uni_jan2020_is_4_pre_genesis(self, real_client):
         # Before UNI protocol launch and before Chainlink UNI feed
@@ -152,11 +153,13 @@ class TestRawBranchSelection:
         assert d["price_usd"] is None
         assert d["unavailable_reason"] is not None
 
-    def test_link_sep2020_is_4_pre_chainlink(self, real_client):
-        # Before Chainlink LINK feed started (2021-03-12); ETH ref files empty → no 0b
+    def test_link_sep2020_is_1_sushiswap(self, real_client):
+        # SushiSwap launched Aug 2020; LINK/ETH SushiSwap pool has data at Sep 2020.
+        # TVL is ETH-denominated → correctly converted to USD → pool is viable.
+        # ETH ref file has data → level-1 cross-rate succeeds.
         d = _get(real_client, "LINK", "2020-09-01T12:00:00Z")
-        assert d["branch_level"] == "4"
-        assert d["price_usd"] is None
+        assert d["branch_level"] == "1"
+        assert d["price_usd"] == pytest.approx(16.139191487362467, rel=1e-4)
 
 
 # ---------------------------------------------------------------------------
@@ -207,26 +210,27 @@ class TestGranularityUNI:
 # ---------------------------------------------------------------------------
 # Granularity — LINK 2024-06-01T12:00:00Z
 #
-# Verified manually on 2026-05-18:
-#   minute → 3   (DEX swaps too sparse at noon; max R1 window ±450s finds nothing)
+# Verified manually on 2026-05-23 (after TVL unit fix):
+#   minute → 0b  (no 0a swap within ±450s; LINK/WETH 0b viable → 1 swap at 900s)
 #   hour   → 0a, 4 swaps, window=3600s
 #   day    → 0a, 50 swaps, window=86400s
 #
-# The minute → Chainlink fallback demonstrates that R1 expansion (60→120→300→900s)
-# is applied and exhausted before the pipeline falls through to level 3.
+# The minute → 0b fallback demonstrates that 0a R1 expansion (60→120→300→900s)
+# is exhausted before the pipeline falls to 0b cross-rate.
 # ---------------------------------------------------------------------------
 
 class TestGranularityLINK:
 
     TS = "2024-06-01T12:00:00Z"
 
-    def test_minute_falls_to_chainlink(self, real_client):
-        # No LINK/USDC or LINK/USDT swap within ±450s of noon → R1 exhausted → level 3
+    def test_minute_falls_to_0b(self, real_client):
+        # No LINK/USDC or LINK/USDT swap within ±450s of noon → 0a R1 exhausted.
+        # LINK/WETH pool now viable (TVL in ETH correctly converted) → 0b wins.
         d = _get(real_client, "LINK", self.TS, gran="minute")
-        assert d["branch_level"] == "3"
+        assert d["branch_level"] == "0b"
         assert d["granularity"] == "minute"
-        assert d["swap_count"] is None  # Chainlink is a point read, never VWMP
-        assert d["window_seconds"] is None
+        assert d["swap_count"] == 1
+        assert d["window_seconds"] == 900.0
 
     def test_hour_is_0a(self, real_client):
         d = _get(real_client, "LINK", self.TS, gran="hour")
@@ -245,12 +249,11 @@ class TestGranularityLINK:
         assert d["window_seconds"] == 86400.0
 
     def test_minute_and_raw_use_different_sources(self, real_client):
-        # raw → 0a DEX price; minute → level-3 Chainlink price. They differ.
+        # raw → 0a (direct LINK/USDC swap); minute → 0b cross-rate (no 0a swap in window).
         raw = _get(real_client, "LINK", self.TS, gran="raw")
         minute = _get(real_client, "LINK", self.TS, gran="minute")
         assert raw["branch_level"] == "0a"
-        assert minute["branch_level"] == "3"
-        assert raw["price_usd"] != pytest.approx(minute["price_usd"], rel=1e-3)
+        assert minute["branch_level"] == "0b"
 
 
 # ---------------------------------------------------------------------------
@@ -289,24 +292,25 @@ class TestR1WindowExpansion:
 
 
 # ---------------------------------------------------------------------------
-# Zombie persistence across granularities
+# 0b persistence across granularities
 #
-# When all 0a pools are zombie and 0b is impossible (empty ETH ref files),
-# every granularity falls to level 3. VWMP windows cannot revive a zombie pool.
-# Verified manually on 2026-05-18 for LINK 2023-06-01, AAVE 2025-01-15.
+# When 0a pools are zombie (USD TVL below threshold), 0b wins via TOKEN/WETH
+# cross-rate. The TOKEN/WETH TVL is stored in ETH and correctly converted to USD.
+# Every granularity uses 0b; VWMP windows cannot revive a zombie 0a pool.
+# Verified manually on 2026-05-23 after TVL unit fix.
 # ---------------------------------------------------------------------------
 
 class TestZombiePersistsAcrossGranularities:
 
     @pytest.mark.parametrize("gran", ["raw", "minute", "hour", "day"])
-    def test_link_jun2023_always_chainlink(self, real_client, gran):
+    def test_link_jun2023_always_0b(self, real_client, gran):
         d = _get(real_client, "LINK", "2023-06-01T12:00:00Z", gran=gran)
-        assert d["branch_level"] == "3", f"gran={gran}: expected 3, got {d['branch_level']}"
+        assert d["branch_level"] == "0b", f"gran={gran}: expected 0b, got {d['branch_level']}"
 
     @pytest.mark.parametrize("gran", ["raw", "minute", "hour", "day"])
-    def test_aave_jan2025_always_chainlink(self, real_client, gran):
+    def test_aave_jan2025_always_0b(self, real_client, gran):
         d = _get(real_client, "AAVE", "2025-01-15T12:00:00Z", gran=gran)
-        assert d["branch_level"] == "3", f"gran={gran}: expected 3, got {d['branch_level']}"
+        assert d["branch_level"] == "0b", f"gran={gran}: expected 0b, got {d['branch_level']}"
 
 
 # ---------------------------------------------------------------------------
@@ -357,8 +361,10 @@ class TestWindowedResponseShape:
         assert d["granularity"] == "raw"
 
     def test_chainlink_fallback_has_null_swap_count(self, real_client):
-        # Level-3 Chainlink is always a point read; it never has VWMP fields
+        # Level-3 Chainlink is always a point read; it never has VWMP fields.
+        # Force branch=3 to ensure Chainlink is selected regardless of DEX availability.
         for gran in ("raw", "minute", "hour", "day"):
-            d = _get(real_client, "LINK", "2023-06-01T12:00:00Z", gran=gran)
+            d = _get(real_client, "LINK", "2025-01-01T12:00:00Z", gran=gran, branch="3")
+            assert d["branch_level"] == "3", f"gran={gran}: expected branch 3"
             assert d["swap_count"] is None, f"gran={gran}: Chainlink should not have swap_count"
             assert d["window_seconds"] is None, f"gran={gran}: Chainlink should not have window_seconds"
