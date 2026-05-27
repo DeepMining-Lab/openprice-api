@@ -133,10 +133,16 @@ to be validated empirically.
 ### S_stat — Statistical hygiene
 
 S_stat measures the statistical coherence of the published VWMP against
-a 7-day rolling median of prior daily VWMP values.
+the median of price observations available in the reference CSV over the
+prior 7-day window `[T − 7 days, T)`.
+
+**Reference file selection:**
+- Cross-rate branches (0b, 1 cross-rate, 2): the asset's Chainlink CSV is
+  used — it is the only independent USD series available for TOKEN/WETH pools.
+- Direct stable branch (0a): the source pool CSV is used directly.
 
 ```
-M_7j   = rolling median of prior 7-day VWMP values
+M_7j   = median of all price observations in the reference CSV over [T−7d, T)
 MAD_7j = median(|p_j − M_7j|)
 z_MAD  = 0.6745 × |VWMP(T) − M_7j| / MAD_7j
 
@@ -153,14 +159,20 @@ The threshold z_MAD = 3.5 is used as a calibration point for continuous
 penalization, not as a hard rejection rule inside the confidence index.
 Hard outlier rejection is handled upstream by the curation pipeline.
 
-If N_valid < 3, S_stat is capped at:
+**Edge case — MAD_7j = 0:** when all reference observations in the 7-day
+window are identical, MAD_7j = 0 and z_MAD is undefined. `S_stat` is set
+to `1.0` (perfect consistency of the reference series).
+
+If fewer than `min_swaps_for_stat_score` observations exist in the 7-day
+reference window (default: 3), S_stat is capped at:
 
 ```
 s_stat_floor = 0.2
 ```
 
-This reflects high statistical uncertainty. It does not make the price
-unavailable: the price is unavailable only when N_valid = 0.
+This floor reflects insufficient historical data for a robust median — it is
+independent of the number of swaps used to compute the current VWMP. The
+price is unavailable only when the current window yields zero clean swaps.
 
 ### S_liq — Deep liquidity
 
@@ -184,7 +196,7 @@ TVL_ref = 1,000,000 USD
 ```
 
 ```
-S_slip = exp(−slip_1k(T) / slip_max)
+S_slip = exp(−|slip(T)| / slip_max)
 ```
 
 with:
@@ -192,6 +204,11 @@ with:
 ```
 slip_max = 0.005
 ```
+
+`slip(T)` is read from the `slip_1k` column when present (1 000 USD
+reference order). If `slip_1k` is absent, `slip_10k` is used as the
+canonical fallback. The absolute value is applied defensively; slippage
+values are stored as decimals in the CSV files.
 
 ```
 S_liq = sqrt(S_TVL × S_slip)
@@ -203,8 +220,14 @@ For the cross-rate branch via WETH:
 S_liq_cross = sqrt(S_liq(TOKEN/WETH) × S_liq(WETH/USDC))
 ```
 
-When TVL or slippage columns are absent, the available sub-score is used alone;
-`S_liq` is `null` only when neither column is present.
+If the TOKEN/WETH leg CSV has no TVL or slippage columns (common for
+Uniswap V2 and SushiSwap files), `S_liq_cross` falls back to the
+WETH/USDC leg alone and the warning `s_liq_cross_rate_token_leg_missing`
+is added. If neither leg provides liquidity data, `S_liq` is `null`.
+
+For direct stable branches (0a), the same degradation applies within a
+single leg: when only TVL or only slippage is available, the single
+available sub-score is used; `S_liq` is `null` only when both are absent.
 
 ### S_coh — Inter-source coherence
 
@@ -218,9 +241,12 @@ S_coh = exp(−(δ(T) / δ_tol(asset))²)
 ```
 
 `δ_tol(asset)` is the native deviation threshold of the relevant Chainlink
-feed, stored as `feed_deviation_threshold` in the provenance table.
+feed, configured in `config/openprice.yaml` under
+`chainlink.deviation_threshold_by_asset` (fallback:
+`chainlink.default_deviation_threshold`). The effective value for each asset
+is visible at `GET /v1/config`.
 
-Typical documented values include:
+Configured values:
 
 - 0.5% for ETH/USD
 - 1% for COMP/USD
@@ -241,18 +267,38 @@ exists. The table below summarises what is computed for each branch:
 
 **Note 1 — S_stat for cross-rate branches**: TOKEN/WETH files do not
 contain a USD price series. S_stat is therefore computed by comparing the
-final USD cross-rate price against the 7-day rolling history of the asset's
-Chainlink feed, which is the only available independent USD reference.
+final USD cross-rate price against the raw price observations in the asset's
+Chainlink CSV over `[T − 7 days, T)`, which is the only available
+independent USD reference.
 
-**Note 2 — S_liq for cross-rate branches**: when the TOKEN/WETH leg CSV
-has no TVL or slippage columns (common for Uniswap V2 and SushiSwap files),
-S_liq falls back to the ETH/USDC leg alone and the warning
-`s_liq_cross_rate_token_leg_missing` is added to the response.
+**Note 2 — S_liq for cross-rate branches**: `S_liq_cross` is the geometric
+mean of both legs when both carry TVL/slippage data. If the TOKEN/WETH leg
+CSV lacks both columns (common for Uniswap V2 and SushiSwap files), the
+WETH/USDC leg score is used alone and `s_liq_cross_rate_token_leg_missing`
+is added. If only the TOKEN/WETH leg has data, it is used alone with no
+warning. If neither leg has data, `S_liq` is `null`.
 
 **Level 3 — all scores are N/A**: when Chainlink is the primary source,
 there is no independent reference against which to measure statistical
 coherence, liquidity, or inter-source deviation. All three sub-scores
 are `null` and the overall confidence is `null`.
+
+### Qualitative confidence level
+
+The research methodology defines a four-band qualitative classification
+derived from the score:
+
+| Score C | Level | Usage recommendation |
+|---------|-------|----------------------|
+| C ≥ 0.80 | **High** | Legally opposable without reservation |
+| 0.50 ≤ C < 0.80 | **Medium** | Opposable with explicit disclosure of limits |
+| C < 0.50 | **Low** | Informational only, not opposable |
+| `null` | **N/A** | Chainlink fallback (level 3) or unavailable (level 4) |
+
+> **Implementation note:** the current API (`/v1/confidence/{asset}/at`)
+> returns the raw `score` and sub-scores only. The `qualitative_level`
+> field is not yet exposed. Callers can derive it from the `score` field
+> using the table above.
 
 ## Structured warnings
 
