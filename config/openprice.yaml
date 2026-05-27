@@ -8,7 +8,7 @@ paths:
   datasets_root: "~/openprice/datasets"
 
 thresholds:
-  seuil_TVL_min_usd: 1000000
+  seuil_TVL_min_usd: 100000
   seuil_vol_min_usd_24h: 10000
   fenetre_inactivite_jours: 30
   min_swaps_for_stat_score: 3
