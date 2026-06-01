@@ -44,7 +44,7 @@ scoring:
   tvl_log_min_usd: 10000
   tvl_log_ref_usd: 1000000
 
-# --- API V2 confidence index (CLAUDE.md §22) -------------------------------
+# --- API V2 confidence index -------------------------------
 # Distinct block: never overrides the V1 keys above. The V1 routes (/v1/...)
 # ignore this block entirely and stay byte-for-byte identical.
 confidence_v2:
@@ -57,12 +57,20 @@ confidence_v2:
     w_peg:  0.25            # used only in 4sub mode (weights renormalized)
   coh:
     default_delta_tol: 0.005
-    delta_tol_by_asset: {}  # calibrated empirically (mémoire §8.4)
+    # Calibrated empirically on the p90 of the observed |neutralized DEX - CEX|/CEX
+    # dispersion per asset (8-regime replay, mémoire §8.4). Decoupled from the
+    # native Chainlink feed thresholds, which the expert found too strict.
+    delta_tol_by_asset:
+      ETH: 0.013
+      LINK: 0.019
+      UNI: 0.020
+      AAVE: 0.026
+      COMP: 0.031
   peg:
-    tol: 0.0025             # 0.25 % USDC/USDT
+    tol: 0.0025             # 0.25 % USDC/USDT (confirmed: S_peg≈1 off-peg, →0 at depeg)
   s_stat:
     window_seconds: 604800  # 7 days; can be shortened for sensitivity tests
     volatility_estimator: "MAD"   # MAD | realized_vol
     normalize_by_volatility: false
   fragility:
-    c_threshold: null       # to calibrate; null → fragility_flag = null + warning
+    c_threshold: 0.57       # calibrated at hourly granularity (ROC/Youden, AUC=0.80, mémoire §8.4)

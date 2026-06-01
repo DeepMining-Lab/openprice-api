@@ -333,7 +333,7 @@ Each warning has the shape:
 ## API V2 — peg neutralization & S_peg
 
 V2 is an **additive** evolution of the confidence index driven by the expert
-review (CLAUDE.md §22). The V1 routes (`/v1/...`) are **frozen and unchanged**:
+review. The V1 routes (`/v1/...`) are **frozen and unchanged**:
 they reproduce the original mémoire model exactly (a non-regression test
 guarantees it). V2 lives under the `/v2/` prefix, reuses the same source
 hierarchy / DuckDB reads / VWMP, and only changes how confidence is computed.
