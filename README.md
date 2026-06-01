@@ -330,6 +330,165 @@ Each warning has the shape:
 | `s_stat_insufficient_data` | warning | confidence | Fewer than `min_swaps_for_stat_score` observations in the 7-day window. S_stat is capped at `s_stat_floor` (default: 0.2). |
 | `s_coh_no_chainlink_observation` | warning | confidence | No Chainlink observation found at or before the requested timestamp. S_coh is `null`. |
 
+## API V2 — peg neutralization & S_peg
+
+V2 is an **additive** evolution of the confidence index driven by the expert
+review (CLAUDE.md §22). The V1 routes (`/v1/...`) are **frozen and unchanged**:
+they reproduce the original mémoire model exactly (a non-regression test
+guarantees it). V2 lives under the `/v2/` prefix, reuses the same source
+hierarchy / DuckDB reads / VWMP, and only changes how confidence is computed.
+
+### What changes in V2
+
+1. **Peg neutralization upstream of S_coh.** A stablecoin-quoted DEX price is
+   not a USD price when the stablecoin itself depegs. Before measuring
+   coherence, the price is neutralized by the effective quote-currency peg:
+
+   ```
+   price_neutralized_usd = price_raw_in_quote × peg(T)
+   ```
+
+   `peg(T)` is read as-of `T` from the Chainlink **USDC/USD** or **USDT/USD**
+   feed (whichever matches the source pool's quote token; for cross-rate
+   branches the peg of the ETH/USD reference leg is used). The neutralized
+   price becomes the headline `price_usd`. S_coh is then computed on the
+   neutralized price, decoupling a genuine DEX/oracle divergence from a
+   stablecoin depeg.
+
+2. **New separate sub-score S_peg.** The depeg signal is reported on its own,
+   not folded into the price coherence:
+
+   ```
+   S_peg = exp(−(|peg(T) − 1| / peg_tol)²)        peg_tol default = 0.0025 (0.25 %)
+   ```
+
+   `S_peg` is published **outside** `subscores` (mode `3sub`). It is `null`
+   (`s_peg_not_applicable`) when the source has no stablecoin quotation —
+   Chainlink fallback (level 3) or the Curve crvUSD/WETH ETH pool.
+
+3. **Weighted composition (same form as V1), two modes:**
+
+   ```
+   3sub (default):  C = S_stat^w_stat · S_liq^w_liq · S_coh^w_coh     (S_peg excluded)
+   4sub (optional): C = ∏ S_i^(w_i / Σw)   including S_peg            (weights renormalized)
+   ```
+
+   Mode is set by `confidence_v2.composite.mode`.
+
+4. **Fragility flag.** `fragility_flag = (C < c_threshold)`, exposed separately
+   from `C`. The threshold is **uncalibrated by default** (`c_threshold: null`);
+   while null, `fragility_flag` is `null` and a `fragility_threshold_uncalibrated`
+   warning is added — the API imposes no qualitative verdict until the threshold
+   is set empirically.
+
+5. **Optional volatility-normalized S_stat** (`confidence_v2.s_stat.normalize_by_volatility`,
+   off by default) and a configurable S_stat window — a *local anomaly* score,
+   not a direct volatility measure.
+
+### Validation case — USDC depeg, 2023-03-11 (SVB)
+
+At `T = 2023-03-11T12:00:00Z`, USDC traded at **$0.9097** while the Chainlink
+AAVE/USD feed read **$65.23**. AAVE resolves to a `0b` cross-rate quoted in USDC:
+
+| | V1 | V2 |
+|---|---|---|
+| Price | 71.67 (USDC-denominated) | **65.19** (neutralized: 71.67 × 0.9097 ≈ Chainlink) |
+| `S_coh` | `6e-170` — collapses (false alarm) | **0.987** — coherent |
+| `S_peg` | — | **0.0** — depeg reported separately |
+| `C` | `3.7e-57` | **0.93** |
+
+V2 stops penalizing a real, well-priced DEX observation for a stablecoin event,
+while still surfacing that event through `S_peg`.
+
+### V2 endpoints
+
+```bash
+# Price at a timestamp (peg-neutralized + V2 confidence)
+curl "http://127.0.0.1:8000/v2/prices/AAVE/at?timestamp=2023-03-11T12:00:00Z"
+
+# Confidence only (V2)
+curl "http://127.0.0.1:8000/v2/confidence/AAVE/at?timestamp=2023-03-11T12:00:00Z"
+
+# Effective V2 configuration (the confidence_v2 block + peg feeds)
+curl "http://127.0.0.1:8000/v2/config"
+```
+
+Example `/v2/prices/{asset}/at` response (abridged):
+
+```json
+{
+  "asset": "AAVE",
+  "timestamp": "2023-03-11T12:00:00Z",
+  "granularity": "raw",
+  "price_usd": 65.19,
+  "price_raw_in_quote": 71.67,
+  "price_neutralized_usd": 65.19,
+  "quote_currency": "USDC",
+  "quote_currency_peg": 0.90965689,
+  "branch_level": "0b",
+  "branch_label": "cross_rate",
+  "data_status": "observed",
+  "confidence": {
+    "C": 0.93,
+    "composition_mode": "3sub",
+    "fragility_flag": null,
+    "subscores": {"S_stat": 0.98, "S_liq": 0.83, "S_coh": 0.987},
+    "S_peg": 0.0,
+    "qualitative_level": "high",
+    "weights": {"w_stat": 0.3333, "w_liq": 0.3333, "w_coh": 0.3334},
+    "warnings": [
+      {"code": "coh_neutralized_peg", "severity": "info", "message": "..."},
+      {"code": "fragility_threshold_uncalibrated", "severity": "info", "message": "..."}
+    ]
+  },
+  "provenance": { "...": "files used, calculation path, peg source" },
+  "warnings": []
+}
+```
+
+### V2 configuration
+
+The V2 parameters live in a **separate** `confidence_v2:` block in
+`config/openprice.yaml` (it never overrides the V1 keys). The effective values
+are visible at `GET /v2/config`.
+
+```yaml
+confidence_v2:
+  composite:
+    mode: "3sub"            # 3sub (default) | 4sub
+  weights:
+    w_stat: 0.3333333333
+    w_liq:  0.3333333333
+    w_coh:  0.3333333334
+    w_peg:  0.25            # used only in 4sub mode (weights renormalized)
+  coh:
+    default_delta_tol: 0.005
+    delta_tol_by_asset: {}  # δ_tol decoupled from the feed's native threshold
+  peg:
+    tol: 0.0025             # 0.25 % for USDC/USDT
+  s_stat:
+    window_seconds: 604800  # 7 days; shorten for sensitivity tests
+    volatility_estimator: "MAD"   # MAD | realized_vol
+    normalize_by_volatility: false
+  fragility:
+    c_threshold: null       # null → fragility_flag = null + warning
+```
+
+The peg feeds are registered (not under the V1 dataset registry, V2 only):
+
+```
+stablecoins/chainlink_usdc_usd.csv
+stablecoins/chainlink_usdt_usd.csv
+```
+
+### V2 warning catalogue
+
+| Code | Severity | Meaning |
+|------|----------|---------|
+| `coh_neutralized_peg` | info | `S_coh` was computed on the peg-neutralized DEX price (V2 behaviour). |
+| `s_peg_not_applicable` | info | Source has no stablecoin quotation (level 3 / Curve) or the peg feed is unavailable; `S_peg = null`. |
+| `fragility_threshold_uncalibrated` | info | `confidence_v2.fragility.c_threshold` is not set; `fragility_flag = null`. |
+
 ## Installation
 
 ```bash

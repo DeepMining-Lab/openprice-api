@@ -9,6 +9,7 @@ from fastapi.responses import HTMLResponse
 from app.config import load_config
 from app.routers import assets, compare, confidence, datasets, health, provenance, prices
 from app.routers import config_router
+from app.routers import prices_v2, confidence_v2
 
 cfg = load_config()
 
@@ -36,3 +37,5 @@ app.include_router(prices.router)
 app.include_router(confidence.router)
 app.include_router(provenance.router)
 app.include_router(compare.router)
+app.include_router(prices_v2.router)
+app.include_router(confidence_v2.router)

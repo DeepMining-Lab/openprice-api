@@ -43,3 +43,26 @@ scoring:
   tvl_score_mode: "log_memoire"
   tvl_log_min_usd: 10000
   tvl_log_ref_usd: 1000000
+
+# --- API V2 confidence index (CLAUDE.md §22) -------------------------------
+# Distinct block: never overrides the V1 keys above. The V1 routes (/v1/...)
+# ignore this block entirely and stay byte-for-byte identical.
+confidence_v2:
+  composite:
+    mode: "3sub"            # 3sub (default) | 4sub
+  weights:
+    w_stat: 0.3333333333
+    w_liq:  0.3333333333
+    w_coh:  0.3333333334
+    w_peg:  0.25            # used only in 4sub mode (weights renormalized)
+  coh:
+    default_delta_tol: 0.005
+    delta_tol_by_asset: {}  # calibrated empirically (mémoire §8.4)
+  peg:
+    tol: 0.0025             # 0.25 % USDC/USDT
+  s_stat:
+    window_seconds: 604800  # 7 days; can be shortened for sensitivity tests
+    volatility_estimator: "MAD"   # MAD | realized_vol
+    normalize_by_volatility: false
+  fragility:
+    c_threshold: null       # to calibrate; null → fragility_flag = null + warning

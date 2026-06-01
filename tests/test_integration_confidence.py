@@ -132,11 +132,12 @@ class TestPriceSpotChecks:
         assert d["branch_level"] == "0b", d["branch_level"]
         assert d["price_usd"] == pytest.approx(78.06636921441036, rel=1e-4)
 
-    def test_link_weth_0b_jun2023_cross_rate(self, real_client):
-        # LINK/USDC TVL=$272k → zombie; LINK/WETH 0b viable
+    def test_link_usdc_0a_jun2023(self, real_client):
+        # seuil_TVL_min_usd lowered to 100k: LINK/USDC TVL=$272k ≥ 100k → no longer
+        # zombie, so the raw point read wins on 0a (was 0b at the 1M threshold).
         d = _price(real_client, "LINK", "2023-06-01T12:00:00Z")
-        assert d["branch_level"] == "0b", d["branch_level"]
-        assert d["price_usd"] == pytest.approx(6.4244000148400655, rel=1e-4)
+        assert d["branch_level"] == "0a", d["branch_level"]
+        assert d["price_usd"] == pytest.approx(6.429641240966584, rel=1e-4)
 
     def test_uni_usdc_0a_jun2022(self, real_client):
         # UNI/USDT zombie at this date → pipeline falls to UNI/USDC (TVL=$1.6M)
@@ -317,7 +318,7 @@ class TestConfidenceAAVE0b:
 # skipped (comparing oracle vs itself would be circular) and the final
 # score is therefore None.
 #
-# LINK at 2023-06-01 falls to level 0b, not level 3.  A clean level-3 case
+# LINK at 2023-06-01 resolves to level 0a, not level 3.  A clean level-3 case
 # is AAVE at 2025-02-10 where the DEX data ends and Chainlink is the only
 # available source.
 #
@@ -435,4 +436,4 @@ class TestConfidenceInvariants:
         assert "seuil_TVL_min_usd" in params
         assert "sigma_mad" in params
         assert "slip_max" in params
-        assert params["seuil_TVL_min_usd"] == pytest.approx(1_000_000)
+        assert params["seuil_TVL_min_usd"] == pytest.approx(100_000)

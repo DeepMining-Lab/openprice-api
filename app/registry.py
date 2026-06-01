@@ -17,6 +17,15 @@ from app.config import get_config
 
 SUPPORTED_ASSETS: list[str] = ["ETH", "LINK", "UNI", "AAVE", "COMP"]
 
+# Stablecoin peg feeds (API V2 only — CLAUDE.md §22 §1/§2).
+# Chainlink USDC/USD and USDT/USD feeds, read as-of T to neutralize the DEX
+# price by the effective quote-currency peg. Same schema as the asset feeds
+# (round_updated_at_utc, answer_normalized). Not used by any V1 route.
+PEG_FEEDS: dict[str, str] = {
+    "USDC": "stablecoins/chainlink_usdc_usd.csv",
+    "USDT": "stablecoins/chainlink_usdt_usd.csv",
+}
+
 # Registry: asset → role → list of relative paths under datasets_root.
 # level_0b_cross_rate and level_1_cross_rate are nested dicts with two keys:
 #   token_eth_or_weth  — TOKEN/ETH(WETH) pool paths
@@ -226,6 +235,18 @@ def get_level_2_amm_token_paths(asset: str) -> list[Path]:
     """
     paths = REGISTRY.get(asset, {}).get("level_2_amm", [])
     return [resolve_path(p) for p in paths]  # type: ignore[arg-type]
+
+
+def get_peg_feed_path(quote_currency: str) -> Path | None:
+    """Resolve the Chainlink peg feed for a stablecoin quote currency (V2 only).
+
+    Returns None when the quote currency has no registered peg feed (e.g. WETH,
+    crvUSD, or a Chainlink-direct USD source), signalling S_peg is not applicable.
+    """
+    rel = PEG_FEEDS.get(quote_currency.upper())
+    if rel is None:
+        return None
+    return resolve_path(rel)
 
 
 def get_eth_usd_reference_paths(asset: str = "ETH") -> list[Path]:

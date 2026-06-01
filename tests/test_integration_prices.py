@@ -95,7 +95,7 @@ def _get_with_provenance(real_client, asset: str, ts: str, *, gran: str = "raw")
 #   UNI  2025-01-15 → 0a  (UNI/USDT TVL=$4.28M, vol24h=$648k — not zombie)
 #   UNI  2022-06-01 → 0a  (UNI/USDC TVL=$1.6M — not zombie)
 #   LINK 2024-06-01 → 0a  (LINK/USDC TVL=$1.21M — not zombie)
-#   LINK 2023-06-01 → 3   (LINK/USDC TVL=$272k < 1M → zombie, 0b impossible: ETH ref empty)
+#   LINK 2023-06-01 → 0a  (LINK/USDC TVL=$272k ≥ 100k threshold → not zombie)
 #   AAVE 2025-01-15 → 3   (AAVE/USDC TVL=$52k → zombie, AAVE/USDT TVL too low)
 #   COMP 2025-01-15 → 3   (COMP/USDC TVL=$159 → zombie)
 #   UNI  2020-01-01 → 4   (before UNI genesis; first swap 2021-05)
@@ -123,14 +123,14 @@ class TestRawBranchSelection:
         assert d["branch_level"] == "0a"
         assert d["price_usd"] == pytest.approx(18.567710623625604, rel=1e-4)
 
-    def test_link_jun2023_is_0b_cross_rate(self, real_client):
-        # LINK/USDC TVL=$272k → 0a zombie; LINK/WETH TVL in ETH correctly converted
-        # to ~$10M USD → 0b viable. ETH ref file has data → cross-rate succeeds.
+    def test_link_jun2023_is_0a(self, real_client):
+        # seuil_TVL_min_usd lowered to 100k: LINK/USDC TVL=$272k ≥ 100k → not zombie,
+        # so raw resolves to 0a (it was 0b cross-rate at the old 1M threshold).
         d = _get(real_client, "LINK", "2023-06-01T12:00:00Z")
-        assert d["branch_level"] == "0b"
-        assert d["branch_label"] == "cross_rate"
+        assert d["branch_level"] == "0a"
+        assert d["branch_label"] == "direct_stable"
         assert d["data_status"] == "observed"
-        assert d["price_usd"] == pytest.approx(6.4244000148400655, rel=1e-4)
+        assert d["price_usd"] == pytest.approx(6.429641240966584, rel=1e-4)
 
     def test_aave_jan2025_is_0b_cross_rate(self, real_client):
         # AAVE/USDC TVL=$52k → 0a zombie; AAVE/WETH TVL in ETH correctly converted → 0b viable
@@ -303,14 +303,43 @@ class TestR1WindowExpansion:
 class TestZombiePersistsAcrossGranularities:
 
     @pytest.mark.parametrize("gran", ["raw", "minute", "hour", "day"])
-    def test_link_jun2023_always_0b(self, real_client, gran):
-        d = _get(real_client, "LINK", "2023-06-01T12:00:00Z", gran=gran)
-        assert d["branch_level"] == "0b", f"gran={gran}: expected 0b, got {d['branch_level']}"
-
-    @pytest.mark.parametrize("gran", ["raw", "minute", "hour", "day"])
     def test_aave_jan2025_always_0b(self, real_client, gran):
         d = _get(real_client, "AAVE", "2025-01-15T12:00:00Z", gran=gran)
         assert d["branch_level"] == "0b", f"gran={gran}: expected 0b, got {d['branch_level']}"
+
+
+# ---------------------------------------------------------------------------
+# LINK 2023-06-01 — mixed branches across granularities (100k threshold)
+#
+# With seuil_TVL_min_usd=100k, LINK/USDC (TVL=$272k) is no longer zombie, so it
+# wins on 0a for point reads and wide windows. The minute window (±30s up to
+# ±450s via R1) finds no LINK/USDC swap, so it exhausts 0a and falls to the 0b
+# LINK/WETH cross-rate. This documents that R1 expansion precedes branch fallback.
+# Verified manually on 2026-06-01.
+# ---------------------------------------------------------------------------
+
+class TestLinkJun2023Granularities:
+
+    TS = "2023-06-01T12:00:00Z"
+
+    def test_raw_is_0a(self, real_client):
+        d = _get(real_client, "LINK", self.TS)
+        assert d["branch_level"] == "0a"
+        assert d["price_usd"] == pytest.approx(6.429641240966584, rel=1e-4)
+
+    def test_minute_falls_to_0b(self, real_client):
+        d = _get(real_client, "LINK", self.TS, gran="minute")
+        assert d["branch_level"] == "0b"
+        assert d["price_usd"] == pytest.approx(6.4244000148400655, rel=1e-4)
+
+    def test_hour_is_0a(self, real_client):
+        d = _get(real_client, "LINK", self.TS, gran="hour")
+        assert d["branch_level"] == "0a"
+
+    def test_day_is_0a(self, real_client):
+        d = _get(real_client, "LINK", self.TS, gran="day")
+        assert d["branch_level"] == "0a"
+        assert d["price_usd"] == pytest.approx(6.3749845461392205, rel=1e-4)
 
 
 # ---------------------------------------------------------------------------

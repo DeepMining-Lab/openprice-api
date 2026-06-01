@@ -60,6 +60,45 @@ class PriceResponse(BaseModel):
     warnings: list[Warning] = []
 
 
+# ---------------------------------------------------------------------------
+# API V2 schemas (CLAUDE.md §22). Additive — V1 schemas above are unchanged.
+# ---------------------------------------------------------------------------
+
+class ConfidenceV2Detail(BaseModel):
+    C: float | None
+    composition_mode: Literal["3sub", "4sub"]
+    fragility_flag: bool | None = None
+    # S_stat / S_liq / S_coh — S_peg is published separately (3sub: signal apart).
+    subscores: dict[str, float | None]
+    S_peg: float | None = None
+    coherence_mode: str | None = None
+    qualitative_level: str | None = None
+    weights: dict[str, float] | None = None
+    parameters: dict[str, Any] | None = None
+    warnings: list[Warning] = []
+
+
+class PriceV2Response(BaseModel):
+    asset: str
+    timestamp: datetime
+    timestamp_observed: datetime | None
+    granularity: str = "raw"
+    price_usd: float | None            # headline price = peg-neutralized USD price
+    price_raw_in_quote: float | None = None
+    price_neutralized_usd: float | None = None
+    quote_currency: str | None = None
+    quote_currency_peg: float | None = None
+    branch_level: str
+    branch_label: str
+    data_status: str
+    swap_count: int | None = None
+    window_seconds: float | None = None
+    unavailable_reason: str | None = None
+    confidence: ConfidenceV2Detail | None = None
+    provenance: Provenance | None = None
+    warnings: list[Warning] = []
+
+
 class DatasetFile(BaseModel):
     asset: str
     path: str
