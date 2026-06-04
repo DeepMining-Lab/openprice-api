@@ -1,0 +1,1049 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenPrice Explorer</title>
+  <style>
+    :root {
+      --bg:         #0a0f1e;
+      --surface:    #111827;
+      --surface2:   #1f2937;
+      --surface3:   #374151;
+      --border:     #374151;
+      --border2:    #4b5563;
+      --text:       #f9fafb;
+      --muted:      #9ca3af;
+      --accent:     #06b6d4;
+      --accent2:    #3b82f6;
+      --ok:         #22c55e;
+      --warn:       #f59e0b;
+      --err:        #ef4444;
+      --purple:     #a855f7;
+    }
+
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', sans-serif;
+      min-height: 100vh;
+      padding: 2rem 1rem 4rem;
+      line-height: 1.5;
+    }
+
+    /* ─── Layout ─────────────────────────────────────────────────── */
+    .container { max-width: 760px; margin: 0 auto; }
+
+    /* ─── Header ─────────────────────────────────────────────────── */
+    .header { text-align: center; margin-bottom: 2.5rem; }
+    .logo {
+      display: inline-flex;
+      align-items: center;
+      gap: .6rem;
+      margin-bottom: .6rem;
+    }
+    .logo-icon {
+      width: 36px; height: 36px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 10px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 1.1rem;
+    }
+    .logo h1 {
+      font-size: 1.6rem; font-weight: 700;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .header p { color: var(--muted); font-size: .875rem; }
+
+    /* ─── API bar ────────────────────────────────────────────────── */
+    .api-bar {
+      display: flex; align-items: center; gap: .5rem;
+      margin-bottom: 1.5rem;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; padding: .4rem .75rem;
+    }
+    .api-bar label { font-size: .7rem; color: var(--muted); white-space: nowrap; }
+    .api-bar input {
+      flex: 1; background: transparent; border: none;
+      color: var(--text); font-size: .8rem; outline: none;
+      font-family: monospace;
+    }
+    #api-dot { font-size: .65rem; }
+
+    /* ─── Version selector ───────────────────────────────────────── */
+    .ver-wrap { display: flex; align-items: center; gap: .4rem; white-space: nowrap; }
+    .ver-group {
+      display: flex; border: 1px solid var(--border2);
+      border-radius: 7px; overflow: hidden;
+    }
+    .ver-btn {
+      padding: .3rem .7rem; background: transparent; border: none;
+      color: var(--muted); cursor: pointer;
+      font-size: .72rem; font-weight: 700; letter-spacing: .03em;
+      transition: background .15s, color .15s;
+    }
+    .ver-btn:not(:last-child) { border-right: 1px solid var(--border2); }
+    .ver-btn:hover { color: var(--text); }
+    .ver-btn.active { background: linear-gradient(135deg, #0891b2, #2563eb); color: #fff; }
+
+    /* ─── Info tooltip ───────────────────────────────────────────── */
+    .info-tip {
+      position: relative;
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 17px; height: 17px; border-radius: 50%;
+      border: 1px solid var(--border2); color: var(--muted);
+      font-size: .68rem; font-weight: 700; cursor: help;
+      transition: color .15s, border-color .15s;
+    }
+    .info-tip:hover { color: var(--accent); border-color: var(--accent); }
+    .tip-box {
+      position: absolute; top: calc(100% + 8px); right: -8px;
+      width: 320px; max-width: 78vw;
+      background: var(--surface2); border: 1px solid var(--border2);
+      border-radius: 10px; padding: .9rem 1rem;
+      box-shadow: 0 12px 32px rgba(0,0,0,.45);
+      font-size: .74rem; line-height: 1.5; color: var(--text);
+      white-space: normal; text-align: left;
+      opacity: 0; visibility: hidden; transform: translateY(-4px);
+      transition: opacity .15s, transform .15s, visibility .15s;
+      z-index: 30;
+    }
+    .info-tip:hover .tip-box { opacity: 1; visibility: visible; transform: translateY(0); }
+    .tip-box::before {
+      content: ''; position: absolute; top: -5px; right: 12px;
+      width: 9px; height: 9px; background: var(--surface2);
+      border-left: 1px solid var(--border2); border-top: 1px solid var(--border2);
+      transform: rotate(45deg);
+    }
+    .tip-title {
+      font-size: .7rem; font-weight: 700; text-transform: uppercase;
+      letter-spacing: .06em; color: var(--accent); margin-bottom: .55rem;
+    }
+    .tip-row { display: flex; gap: .5rem; margin-bottom: .5rem; }
+    .tip-row:last-child { margin-bottom: 0; }
+    .tip-tag {
+      flex-shrink: 0; font-weight: 700; font-size: .68rem;
+      padding: .05rem .4rem; border-radius: 5px; height: fit-content;
+      letter-spacing: .03em;
+    }
+    .tip-tag.v1 { background: rgba(148,163,184,.18); color: #cbd5e1; }
+    .tip-tag.v2 { background: rgba(168,85,247,.16); color: #c084fc; }
+    .tip-box code { font-family: monospace; color: var(--accent); font-size: .72rem; }
+    .tip-box .muted { color: var(--muted); }
+
+    /* ─── Card ───────────────────────────────────────────────────── */
+    .card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 1.5rem;
+      margin-bottom: 1rem;
+    }
+    .section-title {
+      font-size: .65rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .1em;
+      color: var(--muted); margin-bottom: 1rem;
+    }
+    .divider { height: 1px; background: var(--border); margin: 1.25rem 0; }
+
+    /* ─── Token pills ────────────────────────────────────────────── */
+    .token-row { display: flex; gap: .5rem; flex-wrap: wrap; }
+    .token-btn {
+      padding: .45rem 1.1rem;
+      border-radius: 999px;
+      border: 1.5px solid var(--border2);
+      background: transparent;
+      color: var(--muted);
+      cursor: pointer; font-size: .9rem; font-weight: 700;
+      letter-spacing: .03em;
+      transition: border-color .15s, color .15s, background .15s;
+    }
+    .token-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .token-btn.active {
+      background: linear-gradient(135deg, #0891b2, #2563eb);
+      border-color: transparent; color: #fff;
+    }
+
+    /* ─── Granularity tabs ───────────────────────────────────────── */
+    .gran-row { display: flex; align-items: center; gap: .75rem; }
+    .gran-label { font-size: .8rem; color: var(--muted); }
+    .gran-group {
+      display: flex; border: 1px solid var(--border2);
+      border-radius: 8px; overflow: hidden;
+    }
+    .gran-btn {
+      padding: .4rem .9rem; background: transparent; border: none;
+      border-right: 1px solid var(--border2);
+      color: var(--muted); cursor: pointer;
+      font-size: .8rem; font-weight: 500;
+      transition: background .15s, color .15s;
+    }
+    .gran-btn:last-child { border-right: none; }
+    .gran-btn:hover { color: var(--text); background: var(--surface2); }
+    .gran-btn.active { background: var(--accent); color: #fff; }
+
+    /* ─── Date / time inputs ─────────────────────────────────────── */
+    .dt-row { display: flex; gap: .75rem; align-items: flex-end; flex-wrap: wrap; }
+    .field { display: flex; flex-direction: column; gap: .3rem; }
+    .field-label { font-size: .72rem; color: var(--muted); font-weight: 500; }
+    .field input, .field select {
+      background: var(--surface2); border: 1px solid var(--border2);
+      border-radius: 7px; color: var(--text);
+      padding: .45rem .75rem; font-size: .875rem; outline: none;
+      transition: border-color .15s;
+    }
+    .field input:focus, .field select:focus { border-color: var(--accent); }
+    .field input[type=number] { width: 74px; }
+    .field input[type=date] { width: 160px; }
+
+    /* Timestamp preview */
+    .ts-preview {
+      font-family: monospace; font-size: .75rem;
+      color: var(--accent); margin-top: .5rem;
+      min-height: 1.2em;
+    }
+
+    /* ─── Advanced toggle ────────────────────────────────────────── */
+    .adv-toggle {
+      display: flex; align-items: center; gap: .4rem;
+      cursor: pointer; color: var(--muted);
+      font-size: .78rem; user-select: none; margin-top: 1rem;
+    }
+    .adv-toggle:hover { color: var(--text); }
+    .adv-chevron { transition: transform .2s; display: inline-block; }
+    .adv-panel { display: none; margin-top: .75rem; }
+    .adv-panel.open { display: block; }
+
+    /* ─── Submit ─────────────────────────────────────────────────── */
+    .btn-primary {
+      width: 100%; padding: .8rem;
+      background: linear-gradient(135deg, #0891b2, #2563eb);
+      color: #fff; border: none; border-radius: 9px;
+      font-size: .95rem; font-weight: 600;
+      cursor: pointer; margin-top: 1.25rem;
+      transition: opacity .15s, transform .1s;
+      display: flex; align-items: center; justify-content: center; gap: .6rem;
+    }
+    .btn-primary:hover { opacity: .88; transform: translateY(-1px); }
+    .btn-primary:active { transform: translateY(0); }
+    .btn-primary:disabled { opacity: .45; cursor: not-allowed; transform: none; }
+
+    /* ─── Results ────────────────────────────────────────────────── */
+    #results { display: none; }
+
+    /* Price display */
+    .price-big {
+      display: flex; align-items: baseline; gap: .75rem;
+      flex-wrap: wrap; margin-bottom: .6rem;
+    }
+    .price-amount {
+      font-size: 2.8rem; font-weight: 800;
+      letter-spacing: -.03em; line-height: 1;
+    }
+    .price-sym { font-size: 1.2rem; color: var(--muted); font-weight: 500; }
+
+    .badge {
+      display: inline-flex; align-items: center; gap: .3rem;
+      padding: .2rem .7rem; border-radius: 999px;
+      font-size: .72rem; font-weight: 700; letter-spacing: .04em;
+    }
+    .b-0a { background: rgba(34,197,94,.12); color: #22c55e; border: 1px solid rgba(34,197,94,.3); }
+    .b-0b { background: rgba(6,182,212,.12); color: #06b6d4; border: 1px solid rgba(6,182,212,.3); }
+    .b-2  { background: rgba(168,85,247,.12); color: #a855f7; border: 1px solid rgba(168,85,247,.3); }
+    .b-3  { background: rgba(245,158,11,.12); color: #f59e0b; border: 1px solid rgba(245,158,11,.3); }
+    .b-4  { background: rgba(239,68,68,.12);  color: #ef4444; border: 1px solid rgba(239,68,68,.3); }
+
+    .meta-grid {
+      display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+      gap: .75rem; margin-top: .9rem;
+    }
+    .meta-cell { font-size: .78rem; }
+    .meta-cell .label { color: var(--muted); margin-bottom: .1rem; }
+    .meta-cell .value { color: var(--text); font-weight: 600; }
+
+    /* Unavailable */
+    .unavail-box {
+      background: rgba(239,68,68,.08); border: 1px solid rgba(239,68,68,.25);
+      border-radius: 9px; padding: 1rem 1.25rem;
+      color: var(--err); font-size: .875rem;
+    }
+
+    /* ─── Confidence ─────────────────────────────────────────────── */
+    .conf-layout { display: flex; gap: 2rem; align-items: center; flex-wrap: wrap; }
+
+    .gauge-wrap { position: relative; width: 130px; height: 130px; flex-shrink: 0; }
+    .gauge-wrap svg { display: block; }
+    .gauge-label {
+      position: absolute; top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      text-align: center; pointer-events: none;
+    }
+    .gauge-score { font-size: 1.65rem; font-weight: 800; line-height: 1; }
+    .gauge-sub   { font-size: .65rem; color: var(--muted); margin-top: .15rem; }
+
+    .sub-scores { flex: 1; display: flex; flex-direction: column; gap: .85rem; min-width: 200px; }
+    .ss-row { display: flex; flex-direction: column; gap: .28rem; }
+    .ss-head { display: flex; justify-content: space-between; align-items: baseline; }
+    .ss-name { font-size: .78rem; color: var(--muted); }
+    .ss-val  { font-size: .82rem; font-weight: 700; }
+    .ss-desc { font-size: .68rem; color: var(--border2); margin-top: -.1rem; }
+    .prog { height: 5px; border-radius: 999px; background: var(--surface3); overflow: hidden; }
+    .prog-fill { height: 100%; border-radius: 999px; transition: width .7s cubic-bezier(.4,0,.2,1); }
+
+    /* ─── Accordion ──────────────────────────────────────────────── */
+    .acc-item {
+      border: 1px solid var(--border); border-radius: 10px;
+      overflow: hidden; margin-bottom: .6rem;
+    }
+    .acc-head {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: .8rem 1rem; cursor: pointer;
+      background: var(--surface2); font-size: .83rem; font-weight: 600;
+      user-select: none; transition: background .15s;
+    }
+    .acc-head:hover { background: var(--surface3); }
+    .acc-chevron { transition: transform .2s; color: var(--muted); font-size: .75rem; }
+    .acc-body {
+      display: none; padding: 1rem; font-size: .8rem;
+      color: var(--muted); background: var(--surface);
+    }
+    .acc-body.open { display: block; }
+    .acc-body.open ~ .acc-head .acc-chevron { /* via JS */ }
+
+    /* Provenance elements */
+    .file-list { list-style: none; display: flex; flex-direction: column; gap: .3rem; }
+    .file-list li {
+      font-family: monospace; font-size: .76rem;
+      color: var(--text); background: var(--surface2);
+      border-radius: 5px; padding: .25rem .6rem;
+      display: flex; align-items: center; gap: .4rem;
+    }
+    .calc-steps { display: flex; flex-direction: column; gap: .35rem; }
+    .calc-step {
+      display: flex; align-items: center; gap: .5rem;
+      font-size: .8rem; color: var(--text);
+    }
+    .calc-arrow { color: var(--accent); font-size: .7rem; }
+
+    .kv-table { width: 100%; border-collapse: collapse; }
+    .kv-table td { padding: .3rem 0; font-size: .79rem; }
+    .kv-table td:first-child { color: var(--muted); width: 60%; }
+    .kv-table td:last-child { color: var(--text); font-weight: 600; text-align: right; font-family: monospace; }
+
+    /* Sub-section label */
+    .sub-label {
+      font-size: .65rem; font-weight: 700;
+      text-transform: uppercase; letter-spacing: .08em;
+      color: var(--border2); margin-bottom: .5rem; margin-top: .75rem;
+    }
+    .sub-label:first-child { margin-top: 0; }
+
+    /* ─── Warnings ───────────────────────────────────────────────── */
+    .warn-list { display: flex; flex-direction: column; gap: .4rem; }
+    .warn-item {
+      padding: .45rem .75rem; border-radius: 7px;
+      font-size: .78rem; border-left: 3px solid;
+    }
+    .warn-info    { background: rgba(6,182,212,.08);  border-color: var(--accent); color: #67e8f9; }
+    .warn-warning { background: rgba(245,158,11,.08); border-color: var(--warn);   color: #fcd34d; }
+    .warn-error   { background: rgba(239,68,68,.08);  border-color: var(--err);    color: #fca5a5; }
+    .warn-code { font-weight: 700; margin-right: .35rem; }
+
+    /* ─── Spinner ────────────────────────────────────────────────── */
+    .spinner {
+      width: 15px; height: 15px;
+      border: 2px solid rgba(255,255,255,.25);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin .55s linear infinite;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ─── Fade-in ────────────────────────────────────────────────── */
+    .fade-in { animation: fadeIn .35s ease; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+
+    /* ─── Responsive ─────────────────────────────────────────────── */
+    @media (max-width: 540px) {
+      .price-amount { font-size: 2rem; }
+      .conf-layout { flex-direction: column; align-items: flex-start; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="container">
+
+  <!-- Header -->
+  <div class="header">
+    <div class="logo">
+      <div class="logo-icon">◈</div>
+      <h1>OpenPrice</h1>
+    </div>
+    <p>Interrogez l'API de prix crypto — confiance et provenance complètes</p>
+  </div>
+
+  <!-- API bar -->
+  <div class="api-bar">
+    <label for="api-url">API</label>
+    <input type="text" id="api-url" value="http://127.0.0.1:8000"
+           placeholder="http://127.0.0.1:8000"
+           onchange="checkHealth()">
+
+    <div class="ver-wrap">
+      <div class="ver-group" id="ver-group">
+        <button class="ver-btn active" data-ver="v1">V1</button>
+        <button class="ver-btn"        data-ver="v2">V2</button>
+      </div>
+      <span class="info-tip" tabindex="0" aria-label="Différences entre V1 et V2">i
+        <span class="tip-box">
+          <span class="tip-title">V1 vs V2 — différences clés</span>
+          <span class="tip-row">
+            <span class="tip-tag v1">V1</span>
+            <span>Modèle du mémoire d'origine, <strong>gelé</strong>. Confiance <code>C = S_stat · S_liq · S_coh</code>. Le prix est servi tel quel, dans la devise du pool.</span>
+          </span>
+          <span class="tip-row">
+            <span class="tip-tag v2">V2</span>
+            <span><strong>Neutralisation du peg</strong> stablecoin avant <code>S_coh</code> : <code>price_usd = prix × peg(T)</code>. Nouveau sous-score <code>S_peg</code> qui signale un dépeg séparément, plus un <em>flag de fragilité</em>.</span>
+          </span>
+          <span class="tip-row">
+            <span class="muted">Concrètement, V2 évite les fausses alertes de cohérence lors d'un dépeg stablecoin (ex. USDC, faillite SVB le 11/03/2023) tout en remontant l'événement via <code>S_peg</code>.</span>
+          </span>
+        </span>
+      </span>
+    </div>
+
+    <span id="api-dot" style="color:var(--muted)">● —</span>
+  </div>
+
+  <!-- Controls -->
+  <div class="card">
+    <div class="section-title">Token</div>
+    <div class="token-row" id="token-row">
+      <!-- populated by JS -->
+    </div>
+
+    <div class="divider"></div>
+
+    <div class="section-title">Horodatage</div>
+
+    <div class="gran-row" style="margin-bottom:1rem;">
+      <span class="gran-label">Granularité :</span>
+      <div class="gran-group">
+        <button class="gran-btn active" data-gran="raw">Raw</button>
+        <button class="gran-btn"        data-gran="minute">Minute</button>
+        <button class="gran-btn"        data-gran="hour">Heure</button>
+        <button class="gran-btn"        data-gran="day">Jour</button>
+      </div>
+    </div>
+
+    <div class="dt-row">
+      <div class="field">
+        <span class="field-label">Date</span>
+        <input type="date" id="inp-date" oninput="updatePreview()">
+      </div>
+      <div class="field" id="fg-hour">
+        <span class="field-label">Heure (UTC)</span>
+        <input type="number" id="inp-hour" min="0" max="23" value="0" oninput="clamp(this,0,23); updatePreview()">
+      </div>
+      <div class="field" id="fg-minute">
+        <span class="field-label">Minute</span>
+        <input type="number" id="inp-minute" min="0" max="59" value="0" oninput="clamp(this,0,59); updatePreview()">
+      </div>
+    </div>
+
+    <div class="ts-preview" id="ts-preview"></div>
+
+    <!-- Advanced -->
+    <div class="adv-toggle" onclick="toggleAdv()">
+      <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M2 12h3M19 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12"/>
+      </svg>
+      Options avancées
+      <span class="adv-chevron" id="adv-chev">▾</span>
+    </div>
+
+    <div class="adv-panel" id="adv-panel">
+      <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;">
+        <div class="field">
+          <span class="field-label">Source</span>
+          <select id="inp-source">
+            <option value="auto">auto</option>
+            <option value="dex">dex</option>
+            <option value="chainlink">chainlink</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="field-label">Branch</span>
+          <select id="inp-branch">
+            <option value="auto">auto</option>
+            <option value="0a">0a — direct_stable</option>
+            <option value="0b">0b — cross_rate</option>
+            <option value="2">2 — alternative_amm</option>
+            <option value="3">3 — chainlink_fallback</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <button class="btn-primary" id="btn-query" onclick="runQuery()">
+      Interroger l'API
+    </button>
+  </div>
+
+  <!-- Results -->
+  <div id="results">
+
+    <div class="card fade-in" id="card-price"></div>
+
+    <div class="card fade-in" id="card-conf" style="display:none;">
+      <div class="section-title">Indice de confiance</div>
+      <div id="conf-body"></div>
+    </div>
+
+    <div id="acc-section"></div>
+
+  </div>
+
+</div><!-- /container -->
+
+<script>
+// ─────────────────────────────────────────────────────────────────────────────
+// Config
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FALLBACK_TOKENS = ['ETH', 'LINK', 'UNI', 'AAVE', 'COMP'];
+
+const BRANCH_INFO = {
+  '0a': { label: 'direct_stable',       cls: 'b-0a' },
+  '0b': { label: 'cross_rate',          cls: 'b-0b' },
+  '2':  { label: 'alternative_amm',     cls: 'b-2'  },
+  '3':  { label: 'chainlink_fallback',  cls: 'b-3'  },
+  '4':  { label: 'unavailable',         cls: 'b-4'  },
+};
+
+const SS_META = {
+  S_stat: { name: 'S_stat', label: 'Qualité statistique', desc: 'Z-score MAD sur fenêtre 7 jours' },
+  S_liq:  { name: 'S_liq',  label: 'Liquidité',           desc: 'Profondeur TVL × slippage' },
+  S_coh:  { name: 'S_coh',  label: 'Cohérence oracle',    desc: 'Déviation DEX vs Chainlink' },
+  S_peg:  { name: 'S_peg',  label: 'Stabilité du peg',    desc: 'Écart du stablecoin au dollar (V2)' },
+};
+
+const KV_LABELS = {
+  seuil_TVL_min_usd:       'TVL minimum (USD)',
+  seuil_vol_min_usd_24h:   'Volume 24h min (USD)',
+  fenetre_inactivite_jours:'Fenêtre inactivité (jours)',
+  sigma_mad:               'σ_MAD (sensibilité S_stat)',
+  slip_max:                'Slippage max (S_liq)',
+  w_stat:                  'Poids w_stat',
+  w_liq:                   'Poids w_liq',
+  w_coh:                   'Poids w_coh',
+  w_peg:                   'Poids w_peg (V2)',
+  peg_tol:                 'Tolérance peg (V2)',
+  c_threshold:             'Seuil de fragilité (V2)',
+  composition_mode:        'Mode de composition',
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// State
+// ─────────────────────────────────────────────────────────────────────────────
+
+let selectedToken   = 'ETH';
+let selectedGran    = 'raw';
+let selectedVersion = 'v1';
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Init
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function init() {
+  // Default API URL = current origin (works when served via /ui)
+  const originInput = document.getElementById('api-url');
+  if (window.location.protocol !== 'file:') {
+    originInput.value = window.location.origin;
+  }
+
+  // Default date = today
+  const today = new Date().toISOString().slice(0, 10);
+  document.getElementById('inp-date').value = today;
+
+  // Load tokens from API or fallback
+  let tokens = FALLBACK_TOKENS;
+  try {
+    const base = apiBase();
+    const r = await fetch(`${base}/v1/assets`, { signal: AbortSignal.timeout(2000) });
+    if (r.ok) {
+      const d = await r.json();
+      tokens = d.assets.map(a => a.asset);
+    }
+  } catch (_) { /* use fallback */ }
+  buildTokenPills(tokens);
+
+  // Granularity buttons
+  document.querySelectorAll('.gran-btn').forEach(b => {
+    b.addEventListener('click', () => selectGran(b.dataset.gran));
+  });
+  selectGran(selectedGran);
+
+  // Version buttons
+  document.querySelectorAll('.ver-btn').forEach(b => {
+    b.addEventListener('click', () => selectVersion(b.dataset.ver));
+  });
+
+  updatePreview();
+  checkHealth();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tokens
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildTokenPills(tokens) {
+  const row = document.getElementById('token-row');
+  row.innerHTML = '';
+  tokens.forEach(t => {
+    const btn = document.createElement('button');
+    btn.className = 'token-btn' + (t === selectedToken ? ' active' : '');
+    btn.textContent = t;
+    btn.addEventListener('click', () => {
+      selectedToken = t;
+      document.querySelectorAll('.token-btn').forEach(b => b.classList.toggle('active', b.textContent === t));
+    });
+    row.appendChild(btn);
+  });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Granularity
+// ─────────────────────────────────────────────────────────────────────────────
+
+function selectGran(g) {
+  selectedGran = g;
+  document.querySelectorAll('.gran-btn').forEach(b => b.classList.toggle('active', b.dataset.gran === g));
+  document.getElementById('fg-hour').style.display   = g === 'day' ? 'none' : '';
+  document.getElementById('fg-minute').style.display = (g === 'minute' || g === 'raw') ? '' : 'none';
+  updatePreview();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// API version
+// ─────────────────────────────────────────────────────────────────────────────
+
+function selectVersion(v) {
+  selectedVersion = v;
+  document.querySelectorAll('.ver-btn').forEach(b => b.classList.toggle('active', b.dataset.ver === v));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Timestamp preview
+// ─────────────────────────────────────────────────────────────────────────────
+
+function buildTimestamp() {
+  const date = document.getElementById('inp-date').value || new Date().toISOString().slice(0, 10);
+  const h = selectedGran !== 'day'                        ? pad(document.getElementById('inp-hour').value)   : '00';
+  const m = (selectedGran === 'minute' || selectedGran === 'raw') ? pad(document.getElementById('inp-minute').value)  : '00';
+  return `${date}T${h}:${m}:00Z`;
+}
+
+function updatePreview() {
+  document.getElementById('ts-preview').textContent = buildTimestamp();
+}
+
+function pad(v) { return String(v || 0).padStart(2, '0'); }
+function clamp(el, min, max) { el.value = Math.min(max, Math.max(min, parseInt(el.value) || 0)); }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Advanced panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+function toggleAdv() {
+  const panel = document.getElementById('adv-panel');
+  const chev  = document.getElementById('adv-chev');
+  panel.classList.toggle('open');
+  chev.style.transform = panel.classList.contains('open') ? 'rotate(180deg)' : '';
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Health check
+// ─────────────────────────────────────────────────────────────────────────────
+
+function apiBase() { return document.getElementById('api-url').value.replace(/\/$/, ''); }
+
+async function checkHealth() {
+  const dot = document.getElementById('api-dot');
+  dot.style.color = 'var(--muted)';
+  dot.textContent = '● …';
+  try {
+    const r = await fetch(`${apiBase()}/health`, { signal: AbortSignal.timeout(3000) });
+    if (r.ok) {
+      dot.style.color = 'var(--ok)'; dot.textContent = '● ok';
+    } else {
+      dot.style.color = 'var(--warn)'; dot.textContent = '● ' + r.status;
+    }
+  } catch {
+    dot.style.color = 'var(--err)'; dot.textContent = '● offline';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Query
+// ─────────────────────────────────────────────────────────────────────────────
+
+async function runQuery() {
+  const btn = document.getElementById('btn-query');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="spinner"></span> Interrogation…';
+
+  const ts     = buildTimestamp();
+  const source = document.getElementById('inp-source').value;
+  const branch = document.getElementById('inp-branch').value;
+  const url    = `${apiBase()}/${selectedVersion}/prices/${selectedToken}/at?timestamp=${encodeURIComponent(ts)}&granularity=${selectedGran}&source=${source}&branch=${branch}&include_confidence=true&include_provenance=true`;
+
+  try {
+    const r = await fetch(url);
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      renderError(err.detail || r.statusText);
+    } else {
+      renderResult(await r.json());
+    }
+  } catch (e) {
+    renderError('Impossible de contacter l\'API : ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Interroger l\'API';
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Render error
+// ─────────────────────────────────────────────────────────────────────────────
+
+function renderError(msg) {
+  show('results');
+  document.getElementById('card-price').innerHTML = `
+    <div class="unavail-box"><strong>Erreur</strong><br>${esc(String(msg))}</div>`;
+  hide('card-conf');
+  document.getElementById('acc-section').innerHTML = '';
+  addClass('card-price', 'fade-in');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Render result
+// ─────────────────────────────────────────────────────────────────────────────
+
+function renderResult(d) {
+  show('results');
+  renderPrice(d);
+  renderConfidence(d.confidence, d.price_usd);
+  renderAccordions(d);
+}
+
+// ─── Price card ───────────────────────────────────────────────────────────────
+
+function renderPrice(d) {
+  const card = document.getElementById('card-price');
+  card.className = 'card fade-in';
+
+  if (d.price_usd == null) {
+    card.innerHTML = `
+      <div class="section-title">Résultat — ${esc(d.asset)}</div>
+      <div class="unavail-box">
+        <strong>Prix indisponible</strong><br>
+        ${esc(d.unavailable_reason || d.data_status)}
+      </div>
+      ${warningListHtml(d.warnings)}
+    `;
+    return;
+  }
+
+  const bi    = BRANCH_INFO[d.branch_level] || { label: d.branch_label, cls: 'b-4' };
+  const price = fmt(d.price_usd);
+  const tReq  = d.timestamp_requested || d.timestamp;
+  const lag   = lagSeconds(tReq, d.timestamp_observed);
+
+  // V2 peg neutralization fields (absent in V1)
+  const isV2  = selectedVersion === 'v2';
+  const peg   = d.quote_currency_peg;
+  const pegOff = (peg != null) ? Math.abs(peg - 1) > 0.0025 : false;
+
+  card.innerHTML = `
+    <div class="section-title">Résultat — ${esc(d.asset)}${isV2 ? ' · <span style="color:var(--purple)">V2</span>' : ''}</div>
+    <div class="price-big">
+      <span class="price-amount">$${price}</span>
+      <span class="price-sym">${esc(d.asset)}/USD</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">
+      <span class="badge ${bi.cls}">Niveau ${esc(d.branch_level)} — ${esc(bi.label)}</span>
+      <span style="font-size:.72rem;color:var(--muted)">${esc(d.data_status)}</span>
+    </div>
+    <div class="meta-grid">
+      <div class="meta-cell">
+        <div class="label">Horodatage demandé</div>
+        <div class="value">${fmtTs(tReq)}</div>
+      </div>
+      ${d.timestamp_observed ? `
+      <div class="meta-cell">
+        <div class="label">Observation la plus proche</div>
+        <div class="value">${fmtTs(d.timestamp_observed)}</div>
+      </div>` : ''}
+      ${lag != null ? `
+      <div class="meta-cell">
+        <div class="label">Lag</div>
+        <div class="value" style="color:${lag > 3600 ? 'var(--warn)' : 'var(--text)'}">${fmtLag(lag)}</div>
+      </div>` : ''}
+      ${d.quote_currency ? `
+      <div class="meta-cell">
+        <div class="label">Devise de cotation</div>
+        <div class="value">${esc(d.quote_currency)}</div>
+      </div>` : ''}
+      ${peg != null ? `
+      <div class="meta-cell">
+        <div class="label">Peg de la devise</div>
+        <div class="value" style="color:${pegOff ? 'var(--warn)' : 'var(--ok)'}">${peg.toLocaleString('fr-FR', { minimumFractionDigits: 4, maximumFractionDigits: 6 })}</div>
+      </div>` : ''}
+      ${d.price_raw_in_quote != null ? `
+      <div class="meta-cell">
+        <div class="label">Prix brut (avant neutralisation)</div>
+        <div class="value">${fmt(d.price_raw_in_quote)} ${esc(d.quote_currency || '')}</div>
+      </div>` : ''}
+    </div>
+    ${warningListHtml(d.warnings)}
+  `;
+}
+
+// ─── Confidence card ──────────────────────────────────────────────────────────
+
+function renderConfidence(c, price) {
+  const card = document.getElementById('card-conf');
+  if (!c || price == null) { card.style.display = 'none'; return; }
+  card.style.display = 'block';
+  card.className = 'card fade-in';
+
+  // Normalize V1 (flat, `score`) and V2 (`C` + nested `subscores` + `S_peg`)
+  const score = c.score ?? c.C ?? 0;
+  const subs  = c.subscores || c;           // V2 nests sub-scores, V1 keeps them flat
+  const mode  = c.coherence_mode || c.composition_mode;
+
+  const pct   = (score * 100).toFixed(1);
+  const color = scoreColor(score);
+  const R = 50, circ = 2 * Math.PI * R;
+  const fill = score * circ;
+
+  // S_peg lives outside `subscores` in V2; only shown when present
+  const keys = ['S_stat', 'S_liq', 'S_coh'];
+  if (c.S_peg !== undefined) keys.push('S_peg');
+
+  const subScores = keys.map(k => {
+    const val = (k === 'S_peg') ? c.S_peg : subs[k];
+    const m   = SS_META[k];
+    if (val == null) return `
+      <div class="ss-row">
+        <div class="ss-head">
+          <span class="ss-name">${m.label}</span>
+          <span class="ss-val" style="color:var(--muted)">n/a</span>
+        </div>
+        <div class="ss-desc">${m.desc}</div>
+      </div>`;
+    const p   = (val * 100).toFixed(1);
+    const col = scoreColor(val);
+    return `
+      <div class="ss-row">
+        <div class="ss-head">
+          <span class="ss-name">${m.label}</span>
+          <span class="ss-val" style="color:${col}">${p}%</span>
+        </div>
+        <div class="ss-desc">${m.desc}</div>
+        <div class="prog">
+          <div class="prog-fill" style="width:${p}%;background:${col}"></div>
+        </div>
+      </div>`;
+  }).join('');
+
+  // V2-only badges: fragility flag + qualitative level
+  let v2Meta = '';
+  if (c.qualitative_level) {
+    v2Meta += `<div style="font-size:.7rem;color:var(--muted);margin-top:.25rem;">Niveau qualitatif : <strong style="color:${scoreColor(score)}">${esc(c.qualitative_level)}</strong></div>`;
+  }
+  if (c.fragility_flag !== undefined) {
+    const ff = c.fragility_flag;
+    const txt = ff === null ? 'non calibré' : (ff ? 'fragile' : 'robuste');
+    const fc  = ff === null ? 'var(--muted)' : (ff ? 'var(--err)' : 'var(--ok)');
+    v2Meta += `<div style="font-size:.7rem;color:var(--muted);margin-top:.2rem;">Flag de fragilité : <strong style="color:${fc}">${txt}</strong></div>`;
+  }
+
+  document.getElementById('conf-body').innerHTML = `
+    <div class="conf-layout">
+      <div class="gauge-wrap">
+        <svg width="130" height="130" viewBox="0 0 130 130">
+          <circle cx="65" cy="65" r="${R}" fill="none" stroke="var(--surface3)" stroke-width="11"/>
+          <circle cx="65" cy="65" r="${R}" fill="none" stroke="${color}" stroke-width="11"
+            stroke-dasharray="${fill.toFixed(2)} ${circ.toFixed(2)}"
+            stroke-linecap="round"
+            transform="rotate(-90 65 65)"
+          />
+        </svg>
+        <div class="gauge-label">
+          <div class="gauge-score" style="color:${color}">${pct}%</div>
+          <div class="gauge-sub">confiance</div>
+        </div>
+      </div>
+      <div class="sub-scores">
+        ${subScores}
+        ${mode ? `<div style="font-size:.7rem;color:var(--muted);margin-top:.25rem;">Mode : ${esc(mode)}</div>` : ''}
+        ${v2Meta}
+        ${warningListHtml(c.warnings)}
+      </div>
+    </div>
+  `;
+}
+
+// ─── Accordions ───────────────────────────────────────────────────────────────
+
+function renderAccordions(d) {
+  let html = '';
+
+  if (d.provenance) {
+    const p = d.provenance;
+
+    const filesHtml = (p.files_used || []).map(f =>
+      `<li><svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--muted)" stroke-width="2"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></svg>${esc(f)}</li>`
+    ).join('');
+
+    const calcHtml = (p.calculation_path || []).map(s =>
+      `<div class="calc-step"><span class="calc-arrow">→</span>${esc(s)}</div>`
+    ).join('');
+
+    const timings = [];
+    if (p.token_leg_timestamp)
+      timings.push(`<tr><td>Token leg</td><td>${fmtTs(p.token_leg_timestamp)}</td></tr>`);
+    if (p.eth_usd_leg_timestamp)
+      timings.push(`<tr><td>ETH/USD leg</td><td>${fmtTs(p.eth_usd_leg_timestamp)}</td></tr>`);
+    if (p.cross_rate_lag_seconds != null) {
+      const lagColor = p.cross_rate_lag_seconds > 1800 ? 'var(--warn)' : 'var(--ok)';
+      timings.push(`<tr><td>Lag cross-rate</td><td style="color:${lagColor}">${fmtLag(p.cross_rate_lag_seconds)}</td></tr>`);
+    }
+
+    html += accordion('prov', 'Provenance &amp; traçabilité', `
+      ${filesHtml ? `<div class="sub-label">Fichiers utilisés</div><ul class="file-list">${filesHtml}</ul>` : ''}
+      ${calcHtml  ? `<div class="sub-label">Chemin de calcul</div><div class="calc-steps">${calcHtml}</div>` : ''}
+      ${timings.length ? `<div class="sub-label">Horodatages des legs</div><table class="kv-table">${timings.join('')}</table>` : ''}
+      ${warningListHtml(p.warnings)}
+    `);
+  }
+
+  if (d.confidence) {
+    const c = d.confidence;
+    const paramsRows = Object.entries(c.parameters || {}).map(([k, v]) =>
+      `<tr><td>${esc(KV_LABELS[k] || k)}</td><td>${typeof v === 'number' ? v.toLocaleString('fr-FR') : esc(String(v))}</td></tr>`
+    ).join('');
+    const weightRows = Object.entries(c.weights || {}).map(([k, v]) =>
+      `<tr><td>${esc(KV_LABELS[k] || k)}</td><td>${(v * 100).toFixed(4)}%</td></tr>`
+    ).join('');
+
+    html += accordion('params', 'Paramètres &amp; pondérations', `
+      ${paramsRows ? `<div class="sub-label">Seuils méthodologiques</div><table class="kv-table">${paramsRows}</table>` : ''}
+      ${weightRows ? `<div class="sub-label">Pondérations</div><table class="kv-table">${weightRows}</table>` : ''}
+    `);
+  }
+
+  document.getElementById('acc-section').innerHTML = html;
+
+  // Wire accordions
+  document.querySelectorAll('.acc-head').forEach(h => {
+    h.addEventListener('click', () => {
+      const body = h.nextElementSibling;
+      const chev = h.querySelector('.acc-chevron');
+      const open = body.classList.toggle('open');
+      if (chev) chev.style.transform = open ? 'rotate(180deg)' : '';
+    });
+  });
+}
+
+function accordion(id, title, content) {
+  return `
+    <div class="acc-item fade-in">
+      <div class="acc-head">
+        <span>${title}</span>
+        <span class="acc-chevron">▾</span>
+      </div>
+      <div class="acc-body" id="${id}-body">${content}</div>
+    </div>
+  `;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Helpers
+// ─────────────────────────────────────────────────────────────────────────────
+
+function warningListHtml(warnings) {
+  if (!warnings || !warnings.length) return '';
+  const items = warnings.map(w => `
+    <div class="warn-item warn-${esc(w.severity || 'warning')}">
+      <span class="warn-code">[${esc(w.code)}]</span>${esc(w.message)}
+    </div>`).join('');
+  return `<div class="warn-list" style="margin-top:.75rem">${items}</div>`;
+}
+
+function scoreColor(v) {
+  if (v == null) return 'var(--muted)';
+  return v >= 0.7 ? 'var(--ok)' : v >= 0.4 ? 'var(--warn)' : 'var(--err)';
+}
+
+function fmt(n) {
+  if (n == null) return '—';
+  if (n >= 1000) return n.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (n >= 1)    return n.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  return n.toLocaleString('fr-FR', { minimumFractionDigits: 4, maximumFractionDigits: 8 });
+}
+
+function fmtTs(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts);
+  return d.toLocaleString('fr-FR', {
+    year:'numeric', month:'2-digit', day:'2-digit',
+    hour:'2-digit', minute:'2-digit', second:'2-digit',
+    timeZone:'UTC',
+  }) + ' UTC';
+}
+
+function fmtLag(s) {
+  if (s == null) return '—';
+  if (s < 60)   return `${Math.round(s)}s`;
+  if (s < 3600) return `${Math.round(s / 60)}min`;
+  return `${(s / 3600).toFixed(1)}h`;
+}
+
+function lagSeconds(req, obs) {
+  if (!req || !obs) return null;
+  return Math.round((new Date(req) - new Date(obs)) / 1000);
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+function show(id) { document.getElementById(id).style.display = 'block'; }
+function hide(id) { document.getElementById(id).style.display = 'none'; }
+function addClass(id, cls) {
+  const el = document.getElementById(id);
+  el.classList.remove(cls);
+  void el.offsetWidth; // force reflow
+  el.classList.add(cls);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Boot
+// ─────────────────────────────────────────────────────────────────────────────
+
+init();
+</script>
+</body>
+</html>

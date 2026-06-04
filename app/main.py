@@ -22,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-_UI_PATH = Path(__file__).parent.parent.parent / "interface-api" / "index.html"
+_UI_PATH = Path(__file__).parent.parent / "interface-api" / "index.html"
 
 
 @app.get("/ui", response_class=HTMLResponse, include_in_schema=False)
