@@ -104,6 +104,48 @@ After all expansion steps are exhausted, the pipeline falls to the next branch l
 - `window_seconds` — actual window size used (may be larger than the initial window if R1 fired).
 - `provenance.excluded_swaps` — number of swaps removed by the MAD filter.
 
+## Temporal provenance & reference block
+
+To make every price fully replayable by a third party (mémoire §6.8.1, §6.2.6),
+the `provenance` block carries the temporal-reconstruction metadata below. All
+fields are present on both `/v1/...` and `/v2/...` responses (additive — the V1
+contract is otherwise unchanged). Window fields are populated for windowed
+granularities only; `raw` point reads leave them `null`.
+
+| Field | When populated | Meaning |
+|-------|----------------|---------|
+| `initial_window_seconds` | windowed | Width of the initial window Δ₀ before any R1 expansion |
+| `window_seconds` | windowed | Effective window width after R1 (also at top level) |
+| `window_start_utc` / `window_end_utc` | windowed | UTC bounds of the effective window |
+| `window_bound_policy` | windowed | Inclusion convention — always `left_closed_right_open` (`>= start AND < end`), so a swap on a boundary is never counted in two adjacent windows |
+| `expansion_step` | always | R1 step that produced the result: `0` = initial window (or raw point read), `1+` = an expanded window |
+| `n_raw` | windowed | Raw swap count in the window **before** MAD filtering (`raw_swap_count`) |
+| `swap_count` | windowed | Swaps **retained** after filtering (`valid_swap_count`) |
+| `excluded_swaps` | windowed | Swaps **removed** by the MAD/volume filter (`filtered_swap_count`) |
+| `reference_block_number` | raw, DEX source | Ethereum block `b_ref(T)` of the winning observation |
+| `reference_block_timestamp` | raw, DEX source | UTC timestamp of that block |
+
+**Reference block availability.** `reference_block_*` is read from the winning
+source row when the source CSV carries a `block_number` column (all DEX files).
+It is `null` with a structured warning otherwise — Chainlink feeds have no block
+column (`block_metadata_unavailable`), and windowed VWMP aggregates span many
+blocks so no single reference exists (`block_metadata_aggregated`). The API never
+fabricates a block number.
+
+### Price data status
+
+The `data_status` field distinguishes a directly-observed price from a
+reconstructed, fallback, or rejected one — a distinction the methodology
+requires for evidentiary use (mémoire §6.2.5):
+
+| `data_status` | Meaning |
+|---------------|---------|
+| `observed` | Price found directly in the initial target window (or raw point read) |
+| `reconstructed` | Price obtained only after the window had to expand (R1, `expansion_step ≥ 1`) |
+| `rejected_outlier` | Every swap in the window was flagged by the MAD filter; the value is the unfiltered fallback and should be treated with caution |
+| `oracle_fallback` | Chainlink oracle (level 3) — no viable DEX source |
+| `unavailable` | No reliable source (level 4); `price_usd` is `null` |
+
 ## Confidence index
 
 Each price response may include a confidence index C(asset, T) ∈ [0, 1],
@@ -329,6 +371,8 @@ Each warning has the shape:
 | `s_liq_cross_rate_token_leg_missing` | info | confidence | For a cross-rate branch, the TOKEN/WETH leg has no TVL or slippage data. S_liq is estimated from the ETH/USD leg only instead of the geometric mean of both legs. |
 | `s_stat_insufficient_data` | warning | confidence | Fewer than `min_swaps_for_stat_score` observations in the 7-day window. S_stat is capped at `s_stat_floor` (default: 0.2). |
 | `s_coh_no_chainlink_observation` | warning | confidence | No Chainlink observation found at or before the requested timestamp. S_coh is `null`. |
+| `block_metadata_unavailable` | info | provenance | The source CSV has no `block_number` column (e.g. Chainlink feeds). `reference_block_number` / `reference_block_timestamp` are `null`. |
+| `block_metadata_aggregated` | info | provenance | A windowed VWMP aggregates swaps from several blocks, so there is no single reference block. `reference_block_*` are `null`. |
 
 ## API V2 — peg neutralization & S_peg
 
@@ -547,6 +591,32 @@ Interactive documentation (Swagger UI): `http://127.0.0.1:8000/docs`
 
 Alternative docs (ReDoc): `http://127.0.0.1:8000/redoc`
 
+## Web interface
+
+A self-contained, dependency-free web UI ships in `interface-api/index.html`
+(a single static HTML file). The running API serves it directly:
+
+```
+http://127.0.0.1:8000/ui
+```
+
+It lets you, without writing any `curl`:
+
+- pick an asset, granularity (`raw`/`minute`/`hour`/`day`) and timestamp, and
+  switch between **V1** and **V2** of the API;
+- read the price with its branch level and `data_status` (colour-coded:
+  *observé* / *reconstruit* / *rejeté* / *repli oracle*);
+- see the confidence gauge with the S_stat / S_liq / S_coh sub-scores (and the
+  V2 `S_peg`, fragility flag and qualitative level when present);
+- expand a **Provenance** panel showing files used, calculation path, leg
+  timestamps, the full temporal-provenance block (window bounds, R1 expansion
+  step, raw/valid/filtered swap counts) and the reference block `b_ref(T)`.
+
+The page defaults its API base URL to the origin it is served from, so opening
+`/ui` works out of the box. It can also be opened as a local file
+(`file://…/index.html`) — in that case set the API URL field to your running
+instance (e.g. `http://127.0.0.1:8000`).
+
 ## Running tests
 
 ```bash
@@ -736,6 +806,11 @@ curl "http://127.0.0.1:8000/v1/provenance/LINK/at?timestamp=2024-01-01T00:00:00Z
   "token_leg_timestamp": "2024-01-01T00:00:00Z",
   "eth_usd_leg_timestamp": "2023-12-31T23:57:00Z",
   "cross_rate_lag_seconds": 180.0,
+  "expansion_step": 0,
+  "window_seconds": null,
+  "window_bound_policy": null,
+  "reference_block_number": 18913456,
+  "reference_block_timestamp": "2024-01-01T00:00:00Z",
   "parameters": {
     "seuil_TVL_min_usd": 1000000,
     "seuil_vol_min_usd_24h": 10000,

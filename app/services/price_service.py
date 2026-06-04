@@ -44,6 +44,93 @@ class PriceResult:
     swap_count: int | None = None
     window_seconds: float | None = None
     excluded_swaps: int | None = None
+    # Temporal provenance (mémoire §6.8.1 / §6.2.6). Set by windowed builders;
+    # raw point reads leave window fields null and expansion_step = 0.
+    initial_window_seconds: float | None = None
+    window_start_utc: datetime | None = None
+    window_end_utc: datetime | None = None
+    window_bound_policy: str | None = None
+    expansion_step: int | None = None
+    reference_block_number: int | None = None
+    reference_block_timestamp: datetime | None = None
+
+
+# Window-boundary convention used by range_query (>= start AND < end).
+_WINDOW_BOUND_POLICY = "left_closed_right_open"
+
+# Raw column names that may carry a block timestamp, in priority order.
+_BLOCK_TS_CANDIDATES = ("block_timestamp_utc", "block_timestamp", "block_time")
+
+
+# ---------------------------------------------------------------------------
+# Reference block helpers (mémoire §6.2.6)
+# ---------------------------------------------------------------------------
+
+def _coerce_dt(value: Any) -> datetime | None:
+    """Best-effort coercion of a CSV cell to a datetime, else None."""
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
+
+
+def _append_block_cols(schema: csv_adapter.SchemaInfo, cols: list[str]) -> None:
+    """Append block_number / block_timestamp raw columns to a projection list."""
+    bn_col = schema.mapping.get("block_number")
+    if bn_col and bn_col not in cols:
+        cols.append(bn_col)
+    bts_col = next((c for c in _BLOCK_TS_CANDIDATES if c in schema.raw_columns), None)
+    if bts_col and bts_col not in cols:
+        cols.append(bts_col)
+
+
+def _extract_block_ref(
+    schema: csv_adapter.SchemaInfo, row: dict[str, Any]
+) -> tuple[int | None, datetime | None, list[Warning]]:
+    """Extract b_ref(T) from a point-read row.
+
+    Returns (block_number, block_timestamp, warnings). When the source has no
+    block_number column, both values are null and a block_metadata_unavailable
+    warning is emitted (mémoire principle: surface the gap, never invent it).
+    """
+    bn_col = schema.mapping.get("block_number")
+    bts_col = next((c for c in _BLOCK_TS_CANDIDATES if c in schema.raw_columns), None)
+
+    block_number: int | None = None
+    if bn_col and row.get(bn_col) is not None:
+        try:
+            block_number = int(row[bn_col])
+        except (ValueError, TypeError):
+            block_number = None
+
+    block_ts = _coerce_dt(row.get(bts_col)) if bts_col else None
+
+    warns: list[Warning] = []
+    if block_number is None:
+        warns.append(Warning(
+            code="block_metadata_unavailable",
+            message="Source has no block_number column; reference block fields are null.",
+            severity="info",
+        ))
+    return block_number, block_ts, warns
+
+
+def _windowed_status(expansion_step: int, mad_fallback: bool) -> str:
+    """data_status for a windowed VWMP read (mémoire §6.2.5).
+
+    rejected_outlier (every swap in the window flagged by MAD) takes precedence;
+    otherwise reconstructed when the window had to expand (R1, step ≥ 1);
+    otherwise observed (price found in the initial target window).
+    """
+    if mad_fallback:
+        return "rejected_outlier"
+    if expansion_step >= 1:
+        return "reconstructed"
+    return "observed"
 
 
 # ---------------------------------------------------------------------------
@@ -245,6 +332,7 @@ def _try_direct_stable_pools(
             mapped = schema.mapping.get(c)
             if mapped:
                 cols.append(mapped)
+        _append_block_cols(schema, cols)
 
         row = duckdb_client.latest_at_or_before(path, timestamp, cols, ts_col)
         if row is None or row.get(price_col) is None:
@@ -264,6 +352,7 @@ def _try_direct_stable_pools(
 
         if tvl > best_tvl or best is None:
             best_tvl = tvl
+            block_number, block_ts, block_warns = _extract_block_ref(schema, row)
             best = PriceResult(
                 price_usd=float(row[price_col]),
                 timestamp_observed=row[ts_col],
@@ -275,7 +364,10 @@ def _try_direct_stable_pools(
                 detected_columns={path.name: schema.raw_columns},
                 source_row=row,
                 source_schema=schema,
-                warnings=z_warns,
+                warnings=z_warns + block_warns,
+                expansion_step=0,
+                reference_block_number=block_number,
+                reference_block_timestamp=block_ts,
             )
 
     return best
@@ -312,6 +404,7 @@ def _try_cross_rate_pools(
             mapped = schema.mapping.get(c)
             if mapped:
                 cols.append(mapped)
+        _append_block_cols(schema, cols)
 
         row = duckdb_client.latest_at_or_before(path, timestamp, cols, ts_col)
         if row is None or row.get(price_col) is None:
@@ -338,6 +431,8 @@ def _try_cross_rate_pools(
         if eth_file:
             files.append(eth_file)
 
+        # Reference block comes from the token leg (the primary DEX observation).
+        block_number, block_ts, block_warns = _extract_block_ref(schema, row)
         return PriceResult(
             price_usd=price_usd,
             timestamp_observed=token_ts,
@@ -358,7 +453,10 @@ def _try_cross_rate_pools(
             source_schema=schema,
             eth_source_row=eth_row,
             eth_source_schema=eth_schema,
-            warnings=z_warns,
+            warnings=z_warns + block_warns,
+            expansion_step=0,
+            reference_block_number=block_number,
+            reference_block_timestamp=block_ts,
         )
     return None
 
@@ -427,7 +525,7 @@ def _try_direct_stable_pools_windowed(
             if c:
                 cols.append(c)
 
-        for window_s in _WINDOW_STEPS[granularity]:
+        for step_idx, window_s in enumerate(_WINDOW_STEPS[granularity]):
             half = window_s / 2.0
             w_start = timestamp - timedelta(seconds=half)
             w_end = timestamp + timedelta(seconds=half)
@@ -450,6 +548,7 @@ def _try_direct_stable_pools_windowed(
                 prices, volumes, cfg.thresholds.sigma_mad
             )
             warns: list[Warning] = list(pool_warnings)
+            mad_fallback = False
 
             if excluded > 0:
                 warns.append(Warning(
@@ -457,6 +556,7 @@ def _try_direct_stable_pools_windowed(
                     message=f"{excluded} swap(s) excluded by MAD filter (sigma_mad={cfg.thresholds.sigma_mad}).",
                 ))
             if not prices_clean:
+                mad_fallback = True
                 prices_clean, volumes_clean = prices, volumes
                 warns.append(Warning(
                     code="mad_filter_fallback",
@@ -477,12 +577,17 @@ def _try_direct_stable_pools_windowed(
                 continue
 
             rel = str(best_path.relative_to(cfg.paths.datasets_path))
+            warns.append(Warning(
+                code="block_metadata_aggregated",
+                message="VWMP aggregates multiple swaps/blocks; no single reference block.",
+                severity="info",
+            ))
             return PriceResult(
                 price_usd=price_vwmp,
                 timestamp_observed=timestamp,
                 branch_level=branch_level,
                 branch_label=branch_label,
-                data_status="observed",
+                data_status=_windowed_status(step_idx, mad_fallback),
                 files_used=[rel],
                 calculation_path=[
                     f"VWMP({len(prices_clean)} swaps, window ±{half:.0f}s)",
@@ -497,6 +602,11 @@ def _try_direct_stable_pools_windowed(
                 swap_count=len(prices_clean),
                 window_seconds=float(window_s),
                 excluded_swaps=excluded,
+                initial_window_seconds=float(_WINDOW_STEPS[granularity][0]),
+                window_start_utc=w_start,
+                window_end_utc=w_end,
+                window_bound_policy=_WINDOW_BOUND_POLICY,
+                expansion_step=step_idx,
             )
 
     return None
@@ -558,7 +668,7 @@ def _try_cross_rate_pools_windowed(
         if vol_col:
             cols.append(vol_col)
 
-        for window_s in _WINDOW_STEPS[granularity]:
+        for step_idx, window_s in enumerate(_WINDOW_STEPS[granularity]):
             half = window_s / 2.0
             w_start = timestamp - timedelta(seconds=half)
             w_end = timestamp + timedelta(seconds=half)
@@ -581,6 +691,7 @@ def _try_cross_rate_pools_windowed(
                 prices_eth, volumes, cfg.thresholds.sigma_mad
             )
             warns: list[Warning] = list(z_warns)
+            mad_fallback = False
 
             if excluded > 0:
                 warns.append(Warning(
@@ -588,6 +699,7 @@ def _try_cross_rate_pools_windowed(
                     message=f"{excluded} swap(s) excluded by MAD filter.",
                 ))
             if not prices_clean:
+                mad_fallback = True
                 prices_clean, volumes_clean = prices_eth, volumes
                 warns.append(Warning(
                     code="mad_filter_fallback",
@@ -614,12 +726,17 @@ def _try_cross_rate_pools_windowed(
             if eth_file:
                 files.append(eth_file)
 
+            warns.append(Warning(
+                code="block_metadata_aggregated",
+                message="VWMP aggregates multiple swaps/blocks; no single reference block.",
+                severity="info",
+            ))
             return PriceResult(
                 price_usd=price_usd,
                 timestamp_observed=timestamp,
                 branch_level=branch_level,
                 branch_label=branch_label,
-                data_status="observed",
+                data_status=_windowed_status(step_idx, mad_fallback),
                 files_used=files,
                 calculation_path=[
                     f"{asset}/ETH VWMP({len(prices_clean)} swaps, ±{half:.0f}s): {rel_token}",
@@ -640,6 +757,11 @@ def _try_cross_rate_pools_windowed(
                 swap_count=len(prices_clean),
                 window_seconds=float(window_s),
                 excluded_swaps=excluded,
+                initial_window_seconds=float(_WINDOW_STEPS[granularity][0]),
+                window_start_utc=w_start,
+                window_end_utc=w_end,
+                window_bound_policy=_WINDOW_BOUND_POLICY,
+                expansion_step=step_idx,
             )
 
     return None
@@ -707,6 +829,7 @@ def _try_level_2_eth_curve(timestamp: datetime, cfg: AppConfig) -> PriceResult |
             mapped = schema.mapping.get(c)
             if mapped:
                 cols.append(mapped)
+        _append_block_cols(schema, cols)
 
         row = duckdb_client.latest_at_or_before(path, timestamp, cols, ts_col)
         if row is None or row.get(inv_col) is None or float(row[inv_col]) == 0:
@@ -717,6 +840,7 @@ def _try_level_2_eth_curve(timestamp: datetime, cfg: AppConfig) -> PriceResult |
         if zombie:
             continue
 
+        block_number, block_ts, block_warns = _extract_block_ref(schema, row)
         return PriceResult(
             price_usd=eth_usd,
             timestamp_observed=row[ts_col],
@@ -731,7 +855,10 @@ def _try_level_2_eth_curve(timestamp: datetime, cfg: AppConfig) -> PriceResult |
             detected_columns={path.name: schema.raw_columns},
             source_row=row,
             source_schema=schema,
-            warnings=z_warns,
+            warnings=z_warns + block_warns,
+            expansion_step=0,
+            reference_block_number=block_number,
+            reference_block_timestamp=block_ts,
         )
     return None
 
@@ -827,7 +954,7 @@ def _try_level_2_eth_curve_windowed(
         if vol_col:
             cols.append(vol_col)
 
-        for window_s in _WINDOW_STEPS[granularity]:
+        for step_idx, window_s in enumerate(_WINDOW_STEPS[granularity]):
             half = window_s / 2.0
             w_start = timestamp - timedelta(seconds=half)
             w_end = timestamp + timedelta(seconds=half)
@@ -848,12 +975,14 @@ def _try_level_2_eth_curve_windowed(
                 prices, volumes, cfg.thresholds.sigma_mad
             )
             warns: list[Warning] = list(z_warns)
+            mad_fallback = False
             if excluded > 0:
                 warns.append(Warning(
                     code="mad_outliers_excluded",
                     message=f"{excluded} swap(s) excluded by MAD filter.",
                 ))
             if not prices_clean:
+                mad_fallback = True
                 prices_clean, volumes_clean = prices, volumes
                 warns.append(Warning(
                     code="mad_filter_fallback",
@@ -864,12 +993,17 @@ def _try_level_2_eth_curve_windowed(
             if price_vwmp is None:
                 continue
 
+            warns.append(Warning(
+                code="block_metadata_aggregated",
+                message="VWMP aggregates multiple swaps/blocks; no single reference block.",
+                severity="info",
+            ))
             return PriceResult(
                 price_usd=price_vwmp,
                 timestamp_observed=timestamp,
                 branch_level="2",
                 branch_label="alternative_amm",
-                data_status="observed",
+                data_status=_windowed_status(step_idx, mad_fallback),
                 files_used=[rel],
                 calculation_path=[
                     f"Curve VWMP({len(prices_clean)} swaps, ±{half:.0f}s)",
@@ -884,6 +1018,11 @@ def _try_level_2_eth_curve_windowed(
                 swap_count=len(prices_clean),
                 window_seconds=float(window_s),
                 excluded_swaps=excluded,
+                initial_window_seconds=float(_WINDOW_STEPS[granularity][0]),
+                window_start_utc=w_start,
+                window_end_utc=w_end,
+                window_bound_policy=_WINDOW_BOUND_POLICY,
+                expansion_step=step_idx,
             )
 
     return None
@@ -913,11 +1052,15 @@ def _try_level_3(asset: str, timestamp: datetime, cfg: AppConfig) -> PriceResult
         if not ts_col or not price_col:
             continue
 
-        row = duckdb_client.latest_at_or_before(path, timestamp, [ts_col, price_col], ts_col)
+        cols = [ts_col, price_col]
+        _append_block_cols(schema, cols)
+        row = duckdb_client.latest_at_or_before(path, timestamp, cols, ts_col)
         if row is None or row.get(price_col) is None:
             continue
 
         rel = str(path.relative_to(cfg.paths.datasets_path))
+        # Chainlink feeds carry no block_number column → null + warning.
+        block_number, block_ts, block_warns = _extract_block_ref(schema, row)
         return PriceResult(
             price_usd=float(row[price_col]),
             timestamp_observed=row[ts_col],
@@ -929,6 +1072,10 @@ def _try_level_3(asset: str, timestamp: datetime, cfg: AppConfig) -> PriceResult
             detected_columns={path.name: schema.raw_columns},
             source_row=row,
             source_schema=schema,
+            warnings=block_warns,
+            expansion_step=0,
+            reference_block_number=block_number,
+            reference_block_timestamp=block_ts,
         )
     return None
 

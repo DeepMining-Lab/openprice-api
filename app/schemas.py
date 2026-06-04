@@ -37,6 +37,17 @@ class Provenance(BaseModel):
     swap_count: int | None = None
     window_seconds: float | None = None
     excluded_swaps: int | None = None
+    # Temporal provenance fields (mémoire §6.8.1). Additive — populated for
+    # windowed reads; null for raw point reads (no window).
+    initial_window_seconds: float | None = None
+    window_start_utc: datetime | None = None
+    window_end_utc: datetime | None = None
+    window_bound_policy: str | None = None
+    expansion_step: int | None = None
+    # Reference block b_ref(T) (mémoire §6.2.6). Populated from the winning
+    # source row when a block_number column exists (DEX); null otherwise.
+    reference_block_number: int | None = None
+    reference_block_timestamp: datetime | None = None
     parameters: dict[str, Any] = {}
     detected_columns: dict[str, list[str]] = {}
     warnings: list[Warning] = []

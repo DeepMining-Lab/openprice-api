@@ -549,6 +549,15 @@ const KV_LABELS = {
   composition_mode:        'Mode de composition',
 };
 
+// data_status (mémoire §6.2.5) → libellé FR + couleur
+const DATA_STATUS = {
+  observed:         { label: 'observé',            color: 'var(--ok)'    },
+  reconstructed:    { label: 'reconstruit (R1)',   color: 'var(--warn)'  },
+  rejected_outlier: { label: 'rejeté (aberrant)',  color: 'var(--err)'   },
+  oracle_fallback:  { label: 'repli oracle',       color: 'var(--warn)'  },
+  unavailable:      { label: 'indisponible',       color: 'var(--muted)' },
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // State
 // ─────────────────────────────────────────────────────────────────────────────
@@ -763,6 +772,7 @@ function renderPrice(d) {
   }
 
   const bi    = BRANCH_INFO[d.branch_level] || { label: d.branch_label, cls: 'b-4' };
+  const ds    = DATA_STATUS[d.data_status] || { label: d.data_status, color: 'var(--muted)' };
   const price = fmt(d.price_usd);
   const tReq  = d.timestamp_requested || d.timestamp;
   const lag   = lagSeconds(tReq, d.timestamp_observed);
@@ -780,7 +790,7 @@ function renderPrice(d) {
     </div>
     <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">
       <span class="badge ${bi.cls}">Niveau ${esc(d.branch_level)} — ${esc(bi.label)}</span>
-      <span style="font-size:.72rem;color:var(--muted)">${esc(d.data_status)}</span>
+      <span style="font-size:.72rem;color:${ds.color}" title="data_status = ${esc(d.data_status)}">${esc(ds.label)}</span>
     </div>
     <div class="meta-grid">
       <div class="meta-cell">
@@ -929,10 +939,33 @@ function renderAccordions(d) {
       timings.push(`<tr><td>Lag cross-rate</td><td style="color:${lagColor}">${fmtLag(p.cross_rate_lag_seconds)}</td></tr>`);
     }
 
+    // Granularité, comptes de swaps, fenêtre temporelle & expansion R1 (mémoire §6.8.1)
+    const temporal = [];
+    temporal.push(`<tr><td>Granularité</td><td>${esc(d.granularity || 'raw')}</td></tr>`);
+    if (p.n_raw != null)         temporal.push(`<tr><td>Swaps bruts (raw_swap_count)</td><td>${p.n_raw}</td></tr>`);
+    if (p.swap_count != null)    temporal.push(`<tr><td>Swaps retenus (valid_swap_count)</td><td>${p.swap_count}</td></tr>`);
+    if (p.excluded_swaps != null)temporal.push(`<tr><td>Swaps exclus (filtered_swap_count)</td><td>${p.excluded_swaps}</td></tr>`);
+    if (p.expansion_step != null)
+      temporal.push(`<tr><td>Palier d'expansion R1</td><td>${p.expansion_step}${p.expansion_step === 0 ? ' (fenêtre initiale)' : ''}</td></tr>`);
+    if (p.initial_window_seconds != null) temporal.push(`<tr><td>Fenêtre initiale Δ₀</td><td>${fmtWin(p.initial_window_seconds)}</td></tr>`);
+    if (p.window_seconds != null)         temporal.push(`<tr><td>Fenêtre effective</td><td>${fmtWin(p.window_seconds)}</td></tr>`);
+    if (p.window_start_utc) temporal.push(`<tr><td>Début de fenêtre</td><td>${fmtTs(p.window_start_utc)}</td></tr>`);
+    if (p.window_end_utc)   temporal.push(`<tr><td>Fin de fenêtre</td><td>${fmtTs(p.window_end_utc)}</td></tr>`);
+    if (p.window_bound_policy) temporal.push(`<tr><td>Convention de bornes</td><td>${esc(p.window_bound_policy)}</td></tr>`);
+
+    // Bloc de référence b_ref(T) (mémoire §6.2.6) — DEX uniquement
+    const blockRows = [];
+    if (p.reference_block_number != null)
+      blockRows.push(`<tr><td>Numéro de bloc</td><td>${p.reference_block_number.toLocaleString('fr-FR')}</td></tr>`);
+    if (p.reference_block_timestamp)
+      blockRows.push(`<tr><td>Horodatage du bloc</td><td>${fmtTs(p.reference_block_timestamp)}</td></tr>`);
+
     html += accordion('prov', 'Provenance &amp; traçabilité', `
       ${filesHtml ? `<div class="sub-label">Fichiers utilisés</div><ul class="file-list">${filesHtml}</ul>` : ''}
       ${calcHtml  ? `<div class="sub-label">Chemin de calcul</div><div class="calc-steps">${calcHtml}</div>` : ''}
       ${timings.length ? `<div class="sub-label">Horodatages des legs</div><table class="kv-table">${timings.join('')}</table>` : ''}
+      ${temporal.length ? `<div class="sub-label">Granularité &amp; fenêtre temporelle</div><table class="kv-table">${temporal.join('')}</table>` : ''}
+      ${blockRows.length ? `<div class="sub-label">Bloc de référence b_ref(T)</div><table class="kv-table">${blockRows.join('')}</table>` : ''}
       ${warningListHtml(p.warnings)}
     `);
   }
@@ -1017,6 +1050,12 @@ function fmtLag(s) {
   if (s < 60)   return `${Math.round(s)}s`;
   if (s < 3600) return `${Math.round(s / 60)}min`;
   return `${(s / 3600).toFixed(1)}h`;
+}
+
+function fmtWin(s) {
+  if (s == null) return '—';
+  const human = s < 60 ? `${s} s` : s < 3600 ? `${s / 60} min` : `${s / 3600} h`;
+  return `${s.toLocaleString('fr-FR')} s${s >= 60 ? ` (${human})` : ''}`;
 }
 
 function lagSeconds(req, obs) {

@@ -22,6 +22,13 @@ def build_provenance(result: PriceResult, extra_warnings: list[Warning] | None =
         swap_count=result.swap_count,
         window_seconds=result.window_seconds,
         excluded_swaps=result.excluded_swaps,
+        initial_window_seconds=result.initial_window_seconds,
+        window_start_utc=result.window_start_utc,
+        window_end_utc=result.window_end_utc,
+        window_bound_policy=result.window_bound_policy,
+        expansion_step=result.expansion_step,
+        reference_block_number=result.reference_block_number,
+        reference_block_timestamp=result.reference_block_timestamp,
         detected_columns=result.detected_columns,
         warnings=all_warnings,
     )
