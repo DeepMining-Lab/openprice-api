@@ -83,7 +83,6 @@ class ConfidenceV2Detail(BaseModel):
     subscores: dict[str, float | None]
     S_peg: float | None = None
     coherence_mode: str | None = None
-    qualitative_level: str | None = None
     weights: dict[str, float] | None = None
     parameters: dict[str, Any] | None = None
     warnings: list[Warning] = []

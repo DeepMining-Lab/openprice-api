@@ -172,7 +172,6 @@ def build_confidence_v2(
         subscores={"S_stat": s_stat, "S_liq": s_liq, "S_coh": s_coh},
         S_peg=s_peg,
         coherence_mode="oracle_only_staleness" if result.branch_level == "3" else None,
-        qualitative_level=v2.qualitative_level(c),
         weights=weights,
         parameters={
             "peg_tol": cfg.confidence_v2.peg.tol,

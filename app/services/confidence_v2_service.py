@@ -307,12 +307,3 @@ def fragility_flag(
     return score < threshold, []
 
 
-def qualitative_level(score: float | None) -> str | None:
-    """Optional 3-band qualitative level (annex field, not the primary signal)."""
-    if score is None:
-        return None
-    if score >= 0.80:
-        return "high"
-    if score >= 0.50:
-        return "medium"
-    return "low"

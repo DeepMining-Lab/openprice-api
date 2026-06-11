@@ -759,9 +759,55 @@ function renderPrice(d) {
   const card = document.getElementById('card-price');
   card.className = 'card fade-in';
 
+  const isV2 = selectedVersion === 'v2';
+
+  // V2 fragility badge — built once, used in both available and unavailable paths
+  let fragilityBadge = '';
+  if (isV2 && d.confidence && d.confidence.fragility_flag !== undefined) {
+    const ff = d.confidence.fragility_flag;
+    let flagLabel, flagBg, flagColor, flagBorder;
+    if (ff === null) {
+      flagLabel = 'non calibré';
+      flagBg    = 'rgba(156,163,175,.12)';
+      flagColor = 'var(--muted)';
+      flagBorder= 'rgba(156,163,175,.3)';
+    } else if (ff) {
+      flagLabel = '⚠ fragile';
+      flagBg    = 'rgba(239,68,68,.13)';
+      flagColor = '#ef4444';
+      flagBorder= 'rgba(239,68,68,.35)';
+    } else {
+      flagLabel = '✓ exploitable';
+      flagBg    = 'rgba(34,197,94,.13)';
+      flagColor = '#22c55e';
+      flagBorder= 'rgba(34,197,94,.35)';
+    }
+    fragilityBadge = `
+      <div style="display:flex;align-items:center;gap:.4rem;flex-shrink:0;">
+        <span style="font-size:.85rem;font-weight:700;padding:.32rem .95rem;border-radius:999px;background:${flagBg};color:${flagColor};border:1px solid ${flagBorder};white-space:nowrap;">${flagLabel}</span>
+        <span class="info-tip" tabindex="0" aria-label="Flag de fragilité">i
+          <span class="tip-box" style="right:0;">
+            <span class="tip-title">Flag de fragilité</span>
+            <span style="display:block;margin-bottom:.6rem;">Le flag de fragilité est un indicateur binaire qui distingue un prix &laquo;&nbsp;exploitable&nbsp;&raquo; d'un prix &laquo;&nbsp;fragile&nbsp;&raquo;. Il est activé lorsque l'Indice de Confiance passe sous un seuil calibré empiriquement (C&nbsp;&lt;&nbsp;0,57), déterminé par analyse statistique de l'écart aux prix de référence des bourses centralisées. Contrairement à la grille qualitative, dont les seuils sont indicatifs, ce seuil est justifié par les données. Il est fiable à la granularité horaire&nbsp;; aux granularités jour et minute, il est peu discriminant et doit être interprété avec prudence.</span>
+            <span class="tip-row">
+              <span class="tip-tag" style="background:rgba(239,68,68,.15);color:#fca5a5;">fragile</span>
+              <span>À ne pas utiliser tel quel pour un usage financier.</span>
+            </span>
+            <span class="tip-row">
+              <span class="tip-tag" style="background:rgba(34,197,94,.15);color:#86efac;">exploitable</span>
+              <span>Exploitable au regard du critère calibré.</span>
+            </span>
+          </span>
+        </span>
+      </div>`;
+  }
+
   if (d.price_usd == null) {
     card.innerHTML = `
-      <div class="section-title">Résultat — ${esc(d.asset)}</div>
+      <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem;margin-bottom:1rem;">
+        <div class="section-title" style="margin-bottom:0;">Résultat — ${esc(d.asset)}</div>
+        ${fragilityBadge}
+      </div>
       <div class="unavail-box">
         <strong>Prix indisponible</strong><br>
         ${esc(d.unavailable_reason || d.data_status)}
@@ -778,12 +824,14 @@ function renderPrice(d) {
   const lag   = lagSeconds(tReq, d.timestamp_observed);
 
   // V2 peg neutralization fields (absent in V1)
-  const isV2  = selectedVersion === 'v2';
-  const peg   = d.quote_currency_peg;
+  const peg    = d.quote_currency_peg;
   const pegOff = (peg != null) ? Math.abs(peg - 1) > 0.0025 : false;
 
   card.innerHTML = `
-    <div class="section-title">Résultat — ${esc(d.asset)}${isV2 ? ' · <span style="color:var(--purple)">V2</span>' : ''}</div>
+    <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem;margin-bottom:1rem;">
+      <div class="section-title" style="margin-bottom:0;">Résultat — ${esc(d.asset)}${isV2 ? ' · <span style="color:var(--purple)">V2</span>' : ''}</div>
+      ${fragilityBadge}
+    </div>
     <div class="price-big">
       <span class="price-amount">$${price}</span>
       <span class="price-sym">${esc(d.asset)}/USD</span>
@@ -875,18 +923,6 @@ function renderConfidence(c, price) {
       </div>`;
   }).join('');
 
-  // V2-only badges: fragility flag + qualitative level
-  let v2Meta = '';
-  if (c.qualitative_level) {
-    v2Meta += `<div style="font-size:.7rem;color:var(--muted);margin-top:.25rem;">Niveau qualitatif : <strong style="color:${scoreColor(score)}">${esc(c.qualitative_level)}</strong></div>`;
-  }
-  if (c.fragility_flag !== undefined) {
-    const ff = c.fragility_flag;
-    const txt = ff === null ? 'non calibré' : (ff ? 'fragile' : 'robuste');
-    const fc  = ff === null ? 'var(--muted)' : (ff ? 'var(--err)' : 'var(--ok)');
-    v2Meta += `<div style="font-size:.7rem;color:var(--muted);margin-top:.2rem;">Flag de fragilité : <strong style="color:${fc}">${txt}</strong></div>`;
-  }
-
   document.getElementById('conf-body').innerHTML = `
     <div class="conf-layout">
       <div class="gauge-wrap">
@@ -906,7 +942,6 @@ function renderConfidence(c, price) {
       <div class="sub-scores">
         ${subScores}
         ${mode ? `<div style="font-size:.7rem;color:var(--muted);margin-top:.25rem;">Mode : ${esc(mode)}</div>` : ''}
-        ${v2Meta}
         ${warningListHtml(c.warnings)}
       </div>
     </div>
