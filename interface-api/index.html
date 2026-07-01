@@ -654,7 +654,7 @@ function selectVersion(v) {
 
 function buildTimestamp() {
   const date = document.getElementById('inp-date').value || new Date().toISOString().slice(0, 10);
-  const h = selectedGran !== 'day'                        ? pad(document.getElementById('inp-hour').value)   : '00';
+  const h = selectedGran !== 'day'                        ? pad(document.getElementById('inp-hour').value)   : '12';
   const m = (selectedGran === 'minute' || selectedGran === 'raw') ? pad(document.getElementById('inp-minute').value)  : '00';
   return `${date}T${h}:${m}:00Z`;
 }
