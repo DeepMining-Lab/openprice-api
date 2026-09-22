@@ -1,0 +1,13 @@
+[Unit]
+Description=OpenPrice API V3 - incremental CSV -> Parquet sync
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=debian
+WorkingDirectory=/home/debian/OpenPrice-API/openprice-api
+ExecStart=/home/debian/OpenPrice-API/openprice-api/.venv/bin/python -m app.v3.sync
+Nice=10
+IOSchedulingClass=idle
+# The sync only consumes complete lines and swaps manifest.json atomically: it is safe to run
+# at any time, including while the extraction containers are appending to the CSV files.

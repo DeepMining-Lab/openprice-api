@@ -197,6 +197,27 @@ class ConfidenceV2Config(BaseModel):
     fragility: ConfidenceV2FragilityConfig = ConfidenceV2FragilityConfig()
 
 
+# ---------------------------------------------------------------------------
+# API V3 — performance engine (Parquet store). Isolated block with defaults:
+# V1/V2 ignore it entirely and `/v1/config` / `/v2/config` never expose it.
+# ---------------------------------------------------------------------------
+
+class V3Config(BaseModel):
+    # Derived data lives OUTSIDE the datasets directory (CSV files are never written to).
+    parquet_root: str = "~/openprice/parquet"
+    # True replays the V1/V2 behaviour that truncates the S_stat 7-day window and the
+    # windowed-VWMP window to `api.max_limit` rows (used only to prove parity with V2).
+    legacy_truncation: bool = False
+    cache_size: int = 4096            # LRU entries for point responses (0 disables)
+    duckdb_threads: int = 4
+    manifest_poll_seconds: float = 5.0
+    max_segments_before_compaction: int = 30
+
+    @property
+    def parquet_path(self) -> Path:
+        return Path(self.parquet_root).expanduser().resolve()
+
+
 class AppConfig(BaseModel):
     api: ApiConfig
     paths: PathsConfig
@@ -205,6 +226,7 @@ class AppConfig(BaseModel):
     chainlink: ChainlinkConfig
     scoring: ScoringConfig
     confidence_v2: ConfidenceV2Config = ConfidenceV2Config()
+    v3: V3Config = V3Config()
 
 
 _config: AppConfig | None = None

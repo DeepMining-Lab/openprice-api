@@ -74,3 +74,14 @@ confidence_v2:
     normalize_by_volatility: false
   fragility:
     c_threshold: 0.57       # calibrated at hourly granularity (ROC/Youden, AUC=0.80, mémoire §8.4)
+
+# --- API V3 performance engine ------------------------------
+# Isolated block: V1/V2 ignore it. V3 reads a Parquet copy of the CSV datasets built by
+#   python -m app.v3.sync        (incremental; run it after each daily CSV update)
+v3:
+  parquet_root: "~/openprice/parquet"   # derived data; never inside the datasets directory
+  legacy_truncation: false               # true = replay V1/V2 (window cut to api.max_limit rows) to prove parity
+  cache_size: 4096                       # LRU of point responses, invalidated on every dataset_version change
+  duckdb_threads: 4
+  manifest_poll_seconds: 5
+  max_segments_before_compaction: 30

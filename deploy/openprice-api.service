@@ -1,0 +1,21 @@
+# Proposed replacement for ../openprice-api.service (NOT installed automatically).
+# 2-4 workers: each request is ~95% DuckDB time, so extra processes scale throughput; every worker
+# holds its own DuckDB instance and LRU cache and reloads the Parquet manifest by itself.
+[Unit]
+Description=OpenPrice API
+After=network.target
+
+[Service]
+Type=simple
+User=debian
+WorkingDirectory=/home/debian/OpenPrice-API/openprice-api
+ExecStart=/home/debian/OpenPrice-API/openprice-api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000 --workers 3 --proxy-headers
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openprice-api
+# Bind 127.0.0.1 and put a reverse proxy (TLS + rate limit) in front, instead of 0.0.0.0.
+
+[Install]
+WantedBy=multi-user.target

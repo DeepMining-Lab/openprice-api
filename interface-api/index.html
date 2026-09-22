@@ -3,9 +3,63 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>OpenPrice Explorer</title>
+  <script>
+    // Applied before the stylesheet is evaluated, so the right theme paints on the
+    // very first frame (no dark-to-light or light-to-dark flash on load).
+    (function () {
+      try {
+        var t = localStorage.getItem('op-theme');
+        if (t === 'light' || t === 'dark') document.documentElement.setAttribute('data-theme', t);
+      } catch (_) {}
+    })();
+  </script>
+  <title>Open Price Explorer</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg">
   <style>
+    /* Light palette is the default; the dark palette below overrides it either when the
+       OS prefers dark AND no explicit choice was made, or when data-theme="dark" is set
+       explicitly. data-theme="light" always wins over the OS preference. */
     :root {
+      --bg:         #f8fafc;
+      --surface:    #ffffff;
+      --surface2:   #f1f5f9;
+      --surface3:   #e2e8f0;
+      --border:     #e2e8f0;
+      --border2:    #cbd5e1;
+      --text:       #0f172a;
+      --muted:      #64748b;
+      --accent:     #475569;
+      --accent2:    #334155;
+      --ok:         #16a34a;
+      --warn:       #b45309;
+      --err:        #dc2626;
+      --purple:     #9333ea;
+      --tagv1:      #475569;
+      --tagv2:      #7e22ce;
+      --tagv3:      #0e7490;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) {
+        --bg:         #0a0f1e;
+        --surface:    #111827;
+        --surface2:   #1f2937;
+        --surface3:   #374151;
+        --border:     #374151;
+        --border2:    #4b5563;
+        --text:       #f9fafb;
+        --muted:      #9ca3af;
+        --accent:     #94a3b8;
+        --accent2:    #64748b;
+        --ok:         #22c55e;
+        --warn:       #f59e0b;
+        --err:        #ef4444;
+        --purple:     #a855f7;
+        --tagv1:      #cbd5e1;
+        --tagv2:      #c084fc;
+        --tagv3:      #22d3ee;
+      }
+    }
+    :root[data-theme="dark"] {
       --bg:         #0a0f1e;
       --surface:    #111827;
       --surface2:   #1f2937;
@@ -14,12 +68,15 @@
       --border2:    #4b5563;
       --text:       #f9fafb;
       --muted:      #9ca3af;
-      --accent:     #06b6d4;
-      --accent2:    #3b82f6;
+      --accent:     #94a3b8;
+      --accent2:    #64748b;
       --ok:         #22c55e;
       --warn:       #f59e0b;
       --err:        #ef4444;
       --purple:     #a855f7;
+      --tagv1:      #cbd5e1;
+      --tagv2:      #c084fc;
+      --tagv3:      #22d3ee;
     }
 
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -31,6 +88,7 @@
       min-height: 100vh;
       padding: 2rem 1rem 4rem;
       line-height: 1.5;
+      transition: background .15s, color .15s;
     }
 
     /* ─── Layout ─────────────────────────────────────────────────── */
@@ -45,11 +103,9 @@
       margin-bottom: .6rem;
     }
     .logo-icon {
-      width: 36px; height: 36px;
-      background: linear-gradient(135deg, var(--accent), var(--accent2));
-      border-radius: 10px;
       display: flex; align-items: center; justify-content: center;
-      font-size: 1.1rem;
+      flex-shrink: 0;
+      color: var(--text); /* dark mark on light theme, light mark on dark theme */
     }
     .logo h1 {
       font-size: 1.6rem; font-weight: 700;
@@ -62,34 +118,45 @@
 
     /* ─── API bar ────────────────────────────────────────────────── */
     .api-bar {
-      display: flex; align-items: center; gap: .5rem;
+      display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+      row-gap: .6rem;
       margin-bottom: 1.5rem;
       background: var(--surface); border: 1px solid var(--border);
       border-radius: 8px; padding: .4rem .75rem;
     }
     .api-bar label { font-size: .7rem; color: var(--muted); white-space: nowrap; }
     .api-bar input {
-      flex: 1; background: transparent; border: none;
+      flex: 1; min-width: 120px; background: transparent; border: none;
       color: var(--text); font-size: .8rem; outline: none;
       font-family: monospace;
     }
-    #api-dot { font-size: .65rem; }
+    #api-dot { font-size: .65rem; white-space: nowrap; }
 
-    /* ─── Version selector ───────────────────────────────────────── */
+    /* ─── Pill groups (version / language selectors) ────────────────── */
     .ver-wrap { display: flex; align-items: center; gap: .4rem; white-space: nowrap; }
-    .ver-group {
+    .pill-group {
       display: flex; border: 1px solid var(--border2);
       border-radius: 7px; overflow: hidden;
     }
-    .ver-btn {
+    .pill-btn {
       padding: .3rem .7rem; background: transparent; border: none;
       color: var(--muted); cursor: pointer;
       font-size: .72rem; font-weight: 700; letter-spacing: .03em;
       transition: background .15s, color .15s;
     }
-    .ver-btn:not(:last-child) { border-right: 1px solid var(--border2); }
-    .ver-btn:hover { color: var(--text); }
-    .ver-btn.active { background: linear-gradient(135deg, #0891b2, #2563eb); color: #fff; }
+    .pill-btn:not(:last-child) { border-right: 1px solid var(--border2); }
+    .pill-btn:hover { color: var(--text); }
+    .pill-btn.active { background: linear-gradient(135deg, #475569, #334155); color: #fff; }
+
+    /* ─── Theme toggle ───────────────────────────────────────────── */
+    .icon-btn {
+      display: inline-flex; align-items: center; justify-content: center;
+      width: 26px; height: 26px; border-radius: 7px;
+      border: 1px solid var(--border2); background: transparent;
+      color: var(--muted); cursor: pointer; flex-shrink: 0;
+      transition: color .15s, border-color .15s;
+    }
+    .icon-btn:hover { color: var(--accent); border-color: var(--accent); }
 
     /* ─── Info tooltip ───────────────────────────────────────────── */
     .info-tip {
@@ -106,7 +173,7 @@
       width: 320px; max-width: 78vw;
       background: var(--surface2); border: 1px solid var(--border2);
       border-radius: 10px; padding: .9rem 1rem;
-      box-shadow: 0 12px 32px rgba(0,0,0,.45);
+      box-shadow: 0 12px 32px rgba(0,0,0,.35);
       font-size: .74rem; line-height: 1.5; color: var(--text);
       white-space: normal; text-align: left;
       opacity: 0; visibility: hidden; transform: translateY(-4px);
@@ -131,8 +198,9 @@
       padding: .05rem .4rem; border-radius: 5px; height: fit-content;
       letter-spacing: .03em;
     }
-    .tip-tag.v1 { background: rgba(148,163,184,.18); color: #cbd5e1; }
-    .tip-tag.v2 { background: rgba(168,85,247,.16); color: #c084fc; }
+    .tip-tag.v1 { background: color-mix(in srgb, var(--tagv1) 16%, transparent); color: var(--tagv1); }
+    .tip-tag.v2 { background: color-mix(in srgb, var(--tagv2) 16%, transparent); color: var(--tagv2); }
+    .tip-tag.v3 { background: color-mix(in srgb, var(--tagv3) 16%, transparent); color: var(--tagv3); }
     .tip-box code { font-family: monospace; color: var(--accent); font-size: .72rem; }
     .tip-box .muted { color: var(--muted); }
 
@@ -143,6 +211,7 @@
       border-radius: 14px;
       padding: 1.5rem;
       margin-bottom: 1rem;
+      transition: background .15s, border-color .15s;
     }
     .section-title {
       font-size: .65rem; font-weight: 700;
@@ -165,7 +234,7 @@
     }
     .token-btn:hover { border-color: var(--accent); color: var(--accent); }
     .token-btn.active {
-      background: linear-gradient(135deg, #0891b2, #2563eb);
+      background: linear-gradient(135deg, #475569, #334155);
       border-color: transparent; color: #fff;
     }
 
@@ -222,7 +291,7 @@
     /* ─── Submit ─────────────────────────────────────────────────── */
     .btn-primary {
       width: 100%; padding: .8rem;
-      background: linear-gradient(135deg, #0891b2, #2563eb);
+      background: linear-gradient(135deg, #475569, #334155);
       color: #fff; border: none; border-radius: 9px;
       font-size: .95rem; font-weight: 600;
       cursor: pointer; margin-top: 1.25rem;
@@ -251,12 +320,13 @@
       display: inline-flex; align-items: center; gap: .3rem;
       padding: .2rem .7rem; border-radius: 999px;
       font-size: .72rem; font-weight: 700; letter-spacing: .04em;
+      border: 1px solid;
     }
-    .b-0a { background: rgba(34,197,94,.12); color: #22c55e; border: 1px solid rgba(34,197,94,.3); }
-    .b-0b { background: rgba(6,182,212,.12); color: #06b6d4; border: 1px solid rgba(6,182,212,.3); }
-    .b-2  { background: rgba(168,85,247,.12); color: #a855f7; border: 1px solid rgba(168,85,247,.3); }
-    .b-3  { background: rgba(245,158,11,.12); color: #f59e0b; border: 1px solid rgba(245,158,11,.3); }
-    .b-4  { background: rgba(239,68,68,.12);  color: #ef4444; border: 1px solid rgba(239,68,68,.3); }
+    .b-0a { background: color-mix(in srgb, var(--ok) 12%, transparent);     color: var(--ok);     border-color: color-mix(in srgb, var(--ok) 30%, transparent); }
+    .b-0b { background: color-mix(in srgb, var(--accent) 12%, transparent); color: var(--accent); border-color: color-mix(in srgb, var(--accent) 30%, transparent); }
+    .b-2  { background: color-mix(in srgb, var(--purple) 12%, transparent); color: var(--purple); border-color: color-mix(in srgb, var(--purple) 30%, transparent); }
+    .b-3  { background: color-mix(in srgb, var(--warn) 12%, transparent);   color: var(--warn);   border-color: color-mix(in srgb, var(--warn) 30%, transparent); }
+    .b-4  { background: color-mix(in srgb, var(--err) 12%, transparent);    color: var(--err);    border-color: color-mix(in srgb, var(--err) 30%, transparent); }
 
     .meta-grid {
       display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
@@ -268,7 +338,8 @@
 
     /* Unavailable */
     .unavail-box {
-      background: rgba(239,68,68,.08); border: 1px solid rgba(239,68,68,.25);
+      background: color-mix(in srgb, var(--err) 8%, transparent);
+      border: 1px solid color-mix(in srgb, var(--err) 25%, transparent);
       border-radius: 9px; padding: 1rem 1.25rem;
       color: var(--err); font-size: .875rem;
     }
@@ -349,9 +420,9 @@
       padding: .45rem .75rem; border-radius: 7px;
       font-size: .78rem; border-left: 3px solid;
     }
-    .warn-info    { background: rgba(6,182,212,.08);  border-color: var(--accent); color: #67e8f9; }
-    .warn-warning { background: rgba(245,158,11,.08); border-color: var(--warn);   color: #fcd34d; }
-    .warn-error   { background: rgba(239,68,68,.08);  border-color: var(--err);    color: #fca5a5; }
+    .warn-info    { background: color-mix(in srgb, var(--accent) 8%, transparent); border-color: var(--accent); color: var(--accent); }
+    .warn-warning { background: color-mix(in srgb, var(--warn) 8%, transparent);   border-color: var(--warn);   color: var(--warn); }
+    .warn-error   { background: color-mix(in srgb, var(--err) 8%, transparent);    border-color: var(--err);    color: var(--err); }
     .warn-code { font-weight: 700; margin-right: .35rem; }
 
     /* ─── Spinner ────────────────────────────────────────────────── */
@@ -382,77 +453,80 @@
   <!-- Header -->
   <div class="header">
     <div class="logo">
-      <div class="logo-icon">◈</div>
-      <h1>OpenPrice</h1>
+      <div class="logo-icon" aria-hidden="true">
+        <svg viewBox="0 0 64 64" width="48" height="48" fill="none">
+          <circle cx="25" cy="32" r="16" fill="currentColor" opacity=".35"/>
+          <circle cx="39" cy="32" r="16" fill="currentColor" opacity=".35"/>
+          <circle cx="25" cy="32" r="16" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".8"/>
+          <circle cx="39" cy="32" r="16" fill="none" stroke="currentColor" stroke-width="1.2" opacity=".8"/>
+          <circle cx="32" cy="32" r="4" fill="currentColor"/>
+        </svg>
+      </div>
+      <h1>Open Price Explorer</h1>
     </div>
-    <p>Interrogez l'API de prix crypto — confiance et provenance complètes</p>
+    <p data-i18n="tagline">Interrogez l'API de prix crypto : confiance et provenance complètes</p>
   </div>
 
   <!-- API bar -->
   <div class="api-bar">
-    <label for="api-url">API</label>
+    <label for="api-url" data-i18n="apiLabel">API</label>
     <input type="text" id="api-url" value="http://127.0.0.1:8000"
            placeholder="http://127.0.0.1:8000"
            onchange="checkHealth()">
 
     <div class="ver-wrap">
-      <div class="ver-group" id="ver-group">
-        <button class="ver-btn active" data-ver="v1">V1</button>
-        <button class="ver-btn"        data-ver="v2">V2</button>
+      <div class="pill-group" id="ver-group">
+        <button class="pill-btn active" data-ver="v1">V1</button>
+        <button class="pill-btn"        data-ver="v2">V2</button>
+        <button class="pill-btn"        data-ver="v3">V3</button>
       </div>
-      <span class="info-tip" tabindex="0" aria-label="Différences entre V1 et V2">i
-        <span class="tip-box">
-          <span class="tip-title">V1 vs V2 — différences clés</span>
-          <span class="tip-row">
-            <span class="tip-tag v1">V1</span>
-            <span>Modèle du mémoire d'origine, <strong>gelé</strong>. Confiance <code>C = S_stat · S_liq · S_coh</code>. Le prix est servi tel quel, dans la devise du pool.</span>
-          </span>
-          <span class="tip-row">
-            <span class="tip-tag v2">V2</span>
-            <span><strong>Neutralisation du peg</strong> stablecoin avant <code>S_coh</code> : <code>price_usd = prix × peg(T)</code>. Nouveau sous-score <code>S_peg</code> qui signale un dépeg séparément, plus un <em>flag de fragilité</em>.</span>
-          </span>
-          <span class="tip-row">
-            <span class="muted">Concrètement, V2 évite les fausses alertes de cohérence lors d'un dépeg stablecoin (ex. USDC, faillite SVB le 11/03/2023) tout en remontant l'événement via <code>S_peg</code>.</span>
-          </span>
-        </span>
+      <span class="info-tip" tabindex="0" id="ver-info-tip" data-i18n-attr-arialabel="verTipAria">i
+        <span class="tip-box" id="ver-tip-box"><!-- filled by JS: updateStaticText() --></span>
       </span>
     </div>
 
-    <span id="api-dot" style="color:var(--muted)">● —</span>
+    <div class="pill-group" id="lang-group">
+      <button class="pill-btn active" data-lang="fr">FR</button>
+      <button class="pill-btn"        data-lang="en">EN</button>
+    </div>
+
+    <button class="icon-btn" id="theme-toggle" type="button" onclick="toggleTheme()"><!-- filled by JS --></button>
+
+    <span id="api-dot" style="color:var(--muted)">● …</span>
   </div>
 
   <!-- Controls -->
   <div class="card">
-    <div class="section-title">Token</div>
+    <div class="section-title" data-i18n="tokenTitle">Token</div>
     <div class="token-row" id="token-row">
       <!-- populated by JS -->
     </div>
 
     <div class="divider"></div>
 
-    <div class="section-title">Horodatage</div>
+    <div class="section-title" data-i18n="timestampTitle">Horodatage</div>
 
     <div class="gran-row" style="margin-bottom:1rem;">
-      <span class="gran-label">Granularité :</span>
+      <span class="gran-label" data-i18n="granLabel">Granularité :</span>
       <div class="gran-group">
-        <button class="gran-btn active" data-gran="raw">Raw</button>
-        <button class="gran-btn"        data-gran="minute">Minute</button>
-        <button class="gran-btn"        data-gran="hour">Heure</button>
-        <button class="gran-btn"        data-gran="day">Jour</button>
+        <button class="gran-btn active" data-gran="raw"    data-i18n="granRaw">Raw</button>
+        <button class="gran-btn"        data-gran="minute" data-i18n="granMinute">Minute</button>
+        <button class="gran-btn"        data-gran="hour"   data-i18n="granHour">Heure</button>
+        <button class="gran-btn"        data-gran="day"    data-i18n="granDay">Jour</button>
       </div>
     </div>
 
     <div class="dt-row">
       <div class="field">
-        <span class="field-label">Date</span>
+        <span class="field-label" data-i18n="dateLabel">Date</span>
         <input type="date" id="inp-date" oninput="updatePreview()">
       </div>
       <div class="field" id="fg-hour">
-        <span class="field-label">Heure (UTC)</span>
+        <span class="field-label" data-i18n="hourLabel">Heure (UTC)</span>
         <input type="number" id="inp-hour" min="0" max="23" value="0" oninput="clamp(this,0,23); updatePreview()">
       </div>
       <div class="field" id="fg-minute">
-        <span class="field-label">Minute</span>
+        <span class="field-label" data-i18n="minuteLabel">Minute</span>
         <input type="number" id="inp-minute" min="0" max="59" value="0" oninput="clamp(this,0,59); updatePreview()">
       </div>
     </div>
@@ -464,14 +538,14 @@
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M2 12h3M19 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12"/>
       </svg>
-      Options avancées
+      <span data-i18n="advToggle">Options avancées</span>
       <span class="adv-chevron" id="adv-chev">▾</span>
     </div>
 
     <div class="adv-panel" id="adv-panel">
       <div style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;">
         <div class="field">
-          <span class="field-label">Source</span>
+          <span class="field-label" data-i18n="sourceLabel">Source</span>
           <select id="inp-source">
             <option value="auto">auto</option>
             <option value="dex">dex</option>
@@ -479,20 +553,20 @@
           </select>
         </div>
         <div class="field">
-          <span class="field-label">Branch</span>
+          <span class="field-label" data-i18n="branchLabel">Branch</span>
           <select id="inp-branch">
             <option value="auto">auto</option>
-            <option value="0a">0a — direct_stable</option>
-            <option value="0b">0b — cross_rate</option>
-            <option value="2">2 — alternative_amm</option>
-            <option value="3">3 — chainlink_fallback</option>
+            <option value="0a">0a: direct_stable</option>
+            <option value="0b">0b: cross_rate</option>
+            <option value="2">2: alternative_amm</option>
+            <option value="3">3: chainlink_fallback</option>
           </select>
         </div>
       </div>
     </div>
 
     <button class="btn-primary" id="btn-query" onclick="runQuery()">
-      Interroger l'API
+      <span data-i18n="queryBtn">Interroger l'API</span>
     </button>
   </div>
 
@@ -502,7 +576,7 @@
     <div class="card fade-in" id="card-price"></div>
 
     <div class="card fade-in" id="card-conf" style="display:none;">
-      <div class="section-title">Indice de confiance</div>
+      <div class="section-title" data-i18n="confTitle">Indice de confiance</div>
       <div id="conf-body"></div>
     </div>
 
@@ -513,6 +587,217 @@
 </div><!-- /container -->
 
 <script>
+// ─────────────────────────────────────────────────────────────────────────────
+// i18n
+// ─────────────────────────────────────────────────────────────────────────────
+
+const I18N = {
+  fr: {
+    tagline: "Interrogez l'API de prix crypto : confiance et provenance complètes",
+    apiLabel: 'API',
+    tokenTitle: 'Token',
+    timestampTitle: 'Horodatage',
+    granLabel: 'Granularité :',
+    granRaw: 'Raw', granMinute: 'Minute', granHour: 'Heure', granDay: 'Jour',
+    dateLabel: 'Date', hourLabel: 'Heure (UTC)', minuteLabel: 'Minute',
+    advToggle: 'Options avancées',
+    sourceLabel: 'Source', branchLabel: 'Branch',
+    queryBtn: "Interroger l'API",
+    queryBtnBusy: 'Interrogation…',
+    confTitle: 'Indice de confiance',
+    themeToggleAria: 'Basculer entre thème clair et sombre',
+    verTipAria: 'Différences entre V1, V2 et V3',
+    verTipHtml: `
+      <span class="tip-title">V1, V2 et V3 : différences clés</span>
+      <span class="tip-row">
+        <span class="tip-tag v1">V1</span>
+        <span>Modèle du mémoire d'origine, <strong>gelé</strong>. Confiance <code>C = S_stat · S_liq · S_coh</code>. Le prix est servi tel quel, dans la devise du pool.</span>
+      </span>
+      <span class="tip-row">
+        <span class="tip-tag v2">V2</span>
+        <span><strong>Neutralisation du peg</strong> stablecoin avant <code>S_coh</code> : <code>price_usd = prix × peg(T)</code>. Nouveau sous-score <code>S_peg</code> qui signale un dépeg séparément, plus un <em>flag de fragilité</em>.</span>
+      </span>
+      <span class="tip-row">
+        <span class="muted">Concrètement, V2 évite les fausses alertes de cohérence lors d'un dépeg stablecoin (ex. USDC, faillite SVB le 11/03/2023) tout en remontant l'événement via <code>S_peg</code>.</span>
+      </span>
+      <span class="tip-row">
+        <span class="tip-tag v3">V3</span>
+        <span><strong>Même méthodologie et même schéma de réponse que V2</strong>, mais un moteur différent : les CSV sont pré-convertis en Parquet indexé au lieu d'être relus intégralement à chaque requête (~0,05&nbsp;s au lieu de 3 à 40&nbsp;s). Corrige aussi deux troncatures silencieuses de V1/V2 (fenêtre S_stat sur 7&nbsp;j et fenêtre VWMP <code>day</code>, plafonnées à 10&nbsp;000&nbsp;lignes) et ignore 110&nbsp;doublons d'échanges sur le pool ETH/USDC ; cela ne change que certains résultats ETH (voir README).</span>
+      </span>
+      <span class="tip-row">
+        <span class="muted">V1 et V2 restent inchangées (résultats reproductibles pour le mémoire) ; V3 est destinée à l'usage en production.</span>
+      </span>`,
+    errTitle: 'Erreur',
+    errUnreachable: "Impossible de contacter l'API : ",
+    resultTitle: 'Résultat',
+    priceUnavailable: 'Prix indisponible',
+    levelBadge: 'Niveau',
+    reqTimestamp: 'Horodatage demandé',
+    closestObs: 'Observation la plus proche',
+    lag: 'Lag',
+    quoteCurrency: 'Devise de cotation',
+    peg: 'Peg de la devise',
+    rawPrice: 'Prix brut (avant neutralisation)',
+    confidenceSub: 'confiance',
+    mode: 'Mode :',
+    fragUncalibrated: 'non calibré',
+    fragFragile: '⚠ fragile',
+    fragUsable: '✓ exploitable',
+    fragAria: 'Flag de fragilité',
+    fragTipHtml: (thr) => `
+      <span class="tip-title">Flag de fragilité</span>
+      <span style="display:block;margin-bottom:.6rem;">Le flag de fragilité est un indicateur binaire qui distingue un prix &laquo;&nbsp;exploitable&nbsp;&raquo; d'un prix &laquo;&nbsp;fragile&nbsp;&raquo;. Il est activé lorsque l'Indice de Confiance passe sous un seuil calibré empiriquement (C&nbsp;&lt;&nbsp;${thr}), déterminé par analyse statistique de l'écart aux prix de référence des bourses centralisées. Contrairement à la grille qualitative, dont les seuils sont indicatifs, ce seuil est justifié par les données. Il est fiable à la granularité horaire&nbsp;; aux granularités jour et minute, il est peu discriminant et doit être interprété avec prudence.</span>
+      <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--err) 15%, transparent);color:var(--err);">fragile</span><span>À ne pas utiliser tel quel pour un usage financier.</span></span>
+      <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--ok) 15%, transparent);color:var(--ok);">exploitable</span><span>Exploitable au regard du critère calibré.</span></span>`,
+    ssMeta: {
+      S_stat: { label: 'Qualité statistique', desc: 'Z-score MAD sur fenêtre 7 jours' },
+      S_liq:  { label: 'Liquidité',           desc: 'Profondeur TVL × slippage' },
+      S_coh:  { label: 'Cohérence oracle',    desc: 'Déviation DEX vs Chainlink' },
+      S_peg:  { label: 'Stabilité du peg',    desc: 'Écart du stablecoin au dollar (V2)' },
+    },
+    accProvenance: 'Provenance &amp; traçabilité',
+    accParams: 'Paramètres &amp; pondérations',
+    filesUsed: 'Fichiers utilisés',
+    calcPath: 'Chemin de calcul',
+    legTimestamps: 'Horodatages des legs',
+    granWindow: 'Granularité &amp; fenêtre temporelle',
+    refBlock: 'Bloc de référence b_ref(T)',
+    thresholds: 'Seuils méthodologiques',
+    weights: 'Pondérations',
+    tokenLeg: 'Token leg', ethLeg: 'ETH/USD leg', crossLag: 'Lag cross-rate',
+    granularity: 'Granularité',
+    rawSwaps: 'Swaps bruts (raw_swap_count)',
+    keptSwaps: 'Swaps retenus (valid_swap_count)',
+    excludedSwaps: 'Swaps exclus (filtered_swap_count)',
+    r1Step: "Palier d'expansion R1",
+    r1Initial: ' (fenêtre initiale)',
+    initWindow: 'Fenêtre initiale Δ₀',
+    effWindow: 'Fenêtre effective',
+    winStart: 'Début de fenêtre',
+    winEnd: 'Fin de fenêtre',
+    boundPolicy: 'Convention de bornes',
+    blockNumber: 'Numéro de bloc',
+    blockTs: 'Horodatage du bloc',
+    kv: {
+      seuil_TVL_min_usd: 'TVL minimum (USD)', seuil_vol_min_usd_24h: 'Volume 24h min (USD)',
+      fenetre_inactivite_jours: 'Fenêtre inactivité (jours)', sigma_mad: 'σ_MAD (sensibilité S_stat)',
+      slip_max: 'Slippage max (S_liq)', w_stat: 'Poids w_stat', w_liq: 'Poids w_liq', w_coh: 'Poids w_coh',
+      w_peg: 'Poids w_peg (V2)', peg_tol: 'Tolérance peg (V2)', c_threshold: 'Seuil de fragilité (V2)',
+      composition_mode: 'Mode de composition',
+    },
+    dataStatus: {
+      observed: 'observé', reconstructed: 'reconstruit (R1)', rejected_outlier: 'rejeté (aberrant)',
+      oracle_fallback: 'repli oracle', unavailable: 'indisponible',
+    },
+    locale: 'fr-FR',
+  },
+  en: {
+    tagline: 'Query the crypto price API: full confidence and provenance',
+    apiLabel: 'API',
+    tokenTitle: 'Token',
+    timestampTitle: 'Timestamp',
+    granLabel: 'Granularity:',
+    granRaw: 'Raw', granMinute: 'Minute', granHour: 'Hour', granDay: 'Day',
+    dateLabel: 'Date', hourLabel: 'Hour (UTC)', minuteLabel: 'Minute',
+    advToggle: 'Advanced options',
+    sourceLabel: 'Source', branchLabel: 'Branch',
+    queryBtn: 'Query the API',
+    queryBtnBusy: 'Querying…',
+    confTitle: 'Confidence index',
+    themeToggleAria: 'Toggle light / dark theme',
+    verTipAria: 'Differences between V1, V2 and V3',
+    verTipHtml: `
+      <span class="tip-title">V1, V2 and V3: key differences</span>
+      <span class="tip-row">
+        <span class="tip-tag v1">V1</span>
+        <span>Original mémoire model, <strong>frozen</strong>. Confidence <code>C = S_stat · S_liq · S_coh</code>. The price is served as-is, in the pool's quote currency.</span>
+      </span>
+      <span class="tip-row">
+        <span class="tip-tag v2">V2</span>
+        <span><strong>Stablecoin peg neutralization</strong> before <code>S_coh</code>: <code>price_usd = price × peg(T)</code>. New <code>S_peg</code> sub-score reports a depeg separately, plus a <em>fragility flag</em>.</span>
+      </span>
+      <span class="tip-row">
+        <span class="muted">In practice, V2 avoids false coherence alarms during a stablecoin depeg (e.g. USDC, the SVB failure on 2023-03-11) while still surfacing the event through <code>S_peg</code>.</span>
+      </span>
+      <span class="tip-row">
+        <span class="tip-tag v3">V3</span>
+        <span><strong>Same methodology and response schema as V2</strong>, but a different engine: CSVs are pre-converted to an indexed Parquet store instead of being scanned in full on every request (~0.05&nbsp;s instead of 3 to 40&nbsp;s). Also fixes two silent V1/V2 truncations (the 7-day S_stat window and the <code>day</code>-granularity VWMP window, both capped at 10,000&nbsp;rows) and ignores 110&nbsp;duplicated swap events on the ETH/USDC pool; this only changes some ETH results (see README).</span>
+      </span>
+      <span class="tip-row">
+        <span class="muted">V1 and V2 stay unchanged (reproducible results for the mémoire); V3 is meant for production use.</span>
+      </span>`,
+    errTitle: 'Error',
+    errUnreachable: 'Could not reach the API: ',
+    resultTitle: 'Result',
+    priceUnavailable: 'Price unavailable',
+    levelBadge: 'Level',
+    reqTimestamp: 'Requested timestamp',
+    closestObs: 'Closest observation',
+    lag: 'Lag',
+    quoteCurrency: 'Quote currency',
+    peg: 'Currency peg',
+    rawPrice: 'Raw price (before neutralization)',
+    confidenceSub: 'confidence',
+    mode: 'Mode:',
+    fragUncalibrated: 'uncalibrated',
+    fragFragile: '⚠ fragile',
+    fragUsable: '✓ usable',
+    fragAria: 'Fragility flag',
+    fragTipHtml: (thr) => `
+      <span class="tip-title">Fragility flag</span>
+      <span style="display:block;margin-bottom:.6rem;">The fragility flag is a binary indicator that separates a &laquo;&nbsp;usable&nbsp;&raquo; price from a &laquo;&nbsp;fragile&nbsp;&raquo; one. It is set when the confidence index drops below an empirically calibrated threshold (C&nbsp;&lt;&nbsp;${thr}), determined by statistical analysis of the deviation from centralized-exchange reference prices. Unlike the qualitative grid, whose thresholds are indicative, this one is data-justified. It is reliable at hourly granularity; at day and minute granularity it is not very discriminant and should be read with caution.</span>
+      <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--err) 15%, transparent);color:var(--err);">fragile</span><span>Not to be used as-is for a financial purpose.</span></span>
+      <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--ok) 15%, transparent);color:var(--ok);">usable</span><span>Usable per the calibrated criterion.</span></span>`,
+    ssMeta: {
+      S_stat: { label: 'Statistical quality', desc: 'MAD Z-score over a 7-day window' },
+      S_liq:  { label: 'Liquidity',           desc: 'TVL depth × slippage' },
+      S_coh:  { label: 'Oracle coherence',    desc: 'DEX vs Chainlink deviation' },
+      S_peg:  { label: 'Peg stability',       desc: 'Stablecoin deviation from the dollar (V2)' },
+    },
+    accProvenance: 'Provenance &amp; traceability',
+    accParams: 'Parameters &amp; weights',
+    filesUsed: 'Files used',
+    calcPath: 'Calculation path',
+    legTimestamps: 'Leg timestamps',
+    granWindow: 'Granularity &amp; time window',
+    refBlock: 'Reference block b_ref(T)',
+    thresholds: 'Methodological thresholds',
+    weights: 'Weights',
+    tokenLeg: 'Token leg', ethLeg: 'ETH/USD leg', crossLag: 'Cross-rate lag',
+    granularity: 'Granularity',
+    rawSwaps: 'Raw swaps (raw_swap_count)',
+    keptSwaps: 'Retained swaps (valid_swap_count)',
+    excludedSwaps: 'Excluded swaps (filtered_swap_count)',
+    r1Step: 'R1 expansion step',
+    r1Initial: ' (initial window)',
+    initWindow: 'Initial window Δ₀',
+    effWindow: 'Effective window',
+    winStart: 'Window start',
+    winEnd: 'Window end',
+    boundPolicy: 'Boundary convention',
+    blockNumber: 'Block number',
+    blockTs: 'Block timestamp',
+    kv: {
+      seuil_TVL_min_usd: 'Minimum TVL (USD)', seuil_vol_min_usd_24h: 'Min 24h volume (USD)',
+      fenetre_inactivite_jours: 'Inactivity window (days)', sigma_mad: 'σ_MAD (S_stat sensitivity)',
+      slip_max: 'Max slippage (S_liq)', w_stat: 'Weight w_stat', w_liq: 'Weight w_liq', w_coh: 'Weight w_coh',
+      w_peg: 'Weight w_peg (V2)', peg_tol: 'Peg tolerance (V2)', c_threshold: 'Fragility threshold (V2)',
+      composition_mode: 'Composition mode',
+    },
+    dataStatus: {
+      observed: 'observed', reconstructed: 'reconstructed (R1)', rejected_outlier: 'rejected (outlier)',
+      oracle_fallback: 'oracle fallback', unavailable: 'unavailable',
+    },
+    locale: 'en-US',
+  },
+};
+
+let currentLang = 'fr';
+function t(key) { return I18N[currentLang][key]; }
+function locale() { return I18N[currentLang].locale; }
+// French typography spaces before a colon; English does not.
+function colon() { return currentLang === 'fr' ? ' : ' : ': '; }
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Config
 // ─────────────────────────────────────────────────────────────────────────────
@@ -527,36 +812,8 @@ const BRANCH_INFO = {
   '4':  { label: 'unavailable',         cls: 'b-4'  },
 };
 
-const SS_META = {
-  S_stat: { name: 'S_stat', label: 'Qualité statistique', desc: 'Z-score MAD sur fenêtre 7 jours' },
-  S_liq:  { name: 'S_liq',  label: 'Liquidité',           desc: 'Profondeur TVL × slippage' },
-  S_coh:  { name: 'S_coh',  label: 'Cohérence oracle',    desc: 'Déviation DEX vs Chainlink' },
-  S_peg:  { name: 'S_peg',  label: 'Stabilité du peg',    desc: 'Écart du stablecoin au dollar (V2)' },
-};
-
-const KV_LABELS = {
-  seuil_TVL_min_usd:       'TVL minimum (USD)',
-  seuil_vol_min_usd_24h:   'Volume 24h min (USD)',
-  fenetre_inactivite_jours:'Fenêtre inactivité (jours)',
-  sigma_mad:               'σ_MAD (sensibilité S_stat)',
-  slip_max:                'Slippage max (S_liq)',
-  w_stat:                  'Poids w_stat',
-  w_liq:                   'Poids w_liq',
-  w_coh:                   'Poids w_coh',
-  w_peg:                   'Poids w_peg (V2)',
-  peg_tol:                 'Tolérance peg (V2)',
-  c_threshold:             'Seuil de fragilité (V2)',
-  composition_mode:        'Mode de composition',
-};
-
-// data_status (mémoire §6.2.5) → libellé FR + couleur
-const DATA_STATUS = {
-  observed:         { label: 'observé',            color: 'var(--ok)'    },
-  reconstructed:    { label: 'reconstruit (R1)',   color: 'var(--warn)'  },
-  rejected_outlier: { label: 'rejeté (aberrant)',  color: 'var(--err)'   },
-  oracle_fallback:  { label: 'repli oracle',       color: 'var(--warn)'  },
-  unavailable:      { label: 'indisponible',       color: 'var(--muted)' },
-};
+const SUN_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>`;
+const MOON_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -565,6 +822,8 @@ const DATA_STATUS = {
 let selectedToken   = 'ETH';
 let selectedGran    = 'raw';
 let selectedVersion = 'v1';
+let lastResult       = null; // last successful API response, re-rendered on language switch
+let lastResultLabel  = null; // { asset, version } of lastResult, for the "Result" header
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Init
@@ -600,12 +859,93 @@ async function init() {
   selectGran(selectedGran);
 
   // Version buttons
-  document.querySelectorAll('.ver-btn').forEach(b => {
+  document.querySelectorAll('#ver-group .pill-btn').forEach(b => {
     b.addEventListener('click', () => selectVersion(b.dataset.ver));
   });
 
+  // Language buttons
+  document.querySelectorAll('#lang-group .pill-btn').forEach(b => {
+    b.addEventListener('click', () => selectLang(b.dataset.lang));
+  });
+  try {
+    const savedLang = localStorage.getItem('op-lang');
+    if (savedLang === 'fr' || savedLang === 'en') currentLang = savedLang;
+  } catch (_) {}
+  applyLang();
+
+  initTheme();
   updatePreview();
   checkHealth();
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Language
+// ─────────────────────────────────────────────────────────────────────────────
+
+function selectLang(l) {
+  currentLang = l;
+  try { localStorage.setItem('op-lang', l); } catch (_) {}
+  applyLang();
+}
+
+function applyLang() {
+  document.documentElement.lang = currentLang;
+  document.querySelectorAll('#lang-group .pill-btn').forEach(b => b.classList.toggle('active', b.dataset.lang === currentLang));
+
+  // Plain text nodes
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    el.textContent = t(el.dataset.i18n);
+  });
+  // Attributes (aria-label etc.)
+  document.querySelectorAll('[data-i18n-attr-arialabel]').forEach(el => {
+    el.setAttribute('aria-label', t(el.dataset.i18nAttrArialabel));
+  });
+
+  document.getElementById('ver-tip-box').innerHTML = t('verTipHtml');
+
+  const btn = document.getElementById('btn-query');
+  if (!btn.disabled) btn.querySelector('[data-i18n]').textContent = t('queryBtn');
+
+  // Re-render the last result (if any) so every dynamically-built string updates too.
+  if (lastResult) renderResult(lastResult);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Theme
+// ─────────────────────────────────────────────────────────────────────────────
+
+function explicitTheme() {
+  try {
+    const t = localStorage.getItem('op-theme');
+    return (t === 'light' || t === 'dark') ? t : null;
+  } catch (_) { return null; }
+}
+
+function effectiveTheme() {
+  return explicitTheme() || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+}
+
+function initTheme() {
+  updateThemeButton();
+  const mq = window.matchMedia('(prefers-color-scheme: dark)');
+  const onChange = () => { if (!explicitTheme()) updateThemeButton(); };
+  if (mq.addEventListener) mq.addEventListener('change', onChange);
+  else if (mq.addListener) mq.addListener(onChange); // older Safari
+}
+
+function toggleTheme() {
+  const next = effectiveTheme() === 'dark' ? 'light' : 'dark';
+  document.documentElement.setAttribute('data-theme', next);
+  try { localStorage.setItem('op-theme', next); } catch (_) {}
+  updateThemeButton();
+}
+
+function updateThemeButton() {
+  const btn = document.getElementById('theme-toggle');
+  const eff = effectiveTheme();
+  btn.innerHTML = eff === 'dark' ? SUN_SVG : MOON_SVG; // icon = theme you'd switch TO
+  btn.setAttribute('aria-label', t ? t('themeToggleAria') : 'Toggle light / dark theme');
+  btn.title = btn.getAttribute('aria-label');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -615,13 +955,13 @@ async function init() {
 function buildTokenPills(tokens) {
   const row = document.getElementById('token-row');
   row.innerHTML = '';
-  tokens.forEach(t => {
+  tokens.forEach(tok => {
     const btn = document.createElement('button');
-    btn.className = 'token-btn' + (t === selectedToken ? ' active' : '');
-    btn.textContent = t;
+    btn.className = 'token-btn' + (tok === selectedToken ? ' active' : '');
+    btn.textContent = tok;
     btn.addEventListener('click', () => {
-      selectedToken = t;
-      document.querySelectorAll('.token-btn').forEach(b => b.classList.toggle('active', b.textContent === t));
+      selectedToken = tok;
+      document.querySelectorAll('.token-btn').forEach(b => b.classList.toggle('active', b.textContent === tok));
     });
     row.appendChild(btn);
   });
@@ -645,7 +985,7 @@ function selectGran(g) {
 
 function selectVersion(v) {
   selectedVersion = v;
-  document.querySelectorAll('.ver-btn').forEach(b => b.classList.toggle('active', b.dataset.ver === v));
+  document.querySelectorAll('#ver-group .pill-btn').forEach(b => b.classList.toggle('active', b.dataset.ver === v));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -706,26 +1046,32 @@ async function checkHealth() {
 async function runQuery() {
   const btn = document.getElementById('btn-query');
   btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Interrogation…';
+  btn.innerHTML = `<span class="spinner"></span> ${esc(t('queryBtnBusy'))}`;
 
   const ts     = buildTimestamp();
   const source = document.getElementById('inp-source').value;
   const branch = document.getElementById('inp-branch').value;
-  const url    = `${apiBase()}/${selectedVersion}/prices/${selectedToken}/at?timestamp=${encodeURIComponent(ts)}&granularity=${selectedGran}&source=${source}&branch=${branch}&include_confidence=true&include_provenance=true`;
+  const versionAtRequest = selectedVersion;
+  const url    = `${apiBase()}/${versionAtRequest}/prices/${selectedToken}/at?timestamp=${encodeURIComponent(ts)}&granularity=${selectedGran}&source=${source}&branch=${branch}&include_confidence=true&include_provenance=true`;
 
   try {
     const r = await fetch(url);
     if (!r.ok) {
       const err = await r.json().catch(() => ({ detail: r.statusText }));
+      lastResult = null;
       renderError(err.detail || r.statusText);
     } else {
-      renderResult(await r.json());
+      const body = await r.json();
+      lastResult = body;
+      lastResultLabel = { asset: selectedToken, version: versionAtRequest };
+      renderResult(body);
     }
   } catch (e) {
-    renderError('Impossible de contacter l\'API : ' + e.message);
+    lastResult = null;
+    renderError(t('errUnreachable') + e.message);
   } finally {
     btn.disabled = false;
-    btn.textContent = 'Interroger l\'API';
+    btn.innerHTML = `<span data-i18n="queryBtn">${esc(t('queryBtn'))}</span>`;
   }
 }
 
@@ -736,7 +1082,7 @@ async function runQuery() {
 function renderError(msg) {
   show('results');
   document.getElementById('card-price').innerHTML = `
-    <div class="unavail-box"><strong>Erreur</strong><br>${esc(String(msg))}</div>`;
+    <div class="unavail-box"><strong>${esc(t('errTitle'))}</strong><br>${esc(String(msg))}</div>`;
   hide('card-conf');
   document.getElementById('acc-section').innerHTML = '';
   addClass('card-price', 'fade-in');
@@ -759,45 +1105,24 @@ function renderPrice(d) {
   const card = document.getElementById('card-price');
   card.className = 'card fade-in';
 
-  const isV2 = selectedVersion === 'v2';
+  const ver = (lastResultLabel && lastResultLabel.version) || selectedVersion;
+  const isV2 = ver === 'v2' || ver === 'v3';  // V3 returns the V2 schema
+  const verColor = ver === 'v3' ? 'var(--accent)' : 'var(--purple)';
 
-  // V2 fragility badge — built once, used in both available and unavailable paths
+  // V2 fragility badge: built once, used in both available and unavailable paths
   let fragilityBadge = '';
   if (isV2 && d.confidence && d.confidence.fragility_flag !== undefined) {
     const ff = d.confidence.fragility_flag;
-    let flagLabel, flagBg, flagColor, flagBorder;
-    if (ff === null) {
-      flagLabel = 'non calibré';
-      flagBg    = 'rgba(156,163,175,.12)';
-      flagColor = 'var(--muted)';
-      flagBorder= 'rgba(156,163,175,.3)';
-    } else if (ff) {
-      flagLabel = '⚠ fragile';
-      flagBg    = 'rgba(239,68,68,.13)';
-      flagColor = '#ef4444';
-      flagBorder= 'rgba(239,68,68,.35)';
-    } else {
-      flagLabel = '✓ exploitable';
-      flagBg    = 'rgba(34,197,94,.13)';
-      flagColor = '#22c55e';
-      flagBorder= 'rgba(34,197,94,.35)';
-    }
+    let flagLabel, flagVar;
+    if (ff === null) { flagLabel = t('fragUncalibrated'); flagVar = '--muted'; }
+    else if (ff) { flagLabel = t('fragFragile'); flagVar = '--err'; }
+    else { flagLabel = t('fragUsable'); flagVar = '--ok'; }
+    const thr = d.confidence.parameters && d.confidence.parameters.fragility_c_threshold;
     fragilityBadge = `
       <div style="display:flex;align-items:center;gap:.4rem;flex-shrink:0;">
-        <span style="font-size:.85rem;font-weight:700;padding:.32rem .95rem;border-radius:999px;background:${flagBg};color:${flagColor};border:1px solid ${flagBorder};white-space:nowrap;">${flagLabel}</span>
-        <span class="info-tip" tabindex="0" aria-label="Flag de fragilité">i
-          <span class="tip-box" style="right:0;">
-            <span class="tip-title">Flag de fragilité</span>
-            <span style="display:block;margin-bottom:.6rem;">Le flag de fragilité est un indicateur binaire qui distingue un prix &laquo;&nbsp;exploitable&nbsp;&raquo; d'un prix &laquo;&nbsp;fragile&nbsp;&raquo;. Il est activé lorsque l'Indice de Confiance passe sous un seuil calibré empiriquement (C&nbsp;&lt;&nbsp;0,57), déterminé par analyse statistique de l'écart aux prix de référence des bourses centralisées. Contrairement à la grille qualitative, dont les seuils sont indicatifs, ce seuil est justifié par les données. Il est fiable à la granularité horaire&nbsp;; aux granularités jour et minute, il est peu discriminant et doit être interprété avec prudence.</span>
-            <span class="tip-row">
-              <span class="tip-tag" style="background:rgba(239,68,68,.15);color:#fca5a5;">fragile</span>
-              <span>À ne pas utiliser tel quel pour un usage financier.</span>
-            </span>
-            <span class="tip-row">
-              <span class="tip-tag" style="background:rgba(34,197,94,.15);color:#86efac;">exploitable</span>
-              <span>Exploitable au regard du critère calibré.</span>
-            </span>
-          </span>
+        <span style="font-size:.85rem;font-weight:700;padding:.32rem .95rem;border-radius:999px;background:color-mix(in srgb, var(${flagVar}) 13%, transparent);color:var(${flagVar});border:1px solid color-mix(in srgb, var(${flagVar}) 35%, transparent);white-space:nowrap;">${esc(flagLabel)}</span>
+        <span class="info-tip" tabindex="0" aria-label="${esc(t('fragAria'))}">i
+          <span class="tip-box" style="right:0;">${t('fragTipHtml')(thr != null ? fmt(thr) : '0,57')}</span>
         </span>
       </div>`;
   }
@@ -805,11 +1130,11 @@ function renderPrice(d) {
   if (d.price_usd == null) {
     card.innerHTML = `
       <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem;margin-bottom:1rem;">
-        <div class="section-title" style="margin-bottom:0;">Résultat — ${esc(d.asset)}</div>
+        <div class="section-title" style="margin-bottom:0;">${esc(t('resultTitle'))}${colon()}${esc(d.asset)}</div>
         ${fragilityBadge}
       </div>
       <div class="unavail-box">
-        <strong>Prix indisponible</strong><br>
+        <strong>${esc(t('priceUnavailable'))}</strong><br>
         ${esc(d.unavailable_reason || d.data_status)}
       </div>
       ${warningListHtml(d.warnings)}
@@ -818,7 +1143,9 @@ function renderPrice(d) {
   }
 
   const bi    = BRANCH_INFO[d.branch_level] || { label: d.branch_label, cls: 'b-4' };
-  const ds    = DATA_STATUS[d.data_status] || { label: d.data_status, color: 'var(--muted)' };
+  const dsMeta = t('dataStatus')[d.data_status];
+  const dsLabel = dsMeta || d.data_status;
+  const dsColor = { observed: 'var(--ok)', reconstructed: 'var(--warn)', rejected_outlier: 'var(--err)', oracle_fallback: 'var(--warn)', unavailable: 'var(--muted)' }[d.data_status] || 'var(--muted)';
   const price = fmt(d.price_usd);
   const tReq  = d.timestamp_requested || d.timestamp;
   const lag   = lagSeconds(tReq, d.timestamp_observed);
@@ -829,7 +1156,7 @@ function renderPrice(d) {
 
   card.innerHTML = `
     <div style="display:flex;align-items:flex-start;justify-content:space-between;gap:.75rem;margin-bottom:1rem;">
-      <div class="section-title" style="margin-bottom:0;">Résultat — ${esc(d.asset)}${isV2 ? ' · <span style="color:var(--purple)">V2</span>' : ''}</div>
+      <div class="section-title" style="margin-bottom:0;">${esc(t('resultTitle'))}${colon()}${esc(d.asset)}${isV2 ? ` · <span style="color:${verColor}">${ver.toUpperCase()}</span>` : ''}</div>
       ${fragilityBadge}
     </div>
     <div class="price-big">
@@ -837,37 +1164,37 @@ function renderPrice(d) {
       <span class="price-sym">${esc(d.asset)}/USD</span>
     </div>
     <div style="display:flex;align-items:center;gap:.5rem;flex-wrap:wrap;">
-      <span class="badge ${bi.cls}">Niveau ${esc(d.branch_level)} — ${esc(bi.label)}</span>
-      <span style="font-size:.72rem;color:${ds.color}" title="data_status = ${esc(d.data_status)}">${esc(ds.label)}</span>
+      <span class="badge ${bi.cls}">${esc(t('levelBadge'))} ${esc(d.branch_level)}${colon()}${esc(bi.label)}</span>
+      <span style="font-size:.72rem;color:${dsColor}" title="data_status = ${esc(d.data_status)}">${esc(dsLabel)}</span>
     </div>
     <div class="meta-grid">
       <div class="meta-cell">
-        <div class="label">Horodatage demandé</div>
+        <div class="label">${esc(t('reqTimestamp'))}</div>
         <div class="value">${fmtTs(tReq)}</div>
       </div>
       ${d.timestamp_observed ? `
       <div class="meta-cell">
-        <div class="label">Observation la plus proche</div>
+        <div class="label">${esc(t('closestObs'))}</div>
         <div class="value">${fmtTs(d.timestamp_observed)}</div>
       </div>` : ''}
       ${lag != null ? `
       <div class="meta-cell">
-        <div class="label">Lag</div>
+        <div class="label">${esc(t('lag'))}</div>
         <div class="value" style="color:${lag > 3600 ? 'var(--warn)' : 'var(--text)'}">${fmtLag(lag)}</div>
       </div>` : ''}
       ${d.quote_currency ? `
       <div class="meta-cell">
-        <div class="label">Devise de cotation</div>
+        <div class="label">${esc(t('quoteCurrency'))}</div>
         <div class="value">${esc(d.quote_currency)}</div>
       </div>` : ''}
       ${peg != null ? `
       <div class="meta-cell">
-        <div class="label">Peg de la devise</div>
-        <div class="value" style="color:${pegOff ? 'var(--warn)' : 'var(--ok)'}">${peg.toLocaleString('fr-FR', { minimumFractionDigits: 4, maximumFractionDigits: 6 })}</div>
+        <div class="label">${esc(t('peg'))}</div>
+        <div class="value" style="color:${pegOff ? 'var(--warn)' : 'var(--ok)'}">${peg.toLocaleString(locale(), { minimumFractionDigits: 4, maximumFractionDigits: 6 })}</div>
       </div>` : ''}
       ${d.price_raw_in_quote != null ? `
       <div class="meta-cell">
-        <div class="label">Prix brut (avant neutralisation)</div>
+        <div class="label">${esc(t('rawPrice'))}</div>
         <div class="value">${fmt(d.price_raw_in_quote)} ${esc(d.quote_currency || '')}</div>
       </div>` : ''}
     </div>
@@ -896,27 +1223,28 @@ function renderConfidence(c, price) {
   // S_peg lives outside `subscores` in V2; only shown when present
   const keys = ['S_stat', 'S_liq', 'S_coh'];
   if (c.S_peg !== undefined) keys.push('S_peg');
+  const ssMeta = t('ssMeta');
 
   const subScores = keys.map(k => {
     const val = (k === 'S_peg') ? c.S_peg : subs[k];
-    const m   = SS_META[k];
+    const m   = ssMeta[k];
     if (val == null) return `
       <div class="ss-row">
         <div class="ss-head">
-          <span class="ss-name">${m.label}</span>
+          <span class="ss-name">${esc(m.label)}</span>
           <span class="ss-val" style="color:var(--muted)">n/a</span>
         </div>
-        <div class="ss-desc">${m.desc}</div>
+        <div class="ss-desc">${esc(m.desc)}</div>
       </div>`;
     const p   = (val * 100).toFixed(1);
     const col = scoreColor(val);
     return `
       <div class="ss-row">
         <div class="ss-head">
-          <span class="ss-name">${m.label}</span>
+          <span class="ss-name">${esc(m.label)}</span>
           <span class="ss-val" style="color:${col}">${p}%</span>
         </div>
-        <div class="ss-desc">${m.desc}</div>
+        <div class="ss-desc">${esc(m.desc)}</div>
         <div class="prog">
           <div class="prog-fill" style="width:${p}%;background:${col}"></div>
         </div>
@@ -936,12 +1264,12 @@ function renderConfidence(c, price) {
         </svg>
         <div class="gauge-label">
           <div class="gauge-score" style="color:${color}">${pct}%</div>
-          <div class="gauge-sub">confiance</div>
+          <div class="gauge-sub">${esc(t('confidenceSub'))}</div>
         </div>
       </div>
       <div class="sub-scores">
         ${subScores}
-        ${mode ? `<div style="font-size:.7rem;color:var(--muted);margin-top:.25rem;">Mode : ${esc(mode)}</div>` : ''}
+        ${mode ? `<div style="font-size:.7rem;color:var(--muted);margin-top:.25rem;">${esc(t('mode'))} ${esc(mode)}</div>` : ''}
         ${warningListHtml(c.warnings)}
       </div>
     </div>
@@ -966,57 +1294,58 @@ function renderAccordions(d) {
 
     const timings = [];
     if (p.token_leg_timestamp)
-      timings.push(`<tr><td>Token leg</td><td>${fmtTs(p.token_leg_timestamp)}</td></tr>`);
+      timings.push(`<tr><td>${esc(t('tokenLeg'))}</td><td>${fmtTs(p.token_leg_timestamp)}</td></tr>`);
     if (p.eth_usd_leg_timestamp)
-      timings.push(`<tr><td>ETH/USD leg</td><td>${fmtTs(p.eth_usd_leg_timestamp)}</td></tr>`);
+      timings.push(`<tr><td>${esc(t('ethLeg'))}</td><td>${fmtTs(p.eth_usd_leg_timestamp)}</td></tr>`);
     if (p.cross_rate_lag_seconds != null) {
       const lagColor = p.cross_rate_lag_seconds > 1800 ? 'var(--warn)' : 'var(--ok)';
-      timings.push(`<tr><td>Lag cross-rate</td><td style="color:${lagColor}">${fmtLag(p.cross_rate_lag_seconds)}</td></tr>`);
+      timings.push(`<tr><td>${esc(t('crossLag'))}</td><td style="color:${lagColor}">${fmtLag(p.cross_rate_lag_seconds)}</td></tr>`);
     }
 
-    // Granularité, comptes de swaps, fenêtre temporelle & expansion R1 (mémoire §6.8.1)
+    // Granularité, comptes de swaps, fenêtre temporelle et expansion R1 (mémoire §6.8.1)
     const temporal = [];
-    temporal.push(`<tr><td>Granularité</td><td>${esc(d.granularity || 'raw')}</td></tr>`);
-    if (p.n_raw != null)         temporal.push(`<tr><td>Swaps bruts (raw_swap_count)</td><td>${p.n_raw}</td></tr>`);
-    if (p.swap_count != null)    temporal.push(`<tr><td>Swaps retenus (valid_swap_count)</td><td>${p.swap_count}</td></tr>`);
-    if (p.excluded_swaps != null)temporal.push(`<tr><td>Swaps exclus (filtered_swap_count)</td><td>${p.excluded_swaps}</td></tr>`);
+    temporal.push(`<tr><td>${esc(t('granularity'))}</td><td>${esc(d.granularity || 'raw')}</td></tr>`);
+    if (p.n_raw != null)          temporal.push(`<tr><td>${esc(t('rawSwaps'))}</td><td>${p.n_raw}</td></tr>`);
+    if (p.swap_count != null)     temporal.push(`<tr><td>${esc(t('keptSwaps'))}</td><td>${p.swap_count}</td></tr>`);
+    if (p.excluded_swaps != null) temporal.push(`<tr><td>${esc(t('excludedSwaps'))}</td><td>${p.excluded_swaps}</td></tr>`);
     if (p.expansion_step != null)
-      temporal.push(`<tr><td>Palier d'expansion R1</td><td>${p.expansion_step}${p.expansion_step === 0 ? ' (fenêtre initiale)' : ''}</td></tr>`);
-    if (p.initial_window_seconds != null) temporal.push(`<tr><td>Fenêtre initiale Δ₀</td><td>${fmtWin(p.initial_window_seconds)}</td></tr>`);
-    if (p.window_seconds != null)         temporal.push(`<tr><td>Fenêtre effective</td><td>${fmtWin(p.window_seconds)}</td></tr>`);
-    if (p.window_start_utc) temporal.push(`<tr><td>Début de fenêtre</td><td>${fmtTs(p.window_start_utc)}</td></tr>`);
-    if (p.window_end_utc)   temporal.push(`<tr><td>Fin de fenêtre</td><td>${fmtTs(p.window_end_utc)}</td></tr>`);
-    if (p.window_bound_policy) temporal.push(`<tr><td>Convention de bornes</td><td>${esc(p.window_bound_policy)}</td></tr>`);
+      temporal.push(`<tr><td>${esc(t('r1Step'))}</td><td>${p.expansion_step}${p.expansion_step === 0 ? esc(t('r1Initial')) : ''}</td></tr>`);
+    if (p.initial_window_seconds != null) temporal.push(`<tr><td>${esc(t('initWindow'))}</td><td>${fmtWin(p.initial_window_seconds)}</td></tr>`);
+    if (p.window_seconds != null)         temporal.push(`<tr><td>${esc(t('effWindow'))}</td><td>${fmtWin(p.window_seconds)}</td></tr>`);
+    if (p.window_start_utc) temporal.push(`<tr><td>${esc(t('winStart'))}</td><td>${fmtTs(p.window_start_utc)}</td></tr>`);
+    if (p.window_end_utc)   temporal.push(`<tr><td>${esc(t('winEnd'))}</td><td>${fmtTs(p.window_end_utc)}</td></tr>`);
+    if (p.window_bound_policy) temporal.push(`<tr><td>${esc(t('boundPolicy'))}</td><td>${esc(p.window_bound_policy)}</td></tr>`);
 
-    // Bloc de référence b_ref(T) (mémoire §6.2.6) — DEX uniquement
+    // Bloc de référence b_ref(T) (mémoire §6.2.6) : DEX uniquement
     const blockRows = [];
     if (p.reference_block_number != null)
-      blockRows.push(`<tr><td>Numéro de bloc</td><td>${p.reference_block_number.toLocaleString('fr-FR')}</td></tr>`);
+      blockRows.push(`<tr><td>${esc(t('blockNumber'))}</td><td>${p.reference_block_number.toLocaleString(locale())}</td></tr>`);
     if (p.reference_block_timestamp)
-      blockRows.push(`<tr><td>Horodatage du bloc</td><td>${fmtTs(p.reference_block_timestamp)}</td></tr>`);
+      blockRows.push(`<tr><td>${esc(t('blockTs'))}</td><td>${fmtTs(p.reference_block_timestamp)}</td></tr>`);
 
-    html += accordion('prov', 'Provenance &amp; traçabilité', `
-      ${filesHtml ? `<div class="sub-label">Fichiers utilisés</div><ul class="file-list">${filesHtml}</ul>` : ''}
-      ${calcHtml  ? `<div class="sub-label">Chemin de calcul</div><div class="calc-steps">${calcHtml}</div>` : ''}
-      ${timings.length ? `<div class="sub-label">Horodatages des legs</div><table class="kv-table">${timings.join('')}</table>` : ''}
-      ${temporal.length ? `<div class="sub-label">Granularité &amp; fenêtre temporelle</div><table class="kv-table">${temporal.join('')}</table>` : ''}
-      ${blockRows.length ? `<div class="sub-label">Bloc de référence b_ref(T)</div><table class="kv-table">${blockRows.join('')}</table>` : ''}
+    html += accordion('prov', t('accProvenance'), `
+      ${filesHtml ? `<div class="sub-label">${esc(t('filesUsed'))}</div><ul class="file-list">${filesHtml}</ul>` : ''}
+      ${calcHtml  ? `<div class="sub-label">${esc(t('calcPath'))}</div><div class="calc-steps">${calcHtml}</div>` : ''}
+      ${timings.length ? `<div class="sub-label">${esc(t('legTimestamps'))}</div><table class="kv-table">${timings.join('')}</table>` : ''}
+      ${temporal.length ? `<div class="sub-label">${t('granWindow')}</div><table class="kv-table">${temporal.join('')}</table>` : ''}
+      ${blockRows.length ? `<div class="sub-label">${esc(t('refBlock'))}</div><table class="kv-table">${blockRows.join('')}</table>` : ''}
       ${warningListHtml(p.warnings)}
     `);
   }
 
   if (d.confidence) {
     const c = d.confidence;
+    const kv = t('kv');
     const paramsRows = Object.entries(c.parameters || {}).map(([k, v]) =>
-      `<tr><td>${esc(KV_LABELS[k] || k)}</td><td>${typeof v === 'number' ? v.toLocaleString('fr-FR') : esc(String(v))}</td></tr>`
+      `<tr><td>${esc(kv[k] || k)}</td><td>${typeof v === 'number' ? v.toLocaleString(locale()) : esc(String(v))}</td></tr>`
     ).join('');
     const weightRows = Object.entries(c.weights || {}).map(([k, v]) =>
-      `<tr><td>${esc(KV_LABELS[k] || k)}</td><td>${(v * 100).toFixed(4)}%</td></tr>`
+      `<tr><td>${esc(kv[k] || k)}</td><td>${(v * 100).toFixed(4)}%</td></tr>`
     ).join('');
 
-    html += accordion('params', 'Paramètres &amp; pondérations', `
-      ${paramsRows ? `<div class="sub-label">Seuils méthodologiques</div><table class="kv-table">${paramsRows}</table>` : ''}
-      ${weightRows ? `<div class="sub-label">Pondérations</div><table class="kv-table">${weightRows}</table>` : ''}
+    html += accordion('params', t('accParams'), `
+      ${paramsRows ? `<div class="sub-label">${esc(t('thresholds'))}</div><table class="kv-table">${paramsRows}</table>` : ''}
+      ${weightRows ? `<div class="sub-label">${esc(t('weights'))}</div><table class="kv-table">${weightRows}</table>` : ''}
     `);
   }
 
@@ -1064,16 +1393,16 @@ function scoreColor(v) {
 }
 
 function fmt(n) {
-  if (n == null) return '—';
-  if (n >= 1000) return n.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  if (n >= 1)    return n.toLocaleString('fr-FR', { minimumFractionDigits: 2, maximumFractionDigits: 4 });
-  return n.toLocaleString('fr-FR', { minimumFractionDigits: 4, maximumFractionDigits: 8 });
+  if (n == null) return 'n/a';
+  if (n >= 1000) return n.toLocaleString(locale(), { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  if (n >= 1)    return n.toLocaleString(locale(), { minimumFractionDigits: 2, maximumFractionDigits: 4 });
+  return n.toLocaleString(locale(), { minimumFractionDigits: 4, maximumFractionDigits: 8 });
 }
 
 function fmtTs(ts) {
-  if (!ts) return '—';
+  if (!ts) return 'n/a';
   const d = new Date(ts);
-  return d.toLocaleString('fr-FR', {
+  return d.toLocaleString(locale(), {
     year:'numeric', month:'2-digit', day:'2-digit',
     hour:'2-digit', minute:'2-digit', second:'2-digit',
     timeZone:'UTC',
@@ -1081,16 +1410,16 @@ function fmtTs(ts) {
 }
 
 function fmtLag(s) {
-  if (s == null) return '—';
+  if (s == null) return 'n/a';
   if (s < 60)   return `${Math.round(s)}s`;
   if (s < 3600) return `${Math.round(s / 60)}min`;
   return `${(s / 3600).toFixed(1)}h`;
 }
 
 function fmtWin(s) {
-  if (s == null) return '—';
+  if (s == null) return 'n/a';
   const human = s < 60 ? `${s} s` : s < 3600 ? `${s / 60} min` : `${s / 3600} h`;
-  return `${s.toLocaleString('fr-FR')} s${s >= 60 ? ` (${human})` : ''}`;
+  return `${s.toLocaleString(locale())} s${s >= 60 ? ` (${human})` : ''}`;
 }
 
 function lagSeconds(req, obs) {

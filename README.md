@@ -1,6 +1,6 @@
 # OpenPrice API
 
-A Proof of Concept API that exposes historical crypto-asset prices from CSV files — no database required.
+A Proof of Concept API that exposes historical crypto-asset prices from CSV files: no database required.
 
 ```
 CSV files → FastAPI → DuckDB (direct CSV reads) → JSON responses
@@ -18,12 +18,12 @@ The API selects the best available price source by trying levels in order until 
 
 | Level | Label | Description |
 |-------|-------|-------------|
-| `0a` | `direct_stable` | TOKEN/USDC or TOKEN/USDT Uniswap V3 pool — highest-TVL non-zombie pool wins |
-| `0b` | `cross_rate` | TOKEN/WETH × WETH/USD cross-rate, Uniswap V3 — both legs matched as-of timestamp |
-| `1` | `alternative_pool` | Same pair on Uniswap V2 — direct stable (ETH) or cross-rate (others); same endogenous auditability, older protocol version |
+| `0a` | `direct_stable` | TOKEN/USDC or TOKEN/USDT Uniswap V3 pool: highest-TVL non-zombie pool wins |
+| `0b` | `cross_rate` | TOKEN/WETH × WETH/USD cross-rate, Uniswap V3: both legs matched as-of timestamp |
+| `1` | `alternative_pool` | Same pair on Uniswap V2: direct stable (ETH) or cross-rate (others); same endogenous auditability, older protocol version |
 | `2` | `alternative_amm` | Curve (ETH via crvUSD/WETH, inverted) or SushiSwap TOKEN/ETH cross-rate for other assets |
-| `3` | `chainlink_fallback` | Chainlink oracle — latest observation at or before `T` |
-| `4` | `unavailable` | Explicit NULL — no reliable source found |
+| `3` | `chainlink_fallback` | Chainlink oracle: latest observation at or before `T` |
+| `4` | `unavailable` | Explicit NULL: no reliable source found |
 
 ### Zombie pool rules
 
@@ -33,13 +33,13 @@ A pool is excluded from selection when any of the following conditions is true (
 - `volume_24h < seuil_vol_min_usd_24h` (default: 10 000 USD)
 - No observation in the last `fenetre_inactivite_jours` days (default: 30)
 
-When a required column is absent, the check is skipped and a warning is added to the response — the API never invents liquidity data.
+When a required column is absent, the check is skipped and a warning is added to the response: the API never invents liquidity data.
 
 **Historically low TVL pools**: early-date observations of newer DEX
 pools may show very low TVL (e.g., a Uniswap V3 LINK/WETH pool with
 $3 791 TVL in February 2022, versus a $1 000 000 threshold). These pools
 are correctly classified as zombie and the pipeline falls to the next
-level — typically a Uniswap V2 pool whose TVL column is absent, which
+level: typically a Uniswap V2 pool whose TVL column is absent, which
 allows it to pass the check (with a `missing_tvl_column` warning). This
 behaviour is expected: during the early months of Uniswap V3 adoption,
 liquidity was concentrated on V2, and the zombie filter reflects that.
@@ -54,7 +54,7 @@ The API supports four price-calculation modes controlled by the `granularity` pa
 
 | Granularity | Initial window | Symmetric window around T |
 |-------------|---------------|--------------------------|
-| `raw` | — | Latest single observation ≤ T (no aggregation) |
+| `raw` | n/a | Latest single observation ≤ T (no aggregation) |
 | `minute` | 60 s | T ± 30 s |
 | `hour` | 3 600 s | T ± 30 min |
 | `day` | 86 400 s | T ± 12 h |
@@ -68,7 +68,7 @@ For each `(asset, T, granularity)`, the pipeline:
 1. Selects the best non-zombie pool (same pool-selection logic as the source hierarchy).
 2. Queries all swaps in `[T − Δ/2, T + Δ/2]`.
 3. Applies the MAD outlier filter (which also removes MEV sandwich trades) with `sigma_mad` from config.
-4. Computes the **VWMP** — Volume-Weighted Median Price:
+4. Computes the **VWMP** (Volume-Weighted Median Price):
 
 ```
 P(asset, T, g) = VWMP({ p_i, v_i }_{i=1..N})
@@ -86,7 +86,7 @@ If no swap is found in the initial window, the pipeline expands progressively:
 |-------------|----------------|
 | `minute` | 60 s → 2 min → 5 min → 15 min |
 | `hour` | 1 h → 2 h → 4 h → 8 h |
-| `day` | no expansion — falls directly to the next source level |
+| `day` | no expansion: falls directly to the next source level |
 
 After all expansion steps are exhausted, the pipeline falls to the next branch level (`0a → 0b → 2 → 3 → 4`).
 
@@ -100,15 +100,15 @@ After all expansion steps are exhausted, the pipeline falls to the next branch l
 }
 ```
 
-- `swap_count` — number of clean swaps used for the VWMP (after MAD filtering).
-- `window_seconds` — actual window size used (may be larger than the initial window if R1 fired).
-- `provenance.excluded_swaps` — number of swaps removed by the MAD filter.
+- `swap_count`: number of clean swaps used for the VWMP (after MAD filtering).
+- `window_seconds`: actual window size used (may be larger than the initial window if R1 fired).
+- `provenance.excluded_swaps`: number of swaps removed by the MAD filter.
 
 ## Temporal provenance & reference block
 
 To make every price fully replayable by a third party (mémoire §6.8.1, §6.2.6),
 the `provenance` block carries the temporal-reconstruction metadata below. All
-fields are present on both `/v1/...` and `/v2/...` responses (additive — the V1
+fields are present on both `/v1/...` and `/v2/...` responses (additive; the V1
 contract is otherwise unchanged). Window fields are populated for windowed
 granularities only; `raw` point reads leave them `null`.
 
@@ -117,7 +117,7 @@ granularities only; `raw` point reads leave them `null`.
 | `initial_window_seconds` | windowed | Width of the initial window Δ₀ before any R1 expansion |
 | `window_seconds` | windowed | Effective window width after R1 (also at top level) |
 | `window_start_utc` / `window_end_utc` | windowed | UTC bounds of the effective window |
-| `window_bound_policy` | windowed | Inclusion convention — always `left_closed_right_open` (`>= start AND < end`), so a swap on a boundary is never counted in two adjacent windows |
+| `window_bound_policy` | windowed | Inclusion convention: always `left_closed_right_open` (`>= start AND < end`), so a swap on a boundary is never counted in two adjacent windows |
 | `expansion_step` | always | R1 step that produced the result: `0` = initial window (or raw point read), `1+` = an expanded window |
 | `n_raw` | windowed | Raw swap count in the window **before** MAD filtering (`raw_swap_count`) |
 | `swap_count` | windowed | Swaps **retained** after filtering (`valid_swap_count`) |
@@ -127,7 +127,7 @@ granularities only; `raw` point reads leave them `null`.
 
 **Reference block availability.** `reference_block_*` is read from the winning
 source row when the source CSV carries a `block_number` column (all DEX files).
-It is `null` with a structured warning otherwise — Chainlink feeds have no block
+It is `null` with a structured warning otherwise: Chainlink feeds have no block
 column (`block_metadata_unavailable`), and windowed VWMP aggregates span many
 blocks so no single reference exists (`block_metadata_aggregated`). The API never
 fabricates a block number.
@@ -135,7 +135,7 @@ fabricates a block number.
 ### Price data status
 
 The `data_status` field distinguishes a directly-observed price from a
-reconstructed, fallback, or rejected one — a distinction the methodology
+reconstructed, fallback, or rejected one: a distinction the methodology
 requires for evidentiary use (mémoire §6.2.5):
 
 | `data_status` | Meaning |
@@ -143,7 +143,7 @@ requires for evidentiary use (mémoire §6.2.5):
 | `observed` | Price found directly in the initial target window (or raw point read) |
 | `reconstructed` | Price obtained only after the window had to expand (R1, `expansion_step ≥ 1`) |
 | `rejected_outlier` | Every swap in the window was flagged by the MAD filter; the value is the unfiltered fallback and should be treated with caution |
-| `oracle_fallback` | Chainlink oracle (level 3) — no viable DEX source |
+| `oracle_fallback` | Chainlink oracle (level 3): no viable DEX source |
 | `unavailable` | No reliable source (level 4); `price_usd` is `null` |
 
 ## Confidence index
@@ -172,7 +172,7 @@ w_coh  = 1/3
 These weights are the initial equal-weight calibration and are intended
 to be validated empirically.
 
-### S_stat — Statistical hygiene
+### S_stat: Statistical hygiene
 
 S_stat measures the statistical coherence of the published VWMP against
 the median of price observations available in the reference CSV over the
@@ -180,7 +180,7 @@ prior 7-day window `[T − 7 days, T)`.
 
 **Reference file selection:**
 - Cross-rate branches (0b, 1 cross-rate, 2): the asset's Chainlink CSV is
-  used — it is the only independent USD series available for TOKEN/WETH pools.
+  used: it is the only independent USD series available for TOKEN/WETH pools.
 - Direct stable branch (0a): the source pool CSV is used directly.
 
 ```
@@ -201,7 +201,7 @@ The threshold z_MAD = 3.5 is used as a calibration point for continuous
 penalization, not as a hard rejection rule inside the confidence index.
 Hard outlier rejection is handled upstream by the curation pipeline.
 
-**Edge case — MAD_7j = 0:** when all reference observations in the 7-day
+**Edge case (MAD_7j = 0):** when all reference observations in the 7-day
 window are identical, MAD_7j = 0 and z_MAD is undefined. `S_stat` is set
 to `1.0` (perfect consistency of the reference series).
 
@@ -212,11 +212,11 @@ reference window (default: 3), S_stat is capped at:
 s_stat_floor = 0.2
 ```
 
-This floor reflects insufficient historical data for a robust median — it is
+This floor reflects insufficient historical data for a robust median; it is
 independent of the number of swaps used to compute the current VWMP. The
 price is unavailable only when the current window yields zero clean swaps.
 
-### S_liq — Deep liquidity
+### S_liq: Deep liquidity
 
 S_liq combines a TVL score and a slippage score through a geometric mean.
 
@@ -271,7 +271,7 @@ For direct stable branches (0a), the same degradation applies within a
 single leg: when only TVL or only slippage is available, the single
 available sub-score is used; `S_liq` is `null` only when both are absent.
 
-### S_coh — Inter-source coherence
+### S_coh: Inter-source coherence
 
 For DEX branches (`0a`, `0b`, `1`, `2`), S_coh measures the relative deviation
 between the DEX-derived price and the Chainlink reference feed.
@@ -307,20 +307,20 @@ exists. The table below summarises what is computed for each branch:
 | `3` chainlink_fallback | **N/A** | **N/A** | **N/A** | **null** |
 | `4` unavailable | **N/A** | **N/A** | **N/A** | **null** |
 
-**Note 1 — S_stat for cross-rate branches**: TOKEN/WETH files do not
+**Note 1 (S_stat for cross-rate branches):** TOKEN/WETH files do not
 contain a USD price series. S_stat is therefore computed by comparing the
 final USD cross-rate price against the raw price observations in the asset's
 Chainlink CSV over `[T − 7 days, T)`, which is the only available
 independent USD reference.
 
-**Note 2 — S_liq for cross-rate branches**: `S_liq_cross` is the geometric
+**Note 2 (S_liq for cross-rate branches):** `S_liq_cross` is the geometric
 mean of both legs when both carry TVL/slippage data. If the TOKEN/WETH leg
 CSV lacks both columns (common for Uniswap V2 and SushiSwap files), the
 WETH/USDC leg score is used alone and `s_liq_cross_rate_token_leg_missing`
 is added. If only the TOKEN/WETH leg has data, it is used alone with no
 warning. If neither leg has data, `S_liq` is `null`.
 
-**Level 3 — all scores are N/A**: when Chainlink is the primary source,
+**Level 3 (all scores are N/A):** when Chainlink is the primary source,
 there is no independent reference against which to measure statistical
 coherence, liquidity, or inter-source deviation. All three sub-scores
 are `null` and the overall confidence is `null`.
@@ -346,11 +346,11 @@ derived from the score:
 
 Every response may carry structured warnings at three levels:
 
-- **top-level `warnings`** — deduplicated union of all warnings from every
+- **top-level `warnings`**: deduplicated union of all warnings from every
   source; convenient for a single scan.
-- **`provenance.warnings`** — warnings tied to the data source (pool
+- **`provenance.warnings`**: warnings tied to the data source (pool
   viability checks, volume type, swap count).
-- **`confidence.warnings`** — warnings tied to confidence score computation.
+- **`confidence.warnings`**: warnings tied to confidence score computation.
 
 Each warning has the shape:
 
@@ -374,7 +374,7 @@ Each warning has the shape:
 | `block_metadata_unavailable` | info | provenance | The source CSV has no `block_number` column (e.g. Chainlink feeds). `reference_block_number` / `reference_block_timestamp` are `null`. |
 | `block_metadata_aggregated` | info | provenance | A windowed VWMP aggregates swaps from several blocks, so there is no single reference block. `reference_block_*` are `null`. |
 
-## API V2 — peg neutralization & S_peg
+## API V2: peg neutralization & S_peg
 
 V2 is an **additive** evolution of the confidence index driven by the expert
 review. The V1 routes (`/v1/...`) are **frozen and unchanged**:
@@ -407,7 +407,7 @@ hierarchy / DuckDB reads / VWMP, and only changes how confidence is computed.
    ```
 
    `S_peg` is published **outside** `subscores` (mode `3sub`). It is `null`
-   (`s_peg_not_applicable`) when the source has no stablecoin quotation —
+   (`s_peg_not_applicable`) when the source has no stablecoin quotation:
    Chainlink fallback (level 3) or the Curve crvUSD/WETH ETH pool.
 
 3. **Weighted composition (same form as V1), two modes:**
@@ -422,14 +422,14 @@ hierarchy / DuckDB reads / VWMP, and only changes how confidence is computed.
 4. **Fragility flag.** `fragility_flag = (C < c_threshold)`, exposed separately
    from `C`. The threshold is **uncalibrated by default** (`c_threshold: null`);
    while null, `fragility_flag` is `null` and a `fragility_threshold_uncalibrated`
-   warning is added — the API imposes no qualitative verdict until the threshold
+   warning is added: the API imposes no qualitative verdict until the threshold
    is set empirically.
 
 5. **Optional volatility-normalized S_stat** (`confidence_v2.s_stat.normalize_by_volatility`,
-   off by default) and a configurable S_stat window — a *local anomaly* score,
-   not a direct volatility measure.
+   off by default) and a configurable S_stat window (a *local anomaly* score,
+   not a direct volatility measure).
 
-### Validation case — USDC depeg, 2023-03-11 (SVB)
+### Validation case: USDC depeg, 2023-03-11 (SVB)
 
 At `T = 2023-03-11T12:00:00Z`, USDC traded at **$0.9097** while the Chainlink
 AAVE/USD feed read **$65.23**. AAVE resolves to a `0b` cross-rate quoted in USDC:
@@ -437,8 +437,8 @@ AAVE/USD feed read **$65.23**. AAVE resolves to a `0b` cross-rate quoted in USDC
 | | V1 | V2 |
 |---|---|---|
 | Price | 71.67 (USDC-denominated) | **65.19** (neutralized: 71.67 × 0.9097 ≈ Chainlink) |
-| `S_coh` | `6e-170` — collapses (false alarm) | **0.987** — coherent |
-| `S_peg` | — | **0.0** — depeg reported separately |
+| `S_coh` | `6e-170` (collapses, false alarm) | **0.987** (coherent) |
+| `S_peg` | n/a | **0.0** (depeg reported separately) |
 | `C` | `3.7e-57` | **0.93** |
 
 V2 stops penalizing a real, well-priced DEX observation for a stablecoin event,
@@ -533,6 +533,79 @@ stablecoins/chainlink_usdt_usd.csv
 | `s_peg_not_applicable` | info | Source has no stablecoin quotation (level 3 / Curve) or the peg feed is unavailable; `S_peg = null`. |
 | `fragility_threshold_uncalibrated` | info | `confidence_v2.fragility.c_threshold` is not set; `fragility_flag = null`. |
 
+## API V3: performance engine
+
+V3 serves the **same methodology and response schema as V2** (source hierarchy, VWMP, peg
+neutralization, S_stat / S_liq / S_coh / S_peg, fragility flag) from an indexed Parquet copy of the
+CSV files instead of scanning the CSVs on every request. `/v1` and `/v2` are untouched and keep reading
+the CSV files, so results published with them stay reproducible.
+
+| Measured on the production host | V1/V2 (CSV) | V3 |
+|---|---|---|
+| ETH point price, confidence + provenance | 23 to 40 s | 0.05 to 0.25 s |
+| COMP point price (cross-rate) | ~14 s | ~0.08 s |
+| LINK / AAVE point price | 3 to 4 s | ~0.05 s |
+| ETH before pool creation (unavailable) | ~45 s | ~0.14 s |
+| `/compare` COMP, 37 points | 290 s | 0.6 s |
+| repeated request (LRU cache) | n/a | ~2 ms |
+
+### What differs from V2 (on purpose)
+
+1. **The S_stat reference window is complete.** V1/V2 read `[T-7d, T)` with `LIMIT api.max_limit`
+   (10 000), i.e. only the *oldest* rows: for the ETH/USDC pool this happened on ~99.6 % of dates
+   (e.g. S_stat = 0.000 instead of 0.84 on 2022-05-12). V3 reads the whole window.
+2. **The windowed VWMP read is not truncated either** (it hit the same limit on ~6 % of ETH `day` windows).
+3. **110 duplicated swap events** of `eth_usdc_uniswap_v3_005` (same `tx_hash` + `log_index`, only the
+   extraction metadata differs) are ignored. The CSV is never modified.
+
+Everything else is intended to be identical. `v3.legacy_truncation: true` restores (1) and (2), which lets
+`tests/golden/compare_v3.py --legacy` prove that V3 reproduces V2 exactly (the only remaining differences are
+the windows containing the 110 duplicates). Same-timestamp ties still return the *first* row of the CSV, as V2 did.
+
+### Validated against real V2 traffic
+
+`tests/golden/` captures real V2 responses (`capture_v2.py`) and replays them through V3
+(`compare_v3.py`). On a 245-request sample spanning the five assets, every granularity, and several
+market-stress dates (LUNA, the Aug-2024 flash crash, the Mar-2023 USDC depeg):
+
+* in `legacy_truncation` mode, **242/245 are byte-identical** to V2; the 3 remaining differences are
+  entirely explained by the 110 removed duplicates (`tests/test_v3_golden.py` runs this as a permanent
+  regression guard whenever the Parquet store and the golden file are present);
+* in default (fixed) mode, **LINK, UNI, AAVE and COMP are unaffected** (0 differences); only ETH changes,
+  through S_stat/C/`fragility_flag` and the four `day`-granularity prices listed above.
+
+### Build and run
+
+```bash
+.venv/bin/python -m app.v3.sync        # ~2 min the first time; then incremental
+.venv/bin/uvicorn app.main:app         # /v3/... is served next to /v1 and /v2
+curl "http://127.0.0.1:8000/v3/prices/LINK/at?timestamp=2025-06-01T12:00:00Z"
+curl  http://127.0.0.1:8000/v3/ready
+```
+
+| Endpoint | Description |
+|---|---|
+| `GET /v3/prices/{asset}/at` | point price (V2 schema); headers `X-Cache`, `X-Dataset-Version`, `Server-Timing` |
+| `GET /v3/prices/{asset}` | time series (`raw` = swap timestamps of the winning source, or `minute|hour|day`) |
+| `GET /v3/confidence/{asset}/at` | V2 confidence breakdown |
+| `GET /v3/compare/{asset}` | DEX vs Chainlink over a range (identical to `/v1/compare`) |
+| `GET /v3/config`, `GET /v3/ready` | effective V3 config; readiness (503 until the store is built) |
+
+### How the store works
+
+* `python -m app.v3.sync` converts each CSV to canonical, time-sorted Parquet segments under
+  `v3.parquet_root` (default `~/openprice/parquet`; never inside the datasets directory) and writes
+  `manifest.json` atomically. The CSV row number is kept (`rn`), so the CSV order (which V1/V2 relied on
+  for ties) is reproduced exactly.
+* It is incremental: only bytes appended since the last run are read, after checking a fingerprint of what
+  was already consumed; a rewritten header, truncated or rewritten file triggers a rebuild of that dataset
+  only. A partially written last line is never consumed. It is safe to run while the extraction containers
+  append to the CSVs (see `deploy/`).
+* The API polls the manifest (`v3.manifest_poll_seconds`) and reloads it without restart; the LRU cache key
+  includes the dataset version, so it can never serve a stale price after a sync.
+* Range endpoints run the same per-point engine in parallel (~15 to 50 ms per point). A set-based ASOF-join
+  version would be faster still and is not implemented.
+
 ## Installation
 
 ```bash
@@ -603,7 +676,9 @@ http://127.0.0.1:8000/ui
 It lets you, without writing any `curl`:
 
 - pick an asset, granularity (`raw`/`minute`/`hour`/`day`) and timestamp, and
-  switch between **V1** and **V2** of the API;
+  switch between **V1**, **V2** and **V3** of the API (the info bubble next to the
+  version selector explains the differences: V3 answers the V2 schema from the
+  fast Parquet engine described below, in ~0.05 s instead of 3 to 40 s);
 - read the price with its branch level and `data_status` (colour-coded:
   *observé* / *reconstruit* / *rejeté* / *repli oracle*);
 - see the confidence gauge with the S_stat / S_liq / S_coh sub-scores (and the
@@ -614,7 +689,7 @@ It lets you, without writing any `curl`:
 
 The page defaults its API base URL to the origin it is served from, so opening
 `/ui` works out of the box. It can also be opened as a local file
-(`file://…/index.html`) — in that case set the API URL field to your running
+(`file://…/index.html`): in that case set the API URL field to your running
 instance (e.g. `http://127.0.0.1:8000`).
 
 ## Running tests

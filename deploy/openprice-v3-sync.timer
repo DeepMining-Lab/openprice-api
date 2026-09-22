@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the OpenPrice V3 Parquet sync every 30 minutes (no-op when the CSVs did not change)
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
