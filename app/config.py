@@ -210,6 +210,7 @@ class V3Config(BaseModel):
     legacy_truncation: bool = False
     cache_size: int = 4096            # LRU entries for point responses (0 disables)
     duckdb_threads: int = 4
+    range_workers: int = 8            # threads computing the points of one range request in parallel
     manifest_poll_seconds: float = 5.0
     max_segments_before_compaction: int = 30
 

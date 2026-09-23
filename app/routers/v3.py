@@ -10,11 +10,11 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException, Query, Response
+from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from app.config import get_config
 from app.routers.prices import _validate_asset, _validate_branch, _validate_granularity, _validate_source
-from app.schemas import ComparePoint, ConfidenceV2Detail, PriceV2Response
+from app.schemas import ComparePoint, ConfidenceV2Detail, PriceV3Response
 from app.v3.service import Service, get_service
 
 router = APIRouter(prefix="/v3")
@@ -28,24 +28,62 @@ def _service() -> Service:
     return svc
 
 
-def _headers(response: Response, svc: Service, t0: float, cached: bool | None = None) -> None:
+def _headers(response: Response, svc: Service, t0: float, cache: str | None = None) -> None:
     response.headers["X-Dataset-Version"] = str(svc.store.version)
-    if cached is not None:
-        response.headers["X-Cache"] = "HIT" if cached else "MISS"
+    if cache is not None:
+        response.headers["X-Cache"] = cache
     response.headers["Server-Timing"] = f"total;dur={(time.perf_counter() - t0) * 1000:.1f}"
+
+
+def _page_headers(request: Request, response: Response, next_start: datetime | None) -> None:
+    """Truncation signal of a range endpoint; the next page is the same query from ``X-Next-Start``.
+
+    ``Link`` is a query-only reference, resolved by the client against the URL it called: an absolute
+    URL built here would name the internal host and miss the prefix of a gateway in front of the API.
+    """
+    response.headers["X-Truncated"] = "true" if next_start is not None else "false"
+    if next_start is not None:
+        nxt = next_start.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+        response.headers["X-Next-Start"] = nxt
+        response.headers["Link"] = f'<?{request.url.include_query_params(start=nxt).query}>; rel="next"'
+
+
+def _hdr(description: str) -> dict:
+    return {"description": description, "schema": {"type": "string"}}
+
+
+_H_COMMON = {
+    "X-Dataset-Version": _hdr("Version of the Parquet store that answered; changes after every sync that adds data."),
+    "Server-Timing": _hdr("Server-side duration: `total;dur=<milliseconds>`."),
+}
+_H_CACHE = _hdr("`HIT` or `MISS`: served from the in-process LRU cache of point responses or computed. "
+                "The cache is emptied whenever the dataset version changes.")
+_H_RANGE_CACHE = _hdr("`HIT` (every point from the cache), `MISS` (none) or `PARTIAL`.")
+_H_PAGE = {
+    "X-Truncated": _hdr("`true` when the result was cut at `limit`; request the next page from `X-Next-Start`."),
+    "X-Next-Start": _hdr("Only when truncated: the `start` value of the next page (ISO 8601, UTC)."),
+    "Link": _hdr('Only when truncated: `<?query of the next page>; rel="next"` (RFC 8288), relative to the '
+                 'request URL.'),
+}
 
 
 @router.get(
     "/prices/{asset}/at",
-    response_model=PriceV2Response,
+    response_model=PriceV3Response,
     summary="Price at a timestamp (V3 — fast engine, V2 methodology)",
     description=(
         "Same source hierarchy, VWMP, peg neutralization and confidence model as `/v2`, "
         "served from an indexed Parquet store. Differences from V2: the S_stat 7-day window "
         "and the windowed VWMP read are no longer truncated to 10 000 rows, and 110 duplicated "
-        "swap events of the ETH/USDC pool are ignored."
+        "swap events of the ETH/USDC pool are ignored.\n\n"
+        "Additive diagnostics (never change a number):\n"
+        "- a `timestamp` after the server time returns level 4 with `unavailable_reason: future_timestamp`;\n"
+        "- `beyond_data_coverage` warns that the price depends on data after the last sync (provisional);\n"
+        "- `fallback_explained` says why higher-priority sources were rejected; the full list is in "
+        "`provenance.rejected_candidates`."
     ),
     tags=["Prices V3"],
+    responses={200: {"headers": {**_H_COMMON, "X-Cache": _H_CACHE}}},
 )
 def price_at_v3(
     response: Response,
@@ -66,7 +104,7 @@ def price_at_v3(
         timestamp = timestamp.replace(tzinfo=timezone.utc)
     svc = _service()
     resp, cached = svc.price_at(asset, timestamp, branch, source, granularity, include_confidence, include_provenance)
-    _headers(response, svc, t0, cached)
+    _headers(response, svc, t0, "HIT" if cached else "MISS")
     return resp
 
 
@@ -74,7 +112,9 @@ def price_at_v3(
     "/confidence/{asset}/at",
     response_model=ConfidenceV2Detail,
     summary="Confidence index at a timestamp (V3)",
+    description="The confidence block of the default `/v3/prices/{asset}/at` response (same cache entry).",
     tags=["Confidence & Provenance V3"],
+    responses={200: {"headers": {**_H_COMMON, "X-Cache": _H_CACHE}}},
 )
 def confidence_at_v3(
     response: Response,
@@ -86,10 +126,11 @@ def confidence_at_v3(
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
     svc = _service()
-    conf = svc.confidence_at(asset, timestamp)
+    conf, cached, resp = svc.confidence_at(asset, timestamp)
     if conf is None:
-        raise HTTPException(status_code=404, detail="No price available; confidence cannot be computed.")
-    _headers(response, svc, t0)
+        reason = f" ({resp.unavailable_reason})" if resp.unavailable_reason else ""
+        raise HTTPException(status_code=404, detail=f"No price available{reason}; confidence cannot be computed.")
+    _headers(response, svc, t0, "HIT" if cached else "MISS")
     return conf
 
 
@@ -118,16 +159,21 @@ def ready():
 
 @router.get(
     "/prices/{asset}",
-    response_model=list[PriceV2Response],
+    response_model=list[PriceV3Response],
     summary="Price time series over a date range (V3)",
     description=(
-        "`granularity=raw` enumerates the swap timestamps of the winning source; `minute|hour|day` "
-        "compute one VWMP point per step. Confidence and provenance are off by default. "
-        "Points are computed in parallel on the fast engine; capped at `limit` (max 10 000)."
+        "`granularity=raw` returns one point per distinct swap timestamp of the winning source "
+        "(rows sharing a timestamp have the same as-of answer); `minute|hour|day` compute one VWMP "
+        "point per step from `start`. Confidence and provenance are off by default. Points are "
+        "computed in parallel on the fast engine; at most `limit` points (max 10 000). When the "
+        "result is cut at `limit`, `X-Truncated: true` and `X-Next-Start` give the `start` of the "
+        "next page (also as a `Link: rel=\"next\"` header)."
     ),
     tags=["Prices V3"],
+    responses={200: {"headers": {**_H_COMMON, "X-Cache": _H_RANGE_CACHE, **_H_PAGE}}},
 )
 def price_range_v3(
+    request: Request,
     response: Response,
     asset: str,
     start: datetime = Query(..., description="Start of the time range (ISO 8601)"),
@@ -149,18 +195,29 @@ def price_range_v3(
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
     svc = _service()
-    out = svc.price_range(asset, start, end, limit, branch, source, granularity, include_confidence, include_provenance)
-    _headers(response, svc, t0)
-    return out
+    page = svc.price_range(asset, start, end, limit, branch, source, granularity, include_confidence,
+                           include_provenance)
+    n = len(page.items)
+    cache = "HIT" if n and page.cache_hits == n else ("MISS" if page.cache_hits == 0 else "PARTIAL")
+    _page_headers(request, response, page.next_start)
+    _headers(response, svc, t0, cache)
+    return page.items
 
 
 @router.get(
     "/compare/{asset}",
     response_model=list[ComparePoint],
     summary="Compare DEX price vs Chainlink oracle over a date range (V3)",
+    description=(
+        "One row per Chainlink round in [start, end), as `/v1/compare`. Not cached (no `X-Cache`). "
+        "When the result is cut at `limit`, `X-Truncated: true` and `X-Next-Start` give the `start` "
+        "of the next page."
+    ),
     tags=["Confidence & Provenance V3"],
+    responses={200: {"headers": {**_H_COMMON, **_H_PAGE}}},
 )
 def compare_v3(
+    request: Request,
     response: Response,
     asset: str,
     start: datetime = Query(..., description="Start of the time range (ISO 8601)"),
@@ -174,6 +231,7 @@ def compare_v3(
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
     svc = _service()
-    out = svc.compare(asset, start, end, limit)
+    page = svc.compare(asset, start, end, limit)
+    _page_headers(request, response, page.next_start)
     _headers(response, svc, t0)
-    return out
+    return page.items

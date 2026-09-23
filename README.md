@@ -29,7 +29,7 @@ The API selects the best available price source by trying levels in order until 
 
 A pool is excluded from selection when any of the following conditions is true (if the relevant column exists):
 
-- `TVL < seuil_TVL_min_usd` (default: 1 000 000 USD)
+- `TVL < seuil_TVL_min_usd` (default: 100 000 USD)
 - `volume_24h < seuil_vol_min_usd_24h` (default: 10 000 USD)
 - No observation in the last `fenetre_inactivite_jours` days (default: 30)
 
@@ -37,7 +37,7 @@ When a required column is absent, the check is skipped and a warning is added to
 
 **Historically low TVL pools**: early-date observations of newer DEX
 pools may show very low TVL (e.g., a Uniswap V3 LINK/WETH pool with
-$3 791 TVL in February 2022, versus a $1 000 000 threshold). These pools
+$3 791 TVL in February 2022, versus a $100 000 threshold). These pools
 are correctly classified as zombie and the pipeline falls to the next
 level: typically a Uniswap V2 pool whose TVL column is absent, which
 allows it to pass the check (with a `missing_tvl_column` warning). This
@@ -47,6 +47,12 @@ liquidity was concentrated on V2, and the zombie filter reflects that.
 ### Cross-rate lag
 
 For level `0b`, both the TOKEN/WETH leg and the WETH/USD leg are matched using an as-of strategy (latest observation ≤ T). If the two legs are more than `cross_rate_max_lag_seconds` apart (default: 3600 s), the cross-rate is rejected and the API falls to the next level.
+
+The WETH/USD leg trades every few seconds, so for raw point reads this rule in practice requires the
+token pool to have traded within the hour before T, however liquid it is. For example, AAVE at
+2024-06-01T00:00Z falls back to Chainlink (level 3): the AAVE/WETH pool (TVL 1.35 M USD) last traded
+7 032 s before the ETH/USD leg. V3 responses name the rule and the values that rejected each candidate
+(see [V3 diagnostics](#diagnostics-added-by-v3)).
 
 ## Granularity and VWMP
 
@@ -323,7 +329,8 @@ warning. If neither leg has data, `S_liq` is `null`.
 **Level 3 (all scores are N/A):** when Chainlink is the primary source,
 there is no independent reference against which to measure statistical
 coherence, liquidity, or inter-source deviation. All three sub-scores
-are `null` and the overall confidence is `null`.
+are `null` and the overall confidence is `null`. In V3, the `fallback_explained` warning says which
+higher-priority sources were rejected and why.
 
 ### Qualitative confidence level
 
@@ -548,6 +555,12 @@ the CSV files, so results published with them stay reproducible.
 | ETH before pool creation (unavailable) | ~45 s | ~0.14 s |
 | `/compare` COMP, 37 points | 290 s | 0.6 s |
 | repeated request (LRU cache) | n/a | ~2 ms |
+| `/prices` ETH `hour`, 25 points | n/a | ~0.3 s |
+| `/prices` ETH `raw`, 1 000 points (one page) | n/a | ~5 s (~60 ms from the cache) |
+
+The point figures are per request. A range costs about 5 ms per point (uncached, `v3.range_workers: 8`
+on the 12-core host), so a 1 000-point page takes seconds, not 0.1 s. The cache is emptied at every
+sync that adds data (every 30 min with `deploy/`).
 
 ### What differs from V2 (on purpose)
 
@@ -558,7 +571,8 @@ the CSV files, so results published with them stay reproducible.
 3. **110 duplicated swap events** of `eth_usdc_uniswap_v3_005` (same `tx_hash` + `log_index`, only the
    extraction metadata differs) are ignored. The CSV is never modified.
 
-Everything else is intended to be identical. `v3.legacy_truncation: true` restores (1) and (2), which lets
+No other number is meant to differ; V3 only adds the [diagnostics](#diagnostics-added-by-v3) and the
+[range pagination](#ranges-pagination-and-latency) below. `v3.legacy_truncation: true` restores (1) and (2), which lets
 `tests/golden/compare_v3.py --legacy` prove that V3 reproduces V2 exactly (the only remaining differences are
 the windows containing the 110 duplicates). Same-timestamp ties still return the *first* row of the CSV, as V2 did.
 
@@ -585,11 +599,74 @@ curl  http://127.0.0.1:8000/v3/ready
 
 | Endpoint | Description |
 |---|---|
-| `GET /v3/prices/{asset}/at` | point price (V2 schema); headers `X-Cache`, `X-Dataset-Version`, `Server-Timing` |
-| `GET /v3/prices/{asset}` | time series (`raw` = swap timestamps of the winning source, or `minute|hour|day`) |
-| `GET /v3/confidence/{asset}/at` | V2 confidence breakdown |
+| `GET /v3/prices/{asset}/at` | point price (V2 schema plus the V3 diagnostics) |
+| `GET /v3/prices/{asset}` | time series (`raw` = one point per distinct swap timestamp of the winning source, or `minute|hour|day`) |
+| `GET /v3/confidence/{asset}/at` | V2 confidence breakdown: the confidence block of the default `/at` response |
 | `GET /v3/compare/{asset}` | DEX vs Chainlink over a range (identical to `/v1/compare`) |
 | `GET /v3/config`, `GET /v3/ready` | effective V3 config; readiness (503 until the store is built) |
+
+Paths are case-sensitive (`/V3/...` returns 404); asset symbols are not (`eth` = `ETH`).
+
+#### Response headers
+
+| Header | `/prices/{asset}/at`, `/confidence/{asset}/at` | `/prices/{asset}` | `/compare/{asset}` |
+|---|---|---|---|
+| `X-Dataset-Version` | yes | yes | yes |
+| `Server-Timing` (`total;dur=<ms>`) | yes | yes | yes |
+| `X-Cache` | `HIT` or `MISS` | `HIT`, `MISS` or `PARTIAL` (per point) | no (not cached) |
+| `X-Truncated` | no | `true` or `false` | `true` or `false` |
+| `X-Next-Start`, `Link: <?…>; rel="next"` | no | only when truncated | only when truncated |
+
+`/confidence/{asset}/at` shares the cache entry of the default `/prices/{asset}/at` request (confidence
+and provenance included).
+
+### Diagnostics added by V3
+
+They are additive: they never change a price, a score or a branch.
+
+| Code | Severity | When |
+|---|---|---|
+| `future_timestamp` | warning | `timestamp` is after the server time. The response is an explicit NULL: level `4`, `unavailable_reason: "future_timestamp"`, no confidence, never cached. Before this rule, a future date returned the last known price, even as a level `0a` "observed" price with a confidence score when it fell within 30 days of the last swap. |
+| `beyond_data_coverage` | warning | The requested time (or, for `minute`/`hour`/`day`, the end of the VWMP window) is after the last synced data of a folder the price depends on (source files and peg feed). The price is still returned (as-of rule) but is provisional: it can change after the next extraction. A folder's coverage is its latest synced observation. Each asset folder holds its Chainlink feed (1 h heartbeat), so its coverage trails the extraction run by at most about an hour; for the peg feeds (`stablecoins/`, 24 h heartbeat) it can trail by up to a day, which errs on the side of flagging. |
+| `fallback_explained` | info | The answer does not come from the first level of the hierarchy (or is level `4`). The message lists each rejected higher-priority candidate with the rule and the measured value. |
+
+`provenance.rejected_candidates` lists every candidate file evaluated and not used, in evaluation order,
+including siblings of the winning level (for example a zombie `0a` pool next to the one that answered):
+
+```json
+{"level": "0b", "file": "aave/aave_weth_uniswap_v3_03.csv", "rule": "cross_rate_lag",
+ "message": "token leg 2024-05-31T22:02:35Z is 7,032 s from the ETH/USD leg 2024-05-31T23:59:47Z (limit 3,600 s)",
+ "value": 7032.0, "threshold": 3600.0, "last_observation_utc": "2024-05-31T22:02:35Z"}
+```
+
+Rules: `zombie_tvl`, `zombie_volume_24h`, `inactive` (no observation for `fenetre_inactivite_jours`),
+`cross_rate_lag`, `eth_leg_unavailable`, `no_observation` (nothing at or before T), `no_swaps_in_window`
+(windowed granularities, after R1 expansion), `missing_columns`, `dataset_missing`. The diagnostics go to
+the top-level `warnings` and, when there is a confidence block, to its `warnings` too (they explain a
+provisional score or a `C = null` after a fallback to Chainlink). The parity tools remove them with
+`strip_v3_diagnostics` before comparing with V2.
+
+### Ranges: pagination and latency
+
+* `limit` defaults to 1 000 points (hard cap 10 000). One day of ETH swaps is several thousand distinct
+  timestamps (4 112 on 2024-03-01), and even `minute` over 24 h is 1 441 points, so a day does not fit in
+  one default page.
+* When the result is cut at `limit`, the response carries `X-Truncated: true` and `X-Next-Start`: repeat the
+  same query with `start` set to that value. `Link: <?…>; rel="next"` gives the whole next query, relative
+  to the URL you called, so it stays valid behind the gateway. The last page has `X-Truncated: false`.
+
+```bash
+curl -s -D - -o page1.json "http://127.0.0.1:8000/v3/prices/ETH?start=2024-03-01T00:00:00Z&end=2024-03-02T00:00:00Z" \
+  | grep -i -E "^x-truncated|^x-next-start"
+# x-truncated: true
+# x-next-start: 2024-03-01T05:51:11Z      -> next page: same query with start=2024-03-01T05:51:11Z
+```
+
+* A `raw` series has one point per distinct timestamp. V1 returned one point per swap, but all the swaps
+  of a timestamp get the same as-of answer (the first swap of the block), so the extra rows were identical
+  copies (35 % of the ETH/USDC rows on 2024-03-01, 37 % over 2024). It also lets each page start exactly
+  where the previous one stopped. `/compare` pages never split rounds that share a timestamp.
+* Prefer `hour` (or `minute` over a few hours) when a coarser series is enough: 25 hourly points take ~0.3 s.
 
 ### How the store works
 
@@ -603,8 +680,8 @@ curl  http://127.0.0.1:8000/v3/ready
   append to the CSVs (see `deploy/`).
 * The API polls the manifest (`v3.manifest_poll_seconds`) and reloads it without restart; the LRU cache key
   includes the dataset version, so it can never serve a stale price after a sync.
-* Range endpoints run the same per-point engine in parallel (~15 to 50 ms per point). A set-based ASOF-join
-  version would be faster still and is not implemented.
+* Range endpoints run the same per-point engine in parallel (`v3.range_workers`, default 8; about 5 ms
+  per point on the 12-core host). A set-based ASOF-join version would be faster still and is not implemented.
 
 ## Installation
 
@@ -632,7 +709,7 @@ Edit `config/openprice.yaml`. All methodological parameters are there:
 
 ```yaml
 thresholds:
-  seuil_TVL_min_usd: 1000000        # Pool TVL below this → zombie
+  seuil_TVL_min_usd: 100000         # Pool TVL below this → zombie
   seuil_vol_min_usd_24h: 10000      # 24h volume below this → zombie
   fenetre_inactivite_jours: 30      # Days with no activity → zombie
   sigma_mad: 3.5                    # MAD sensitivity for S_stat
@@ -852,7 +929,7 @@ curl "http://127.0.0.1:8000/v1/confidence/LINK/at?timestamp=2024-01-01T00:00:00Z
   "coherence_mode": null,
   "weights": {"w_stat": 0.3333333333, "w_liq": 0.3333333333, "w_coh": 0.3333333334},
   "parameters": {
-    "seuil_TVL_min_usd": 1000000,
+    "seuil_TVL_min_usd": 100000,
     "seuil_vol_min_usd_24h": 10000,
     "fenetre_inactivite_jours": 30,
     "sigma_mad": 3.5,
@@ -887,7 +964,7 @@ curl "http://127.0.0.1:8000/v1/provenance/LINK/at?timestamp=2024-01-01T00:00:00Z
   "reference_block_number": 18913456,
   "reference_block_timestamp": "2024-01-01T00:00:00Z",
   "parameters": {
-    "seuil_TVL_min_usd": 1000000,
+    "seuil_TVL_min_usd": 100000,
     "seuil_vol_min_usd_24h": 10000,
     "fenetre_inactivite_jours": 30
   },

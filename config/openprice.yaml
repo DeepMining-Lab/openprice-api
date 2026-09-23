@@ -83,5 +83,6 @@ v3:
   legacy_truncation: false               # true = replay V1/V2 (window cut to api.max_limit rows) to prove parity
   cache_size: 4096                       # LRU of point responses, invalidated on every dataset_version change
   duckdb_threads: 4
+  range_workers: 8                       # points of one range request computed in parallel
   manifest_poll_seconds: 5
   max_segments_before_compaction: 30

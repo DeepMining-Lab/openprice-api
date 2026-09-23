@@ -66,6 +66,7 @@ class Store:
         self._local = threading.local()
         self._datasets: dict[str, DatasetInfo] = {}
         self._quote_cache: dict[str, str | None] = {}
+        self._coverage: dict[str, datetime] = {}
         self._manifest_mtime = 0.0
         self._last_poll = 0.0
         self.version: str | None = None
@@ -107,6 +108,11 @@ class Store:
                     view=view, schema=schema,
                 )
             self._datasets = datasets
+            self._coverage = {}
+            for d in datasets.values():
+                folder = d.rel.split("/")[0]
+                if d.max_ts is not None and (folder not in self._coverage or d.max_ts > self._coverage[folder]):
+                    self._coverage[folder] = d.max_ts
             self._quote_cache = {}
             self._manifest_mtime = mtime
             self.version = manifest.get("version")
@@ -133,6 +139,15 @@ class Store:
 
     def datasets(self) -> dict[str, DatasetInfo]:
         return self._datasets
+
+    def coverage(self, rel: str) -> datetime | None:
+        """Latest synced observation of the dataset's folder (one extraction container per folder).
+
+        A lower bound of the time up to which the extractor has scanned the chain: each asset folder
+        holds its Chainlink feed (1 h heartbeat; 24 h for the stablecoin peg feeds), whereas a quiet
+        pool's own last row can be days old even when the extraction is up to date.
+        """
+        return self._coverage.get(rel.split("/")[0])
 
     # ------------------------------------------------------------------- queries
     def as_of(self, rel: str, t: datetime, cols: list[str]) -> dict[str, Any] | None:
@@ -168,6 +183,16 @@ class Store:
         rows = self._cursor().execute(sql, [start, end]).fetchall()
         names = select.split(", ")
         return [dict(zip(names, r)) for r in rows]
+
+    def distinct_ts(self, rel: str, start: datetime, end: datetime, limit: int) -> list[datetime]:
+        """Distinct timestamps with ``start <= ts < end``, ascending, at most ``limit``."""
+        d = self._datasets.get(rel)
+        if d is None or not d.files:
+            return []
+        rows = self._cursor().execute(
+            f"SELECT DISTINCT ts FROM {d.view} WHERE ts >= ? AND ts < ? ORDER BY ts LIMIT {int(limit)}", [start, end]
+        ).fetchall()
+        return [r[0] for r in rows]
 
     def sum_between(self, rel: str, col: str, start: datetime, end: datetime) -> float | None:
         """SUM(col) for ``start <= ts <= end`` (both inclusive); None when no non-null value."""

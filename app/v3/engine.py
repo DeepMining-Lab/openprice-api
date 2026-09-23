@@ -11,6 +11,10 @@ same branch order, same warnings and provenance. Only the data access changed:
 * the 10 000-row truncation of the windowed VWMP read (``api.max_limit`` used as a SQL
   LIMIT, V1/V2 behaviour) is removed. ``v3.legacy_truncation: true`` restores it so
   the engine can be proven identical to V2.
+
+Every candidate file that the hierarchy evaluates and does not use is recorded with the
+rule that rejected it (``get_price_at(..., trace=[...])``). This is bookkeeping only: the
+selection logic, its order and its thresholds are exactly those of V1/V2.
 """
 
 from __future__ import annotations
@@ -21,7 +25,7 @@ from typing import Any
 
 from app import registry
 from app.config import AppConfig
-from app.schemas import Warning
+from app.schemas import RejectedCandidate, Warning
 from app.services.price_service import (
     PriceResult,
     _WINDOW_BOUND_POLICY,
@@ -50,10 +54,21 @@ def _row_cols(ds: DatasetInfo) -> list[str]:
 
 
 class _Ctx:
-    """Per-request memo (the ETH/USD leg is identical across levels for one T)."""
+    """Per-request memo (the ETH/USD leg is identical across levels for one T) and trace of
+    the candidates rejected along the hierarchy, in evaluation order."""
 
     def __init__(self) -> None:
         self.eth: dict[tuple[str, datetime], tuple] = {}
+        self.rejected: list[RejectedCandidate] = []
+
+    def reject(self, level: str, file: str, rule: str, message: str, value: float | None = None,
+               threshold: float | None = None, last: datetime | None = None) -> None:
+        self.rejected.append(RejectedCandidate(level=level, file=file, rule=rule, message=message, value=value,
+                                               threshold=threshold, last_observation_utc=last))
+
+
+def _hms(t: datetime) -> str:
+    return t.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class Engine:
@@ -93,9 +108,11 @@ class Engine:
     # ------------------------------------------------------------- zombie check
     def _is_zombie(
         self, ds: DatasetInfo, row: dict[str, Any], timestamp: datetime, eth_usd_price: float | None = None,
-    ) -> tuple[bool, list[Warning]]:
+    ) -> tuple[bool, list[Warning], list[tuple[str, str, float, float]]]:
+        """(is_zombie, warnings, failed rules as (rule, message, value, threshold))."""
         cfg = self.cfg
         warnings: list[Warning] = []
+        reasons: list[tuple[str, str, float, float]] = []
         is_zombie = False
         schema = ds.schema
         tvl_col = schema.mapping.get("tvl_usd")
@@ -111,6 +128,10 @@ class Engine:
                         tvl_float *= eth_usd_price
                     if tvl_float < cfg.thresholds.seuil_TVL_min_usd:
                         is_zombie = True
+                        unconverted = schema.tvl_unit == "eth" and eth_usd_price is None
+                        unit = "ETH (no ETH/USD price to convert it)" if unconverted else "USD"
+                        thr = float(cfg.thresholds.seuil_TVL_min_usd)
+                        reasons.append(("zombie_tvl", f"TVL {tvl_float:,.0f} {unit} < {thr:,.0f} USD", tvl_float, thr))
             except (ValueError, TypeError):
                 warnings.append(Warning(code="tvl_parse_error",
                                         message=f"TVL value could not be parsed as a number (got {tvl!r}); viability check skipped."))
@@ -123,6 +144,8 @@ class Engine:
             vol_24h = self.store.sum_between(ds.rel, vol_col, window_start, timestamp)
             if vol_24h is not None and vol_24h < cfg.thresholds.seuil_vol_min_usd_24h:
                 is_zombie = True
+                thr = float(cfg.thresholds.seuil_vol_min_usd_24h)
+                reasons.append(("zombie_volume_24h", f"24 h volume {vol_24h:,.0f} USD < {thr:,.0f} USD", vol_24h, thr))
             elif vol_24h is None:
                 warnings.append(Warning(code="volume_sum_empty",
                                         message="No swaps found in the 24h window; volume viability check skipped."))
@@ -132,12 +155,50 @@ class Engine:
         else:
             warnings.append(Warning(code="missing_volume_column",
                                     message="Volume viability check could not be evaluated."))
-        return is_zombie, warnings
+        return is_zombie, warnings, reasons
 
     def _recently_active(self, row: dict[str, Any], timestamp: datetime) -> bool:
         """True iff a row exists in [T - N days, T]; ``row`` is the as-of row at T (ts <= T)."""
         window_start = timestamp - timedelta(days=self.cfg.thresholds.fenetre_inactivite_jours)
         return row["ts"] >= window_start
+
+    # ------------------------------------------------------------ rejection trace
+    def _reject_row(self, ctx: _Ctx, level: str, ds: DatasetInfo, row: dict[str, Any], timestamp: datetime,
+                    reasons: list[tuple[str, str, float, float]], inactive: bool = False) -> None:
+        """Record why a candidate with an as-of row was not used (zombie rules, inactivity)."""
+        last = row.get("ts")
+        for rule, message, value, threshold in reasons:
+            ctx.reject(level, ds.rel, rule, message, value, threshold, last)
+        if inactive:
+            days = self.cfg.thresholds.fenetre_inactivite_jours
+            age = (timestamp - last).total_seconds()
+            ctx.reject(level, ds.rel, "inactive", f"last observation {age / 86400:.1f} d before T (limit {days} d)",
+                       age, days * 86400.0, last)
+
+    def _reject_eth_leg(self, ctx: _Ctx, level: str, asset: str) -> None:
+        refs = [self._rel(p) for p in registry.get_eth_usd_reference_paths(asset)]
+        ctx.reject(level, refs[0] if refs else "eth_usd_reference", "eth_leg_unavailable",
+                   f"no ETH/USD observation at or before T in the {len(refs)} reference file(s)")
+
+    def _reject_unreadable(self, ctx: _Ctx, level: str, rel: str, ds: DatasetInfo | None) -> None:
+        if ds is None:
+            ctx.reject(level, rel, "dataset_missing", "file is not in the Parquet store")
+        else:
+            ctx.reject(level, rel, "missing_columns", "no timestamp or price column for this level")
+
+    def _reject_lag(self, ctx: _Ctx, level: str, ds: DatasetInfo, token_ts: datetime, eth_ts: datetime,
+                    lag: float) -> None:
+        limit = self.cfg.thresholds.cross_rate_max_lag_seconds
+        ctx.reject(level, ds.rel, "cross_rate_lag",
+                   f"token leg {_hms(token_ts)} is {lag:,.0f} s from the ETH/USD leg {_hms(eth_ts)} (limit {limit:,} s)",
+                   lag, float(limit), token_ts)
+
+    def _reject_window(self, ctx: _Ctx, level: str, ds: DatasetInfo, granularity: str,
+                       viability_row: dict[str, Any]) -> None:
+        half = _WINDOW_STEPS[granularity][-1] / 2.0
+        ctx.reject(level, ds.rel, "no_swaps_in_window",
+                   f"no usable swap within ±{half:.0f} s of T (window expansion exhausted)",
+                   last=viability_row.get("ts"))
 
     # -------------------------------------------------------- ETH/USD reference
     def _eth_usd_at(self, timestamp: datetime, asset: str, ctx: _Ctx):
@@ -160,23 +221,23 @@ class Engine:
         return out
 
     # ------------------------------------------------------------- raw builders
-    def _direct_stable_raw(self, asset, timestamp, paths, level, label) -> PriceResult | None:
+    def _direct_stable_raw(self, asset, timestamp, paths, level, label, ctx) -> PriceResult | None:
         best: PriceResult | None = None
         best_tvl = -1.0
         for path in paths:
             ds = self._ds(path)
-            if ds is None:
-                continue
-            ts_col, price_col = ds.col("timestamp"), ds.col("price_usd")
+            ts_col, price_col = (ds.col("timestamp"), ds.col("price_usd")) if ds else (None, None)
             if not ts_col or not price_col:
+                self._reject_unreadable(ctx, level, self._rel(path), ds)
                 continue
             row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if row is None or row.get(price_col) is None:
+                ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
-            zombie, z_warns = self._is_zombie(ds, row, timestamp)
-            if zombie:
-                continue
-            if not self._recently_active(row, timestamp):
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp)
+            active = self._recently_active(row, timestamp)
+            if zombie or not active:
+                self._reject_row(ctx, level, ds, row, timestamp, z_why, inactive=not active)
                 continue
             tvl_col = ds.col("tvl_usd")
             try:
@@ -209,16 +270,17 @@ class Engine:
             return None  # V1/V2 looked the ETH/USD leg up and then looped over nothing
         eth_price, eth_ts, eth_file, eth_row, eth_schema = self._eth_usd_at(timestamp, asset, ctx)
         if eth_price is None:
+            self._reject_eth_leg(ctx, level, asset)
             return None
         for path in token_paths:
             ds = self._ds(path)
-            if ds is None:
-                continue
-            ts_col, price_col = ds.col("timestamp"), ds.col("price_token_eth")
+            ts_col, price_col = (ds.col("timestamp"), ds.col("price_token_eth")) if ds else (None, None)
             if not ts_col or not price_col:
+                self._reject_unreadable(ctx, level, self._rel(path), ds)
                 continue
             row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if row is None or row.get(price_col) is None:
+                ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
             token_ts = row[ts_col]
             if eth_ts is not None and hasattr(token_ts, "timestamp") and hasattr(eth_ts, "timestamp"):
@@ -226,9 +288,11 @@ class Engine:
             else:
                 lag = 0.0
             if lag > self.cfg.thresholds.cross_rate_max_lag_seconds:
+                self._reject_lag(ctx, level, ds, token_ts, eth_ts, lag)
                 continue
-            zombie, z_warns = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_price)
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_price)
             if zombie:
+                self._reject_row(ctx, level, ds, row, timestamp, z_why)
                 continue
             token_eth_price = float(row[price_col])
             price_usd = token_eth_price * eth_price
@@ -289,23 +353,23 @@ class Engine:
                                       message="All swaps flagged by MAD filter; using unfiltered data."))
         return prices_clean, volumes_clean, excluded, mad_fallback
 
-    def _direct_stable_windowed(self, asset, timestamp, granularity, paths, level, label) -> PriceResult | None:
+    def _direct_stable_windowed(self, asset, timestamp, granularity, paths, level, label, ctx) -> PriceResult | None:
         cfg = self.cfg
         viable: list[tuple[float, DatasetInfo, dict[str, Any], list[Warning]]] = []
         for path in paths:
             ds = self._ds(path)
-            if ds is None:
-                continue
-            ts_col, price_col = ds.col("timestamp"), ds.col("price_usd")
+            ts_col, price_col = (ds.col("timestamp"), ds.col("price_usd")) if ds else (None, None)
             if not ts_col or not price_col:
+                self._reject_unreadable(ctx, level, self._rel(path), ds)
                 continue
             row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if row is None:
+                ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
-            zombie, z_warns = self._is_zombie(ds, row, timestamp)
-            if zombie:
-                continue
-            if not self._recently_active(row, timestamp):
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp)
+            active = self._recently_active(row, timestamp)
+            if zombie or not active:
+                self._reject_row(ctx, level, ds, row, timestamp, z_why, inactive=not active)
                 continue
             tvl_col = ds.col("tvl_usd")
             try:
@@ -366,6 +430,7 @@ class Engine:
                     window_bound_policy=_WINDOW_BOUND_POLICY,
                     expansion_step=step_idx,
                 )
+            self._reject_window(ctx, level, ds, granularity, viability_row)
         return None
 
     def _cross_rate_windowed(self, asset, timestamp, granularity, token_paths, level, label, ctx) -> PriceResult | None:
@@ -374,24 +439,27 @@ class Engine:
             return None
         eth_price, eth_ts, eth_file, eth_row, eth_schema = self._eth_usd_at(timestamp, asset, ctx)
         if eth_price is None:
+            self._reject_eth_leg(ctx, level, asset)
             return None
         for path in token_paths:
             ds = self._ds(path)
-            if ds is None:
-                continue
-            ts_col, price_col = ds.col("timestamp"), ds.col("price_token_eth")
+            ts_col, price_col = (ds.col("timestamp"), ds.col("price_token_eth")) if ds else (None, None)
             if not ts_col or not price_col:
+                self._reject_unreadable(ctx, level, self._rel(path), ds)
                 continue
             viability_row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if viability_row is None:
+                ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
-            zombie, z_warns = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_price)
+            zombie, z_warns, z_why = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_price)
             if zombie:
+                self._reject_row(ctx, level, ds, viability_row, timestamp, z_why)
                 continue
             if (eth_ts is not None and viability_row.get(ts_col) is not None
                     and hasattr(viability_row[ts_col], "timestamp")):
                 lag = abs((viability_row[ts_col] - eth_ts).total_seconds())
                 if lag > cfg.thresholds.cross_rate_max_lag_seconds:
+                    self._reject_lag(ctx, level, ds, viability_row[ts_col], eth_ts, lag)
                     continue
             vol_col = ds.col("volume_usd") or ds.col("volume_token")
             for step_idx, window_s, half, w_start, w_end, rows in self._window_vwmp(ds, price_col, vol_col, timestamp, granularity):
@@ -453,23 +521,25 @@ class Engine:
                     window_bound_policy=_WINDOW_BOUND_POLICY,
                     expansion_step=step_idx,
                 )
+            self._reject_window(ctx, level, ds, granularity, viability_row)
         return None
 
     # -------------------------------------------------------------- level 2 ETH
-    def _curve_raw(self, timestamp) -> PriceResult | None:
+    def _curve_raw(self, timestamp, ctx) -> PriceResult | None:
         for rel in registry.REGISTRY.get("ETH", {}).get("level_2_amm", []):
             ds = self.store.dataset(rel)
-            if ds is None:
-                continue
-            ts_col, inv_col = ds.col("timestamp"), ds.col("price_inverse_eth")
+            ts_col, inv_col = (ds.col("timestamp"), ds.col("price_inverse_eth")) if ds else (None, None)
             if not ts_col or not inv_col:
+                self._reject_unreadable(ctx, "2", rel, ds)
                 continue
             row = self.store.as_of(rel, timestamp, _row_cols(ds))
             if row is None or row.get(inv_col) is None or float(row[inv_col]) == 0:
+                ctx.reject("2", rel, "no_observation", "no observation at or before T")
                 continue
             eth_usd = 1.0 / float(row[inv_col])
-            zombie, z_warns = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_usd)
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_usd)
             if zombie:
+                self._reject_row(ctx, "2", ds, row, timestamp, z_why)
                 continue
             bn, bts, bwarns = self._extract_block_ref(ds, row)
             return PriceResult(
@@ -493,24 +563,25 @@ class Engine:
             )
         return None
 
-    def _curve_windowed(self, timestamp, granularity) -> PriceResult | None:
+    def _curve_windowed(self, timestamp, granularity, ctx) -> PriceResult | None:
         cfg = self.cfg
         for rel in registry.REGISTRY.get("ETH", {}).get("level_2_amm", []):
             ds = self.store.dataset(rel)
-            if ds is None:
-                continue
-            ts_col, inv_col = ds.col("timestamp"), ds.col("price_inverse_eth")
+            ts_col, inv_col = (ds.col("timestamp"), ds.col("price_inverse_eth")) if ds else (None, None)
             if not ts_col or not inv_col:
+                self._reject_unreadable(ctx, "2", rel, ds)
                 continue
             viability_row = self.store.as_of(rel, timestamp, _row_cols(ds))
             if viability_row is None:
+                ctx.reject("2", rel, "no_observation", "no observation at or before T")
                 continue
             eth_usd_viability = (
                 1.0 / float(viability_row[inv_col])
                 if viability_row.get(inv_col) and float(viability_row[inv_col]) != 0 else None
             )
-            zombie, z_warns = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_usd_viability)
+            zombie, z_warns, z_why = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_usd_viability)
             if zombie:
+                self._reject_row(ctx, "2", ds, viability_row, timestamp, z_why)
                 continue
             vol_col = ds.col("volume_usd") or ds.col("volume_token")
             for step_idx, window_s, half, w_start, w_end, rows in self._window_vwmp(ds, inv_col, vol_col, timestamp, granularity):
@@ -557,19 +628,20 @@ class Engine:
                     window_bound_policy=_WINDOW_BOUND_POLICY,
                     expansion_step=step_idx,
                 )
+            self._reject_window(ctx, "2", ds, granularity, viability_row)
         return None
 
     # ----------------------------------------------------------------- level 3
-    def _chainlink(self, asset, timestamp) -> PriceResult | None:
+    def _chainlink(self, asset, timestamp, ctx) -> PriceResult | None:
         for path in registry.get_chainlink_paths(asset):
             ds = self._ds(path)
-            if ds is None:
-                continue
-            ts_col, price_col = ds.col("timestamp"), ds.col("price_usd")
+            ts_col, price_col = (ds.col("timestamp"), ds.col("price_usd")) if ds else (None, None)
             if not ts_col or not price_col:
+                self._reject_unreadable(ctx, "3", self._rel(path), ds)
                 continue
             row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if row is None or row.get(price_col) is None:
+                ctx.reject("3", ds.rel, "no_observation", "no Chainlink round at or before T")
                 continue
             bn, bts, bwarns = self._extract_block_ref(ds, row)
             return PriceResult(
@@ -593,9 +665,21 @@ class Engine:
     # ------------------------------------------------------------- entry point
     def get_price_at(
         self, asset: str, timestamp: datetime, branch: str = "auto", source: str = "auto", granularity: str = "raw",
+        trace: list[RejectedCandidate] | None = None,
     ) -> PriceResult:
-        """Same hierarchy and short-circuit rules as ``price_service.get_price_at``."""
+        """Same hierarchy and short-circuit rules as ``price_service.get_price_at``.
+
+        When ``trace`` is given, every candidate evaluated and not used is appended to it.
+        """
         ctx = _Ctx()
+        try:
+            return self._hierarchy(asset, timestamp, branch, source, granularity, ctx)
+        finally:
+            if trace is not None:
+                trace.extend(ctx.rejected)
+
+    def _hierarchy(self, asset: str, timestamp: datetime, branch: str, source: str, granularity: str,
+                   ctx: _Ctx) -> PriceResult:
         dex = source in ("auto", "dex")
         raw = granularity == "raw"
 
@@ -614,18 +698,18 @@ class Engine:
 
         if raw:
             steps = [
-                ("0a", lambda: self._direct_stable_raw(asset, timestamp, p0a, "0a", "direct_stable")),
+                ("0a", lambda: self._direct_stable_raw(asset, timestamp, p0a, "0a", "direct_stable", ctx)),
                 ("0b", lambda: self._cross_rate_raw(asset, timestamp, p0b, "0b", "cross_rate", ctx)),
                 ("1", lambda: self._level1_raw(asset, timestamp, ctx)),
-                ("2", lambda: self._curve_raw(timestamp) if asset == "ETH" else
+                ("2", lambda: self._curve_raw(timestamp, ctx) if asset == "ETH" else
                  self._cross_rate_raw(asset, timestamp, registry.get_level_2_amm_token_paths(asset), "2", "alternative_amm", ctx)),
             ]
         else:
             steps = [
-                ("0a", lambda: self._direct_stable_windowed(asset, timestamp, granularity, p0a, "0a", "direct_stable")),
+                ("0a", lambda: self._direct_stable_windowed(asset, timestamp, granularity, p0a, "0a", "direct_stable", ctx)),
                 ("0b", lambda: self._cross_rate_windowed(asset, timestamp, granularity, p0b, "0b", "cross_rate", ctx)),
                 ("1", lambda: self._level1_windowed(asset, timestamp, granularity, p1x, ctx)),
-                ("2", lambda: self._curve_windowed(timestamp, granularity) if asset == "ETH" else
+                ("2", lambda: self._curve_windowed(timestamp, granularity, ctx) if asset == "ETH" else
                  self._cross_rate_windowed(asset, timestamp, granularity, registry.get_level_2_amm_token_paths(asset), "2", "alternative_amm", ctx)),
             ]
         for name, fn in steps:
@@ -635,7 +719,7 @@ class Engine:
 
         # Level 3 (Chainlink) stays a point read whatever the granularity.
         if branch in ("auto", "3") or source == "chainlink":
-            res = self._chainlink(asset, timestamp)
+            res = self._chainlink(asset, timestamp, ctx)
             if res:
                 return res
             if branch == "3":
@@ -644,7 +728,7 @@ class Engine:
 
     def _level1_raw(self, asset, timestamp, ctx) -> PriceResult | None:
         if asset == "ETH":
-            res = self._direct_stable_raw(asset, timestamp, registry.get_level_1_direct_paths(asset), "1", "alternative_pool")
+            res = self._direct_stable_raw(asset, timestamp, registry.get_level_1_direct_paths(asset), "1", "alternative_pool", ctx)
             if res:
                 return res
         xrate = registry.get_level_1_cross_rate_token_paths(asset)
@@ -655,7 +739,7 @@ class Engine:
     def _level1_windowed(self, asset, timestamp, granularity, xrate, ctx) -> PriceResult | None:
         if asset == "ETH":
             res = self._direct_stable_windowed(asset, timestamp, granularity,
-                                               registry.get_level_1_direct_paths(asset), "1", "alternative_pool")
+                                               registry.get_level_1_direct_paths(asset), "1", "alternative_pool", ctx)
             if res:
                 return res
         if xrate:

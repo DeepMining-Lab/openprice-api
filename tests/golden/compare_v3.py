@@ -5,7 +5,9 @@
 
 Exit code 0 only if every non-excused record is identical (floats: rel 1e-9).
 Records whose window can contain one of the 110 duplicated ETH swaps (removed in the
-Parquet store, on purpose) are reported separately as "dup-zone".
+Parquet store, on purpose) are reported separately as "dup-zone". The additive V3 diagnostics
+(warning codes in V3_DIAGNOSTIC_CODES, provenance.rejected_candidates) are stripped before the
+comparison: they never change a number and V2 has no equivalent.
 """
 import argparse, json, math, os, sys
 from collections import Counter
@@ -14,7 +16,7 @@ from datetime import datetime, timedelta, timezone
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 sys.path.insert(0, ROOT); os.chdir(ROOT)
 from app.config import get_config
-from app.v3.service import get_service
+from app.v3.service import get_service, strip_v3_diagnostics
 
 # Days on which duplicated (tx_hash, log_index) rows exist in eth_usdc_uniswap_v3_005.csv.
 DUP_DAYS = ["2023-12-05", "2026-05-20", "2026-05-22", "2026-05-23"]
@@ -60,7 +62,7 @@ def compare(legacy: bool, limit: int | None = None, golden: str | None = None):
         q = r["req"]
         got, _ = svc.price_at(q["asset"], datetime.fromisoformat(q["timestamp"].replace("Z", "+00:00")),
                               granularity=q["granularity"])
-        d = list(diff(r["response"], got.model_dump(mode="json")))
+        d = list(diff(r["response"], strip_v3_diagnostics(got.model_dump(mode="json"))))
         if not d: counts["identical"] += 1; continue
         if in_dup_zone(q["asset"], q["timestamp"]): counts["dup_zone"] += 1; continue
         counts["other"] += 1; bad.append((r["id"], d))

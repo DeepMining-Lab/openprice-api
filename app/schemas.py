@@ -109,6 +109,30 @@ class PriceV2Response(BaseModel):
     warnings: list[Warning] = []
 
 
+# ---------------------------------------------------------------------------
+# API V3 schemas. Additive — V1/V2 schemas above are unchanged, so V3 can
+# explain its source selection without altering the V1/V2 JSON.
+# ---------------------------------------------------------------------------
+
+class RejectedCandidate(BaseModel):
+    """A source file that the hierarchy evaluated at T and did not use, and why."""
+    level: str
+    file: str
+    rule: str                      # zombie_tvl | zombie_volume_24h | inactive | cross_rate_lag | ...
+    message: str
+    value: float | None = None     # measured value that failed the rule (USD, seconds, ...)
+    threshold: float | None = None
+    last_observation_utc: datetime | None = None
+
+
+class ProvenanceV3(Provenance):
+    rejected_candidates: list[RejectedCandidate] = []
+
+
+class PriceV3Response(PriceV2Response):
+    provenance: ProvenanceV3 | None = None
+
+
 class DatasetFile(BaseModel):
     asset: str
     path: str
