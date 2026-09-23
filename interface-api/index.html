@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html lang="fr">
+<html lang="en">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -476,9 +476,9 @@
 
     <div class="ver-wrap">
       <div class="pill-group" id="ver-group">
-        <button class="pill-btn active" data-ver="v1">V1</button>
+        <button class="pill-btn"        data-ver="v1">V1</button>
         <button class="pill-btn"        data-ver="v2">V2</button>
-        <button class="pill-btn"        data-ver="v3">V3</button>
+        <button class="pill-btn active" data-ver="v3">V3</button>
       </div>
       <span class="info-tip" tabindex="0" id="ver-info-tip" data-i18n-attr-arialabel="verTipAria">i
         <span class="tip-box" id="ver-tip-box"><!-- filled by JS: updateStaticText() --></span>
@@ -486,8 +486,8 @@
     </div>
 
     <div class="pill-group" id="lang-group">
-      <button class="pill-btn active" data-lang="fr">FR</button>
-      <button class="pill-btn"        data-lang="en">EN</button>
+      <button class="pill-btn"        data-lang="fr">FR</button>
+      <button class="pill-btn active" data-lang="en">EN</button>
     </div>
 
     <button class="icon-btn" id="theme-toggle" type="button" onclick="toggleTheme()"><!-- filled by JS --></button>
@@ -792,7 +792,7 @@ const I18N = {
   },
 };
 
-let currentLang = 'fr';
+let currentLang = 'en';
 function t(key) { return I18N[currentLang][key]; }
 function locale() { return I18N[currentLang].locale; }
 // French typography spaces before a colon; English does not.
@@ -821,7 +821,7 @@ const MOON_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" st
 
 let selectedToken   = 'ETH';
 let selectedGran    = 'raw';
-let selectedVersion = 'v1';
+let selectedVersion = 'v3';
 let lastResult       = null; // last successful API response, re-rendered on language switch
 let lastResultLabel  = null; // { asset, version } of lastResult, for the "Result" header
 
