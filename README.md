@@ -764,10 +764,35 @@ It lets you, without writing any `curl`:
   timestamps, the full temporal-provenance block (window bounds, R1 expansion
   step, raw/valid/filtered swap counts) and the reference block `b_ref(T)`.
 
-The page defaults its API base URL to the origin it is served from, so opening
-`/ui` works out of the box. It can also be opened as a local file
-(`file://…/index.html`): in that case set the API URL field to your running
-instance (e.g. `http://127.0.0.1:8000`).
+The API URL field picks its default from where the page is served:
+
+- served by the API at `/ui` (e.g. the internal link): that same API, no key needed;
+- anywhere else (GitHub Pages, or opened as a local file `file://…/index.html`): the
+  Deep Mining gateway, `https://gateway.deepmining.ch/prices`, which requires an API key.
+
+The field stays editable, e.g. `http://127.0.0.1:8000` for a local instance. A page
+served over `https` cannot call a plain-`http` API (the browser blocks it), `localhost`
+excepted.
+
+### Public explorer (GitHub Pages)
+
+The same file is published at **https://deepmining-lab.github.io/openprice-api/** by
+`.github/workflows/pages.yml`, on every push to `main` that changes `interface-api/`
+(only that folder is published). One-time setup: *Settings → Pages → Build and
+deployment → Source: GitHub Actions*.
+
+That page calls the API through the gateway, so it needs a gateway API key (generate one
+with `POST /api-keys/generate`, see https://gateway.deepmining.ch/docs/):
+
+- paste it in the **API key** field; the status dot then reads `ok`, `key required`
+  (401) or `invalid key` (403);
+- the key is sent only in the `X-API-Key` header, never in a URL;
+- it is kept in `sessionStorage` (forgotten when the tab is closed), or in
+  `localStorage` when **Remember on this device** is ticked.
+
+Through the gateway, V1/V2 computations are rate-limited (10 per minute per key, 3 in
+progress across all users): prefer V3. The page relies on the gateway's CORS headers
+(`Access-Control-Allow-Origin: *`, `X-API-Key` allowed by the preflight).
 
 ## Running tests
 

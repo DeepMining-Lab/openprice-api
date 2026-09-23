@@ -125,12 +125,31 @@
       border-radius: 8px; padding: .4rem .75rem;
     }
     .api-bar label { font-size: .7rem; color: var(--muted); white-space: nowrap; }
-    .api-bar input {
+    .api-bar input:not([type="checkbox"]) {
       flex: 1; min-width: 120px; background: transparent; border: none;
       color: var(--text); font-size: .8rem; outline: none;
       font-family: monospace;
     }
     #api-dot { font-size: .65rem; white-space: nowrap; }
+
+    /* Second row of the bar: gateway API key */
+    .key-row {
+      flex-basis: 100%;
+      display: flex; align-items: center; gap: .5rem; flex-wrap: wrap;
+      padding-top: .45rem; border-top: 1px solid var(--border);
+    }
+    .key-remember { display: inline-flex; align-items: center; gap: .3rem; cursor: pointer; }
+    .key-remember input { accent-color: var(--accent); cursor: pointer; }
+    /* Native checkbox: dark rendering on the dark theme (same conditions as the dark palette) */
+    @media (prefers-color-scheme: dark) {
+      :root:not([data-theme="light"]) .key-remember input { color-scheme: dark; }
+    }
+    :root[data-theme="dark"] .key-remember input { color-scheme: dark; }
+    .key-link {
+      margin-left: auto; font-size: .7rem; white-space: nowrap;
+      color: var(--accent); text-decoration: none;
+    }
+    .key-link:hover { color: var(--text); text-decoration: underline; }
 
     /* ─── Pill groups (version / language selectors) ────────────────── */
     .ver-wrap { display: flex; align-items: center; gap: .4rem; white-space: nowrap; }
@@ -470,9 +489,9 @@
   <!-- API bar -->
   <div class="api-bar">
     <label for="api-url" data-i18n="apiLabel">API</label>
-    <input type="text" id="api-url" value="http://127.0.0.1:8000"
-           placeholder="http://127.0.0.1:8000"
-           onchange="checkHealth()">
+    <input type="text" id="api-url" value="https://gateway.deepmining.ch/prices"
+           placeholder="https://gateway.deepmining.ch/prices"
+           spellcheck="false" onchange="onApiUrlChange()">
 
     <div class="ver-wrap">
       <div class="pill-group" id="ver-group">
@@ -493,6 +512,20 @@
     <button class="icon-btn" id="theme-toggle" type="button" onclick="toggleTheme()"><!-- filled by JS --></button>
 
     <span id="api-dot" style="color:var(--muted)">● …</span>
+
+    <!-- Gateway API key: sent only in the X-API-Key header, never in the URL -->
+    <div class="key-row">
+      <label for="api-key" data-i18n="keyLabel">Clé API</label>
+      <input type="password" id="api-key" autocomplete="off" spellcheck="false" autocapitalize="off"
+             data-i18n-attr-placeholder="keyPlaceholder" onchange="onKeyChange()">
+      <button class="icon-btn" id="key-toggle" type="button" onclick="toggleKeyVisibility()"><!-- filled by JS --></button>
+      <label class="key-remember" data-i18n-attr-title="keyRememberTip">
+        <input type="checkbox" id="key-remember" onchange="saveKey()">
+        <span data-i18n="keyRemember">Mémoriser sur cet appareil</span>
+      </label>
+      <a class="key-link" href="https://gateway.deepmining.ch/docs/" target="_blank" rel="noopener noreferrer"
+         data-i18n="keyGet" data-i18n-attr-title="keyGetTip">Obtenir une clé ↗</a>
+    </div>
   </div>
 
   <!-- Controls -->
@@ -595,6 +628,14 @@ const I18N = {
   fr: {
     tagline: "Interrogez l'API de prix crypto : confiance et provenance complètes",
     apiLabel: 'API',
+    keyLabel: 'Clé API',
+    keyPlaceholder: 'Clé de la gateway (X-API-Key)',
+    keyShow: 'Afficher la clé', keyHide: 'Masquer la clé',
+    keyRemember: 'Mémoriser sur cet appareil',
+    keyRememberTip: "Sinon, la clé est oubliée à la fermeture de l'onglet.",
+    keyGet: 'Obtenir une clé ↗',
+    keyGetTip: 'Documentation de la gateway : POST /api-keys/generate',
+    dotKeyMissing: 'clé requise', dotKeyInvalid: 'clé invalide', dotOffline: 'hors ligne',
     tokenTitle: 'Token',
     timestampTitle: 'Horodatage',
     granLabel: 'Granularité :',
@@ -629,6 +670,15 @@ const I18N = {
       </span>`,
     errTitle: 'Erreur',
     errUnreachable: "Impossible de contacter l'API : ",
+    errKeyMissing: "Clé API manquante : l'accès par la gateway demande une clé (champ « Clé API »).",
+    errKeyInvalid: 'Clé API invalide, révoquée ou suspendue.',
+    errRateLimited: 'Limite de requêtes atteinte, réessayez dans un moment. Les calculs V1 et V2 sont limités à 10 par minute et par clé : préférez V3.',
+    errRetryAfter: 'Nouvel essai possible dans {s} s.',
+    errNotFound: "Adresse introuvable : vérifiez l'URL de l'API (par la gateway : {gw}).",
+    errUnavailable: 'OpenPrice est injoignable pour le moment, réessayez plus tard.',
+    errNotReady: 'Service temporairement indisponible, réessayez plus tard.',
+    errTimeout: "OpenPrice n'a pas répondu à temps : réessayez, ou utilisez V3.",
+    errMixedContent: 'Cette page est en https : le navigateur bloque les appels vers une API en http. Utilisez une URL en https, par exemple {gw}.',
     resultTitle: 'Résultat',
     priceUnavailable: 'Prix indisponible',
     levelBadge: 'Niveau',
@@ -694,6 +744,14 @@ const I18N = {
   en: {
     tagline: 'Query the crypto price API: full confidence and provenance',
     apiLabel: 'API',
+    keyLabel: 'API key',
+    keyPlaceholder: 'Gateway key (X-API-Key)',
+    keyShow: 'Show key', keyHide: 'Hide key',
+    keyRemember: 'Remember on this device',
+    keyRememberTip: 'Otherwise the key is forgotten when the tab is closed.',
+    keyGet: 'Get a key ↗',
+    keyGetTip: 'Gateway documentation: POST /api-keys/generate',
+    dotKeyMissing: 'key required', dotKeyInvalid: 'invalid key', dotOffline: 'offline',
     tokenTitle: 'Token',
     timestampTitle: 'Timestamp',
     granLabel: 'Granularity:',
@@ -728,6 +786,15 @@ const I18N = {
       </span>`,
     errTitle: 'Error',
     errUnreachable: 'Could not reach the API: ',
+    errKeyMissing: 'Missing API key: access through the gateway requires a key (API key field).',
+    errKeyInvalid: 'Invalid, revoked or suspended API key.',
+    errRateLimited: 'Rate limit reached, try again in a moment. V1 and V2 computations are limited to 10 per minute per key: prefer V3.',
+    errRetryAfter: 'Retry possible in {s} s.',
+    errNotFound: 'Not found: check the API URL (through the gateway: {gw}).',
+    errUnavailable: 'OpenPrice cannot be reached right now, try again later.',
+    errNotReady: 'Service temporarily unavailable, try again later.',
+    errTimeout: 'OpenPrice did not answer in time: try again, or use V3.',
+    errMixedContent: 'This page is served over https: the browser blocks calls to an http API. Use an https URL, e.g. {gw}.',
     resultTitle: 'Result',
     priceUnavailable: 'Price unavailable',
     levelBadge: 'Level',
@@ -804,6 +871,12 @@ function colon() { return currentLang === 'fr' ? ' : ' : ': '; }
 
 const FALLBACK_TOKENS = ['ETH', 'LINK', 'UNI', 'AAVE', 'COMP'];
 
+// Public entry point: the Deep Mining gateway serves every OpenPrice path under /prices and
+// requires an API key. Default API URL whenever the page is not served by the API itself
+// (GitHub Pages, local file).
+const GATEWAY_BASE = 'https://gateway.deepmining.ch/prices';
+const KEY_STORAGE  = 'op-api-key';
+
 const BRANCH_INFO = {
   '0a': { label: 'direct_stable',       cls: 'b-0a' },
   '0b': { label: 'cross_rate',          cls: 'b-0b' },
@@ -814,6 +887,8 @@ const BRANCH_INFO = {
 
 const SUN_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>`;
 const MOON_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></svg>`;
+const EYE_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const EYE_OFF_SVG = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24M1 1l22 22"/></svg>`;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // State
@@ -824,33 +899,24 @@ let selectedGran    = 'raw';
 let selectedVersion = 'v3';
 let lastResult       = null; // last successful API response, re-rendered on language switch
 let lastResultLabel  = null; // { asset, version } of lastResult, for the "Result" header
+let lastError        = null; // last failed request, re-rendered on language switch
+let healthState      = 'pending'; // status dot: pending | ok | keyMissing | keyInvalid | offline | HTTP status
+let apiGen           = 0;    // bumped on every API URL / key change: answers for an older setting are dropped
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Init
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function init() {
-  // Default API URL = current origin (works when served via /ui)
-  const originInput = document.getElementById('api-url');
-  if (window.location.protocol !== 'file:') {
-    originInput.value = window.location.origin;
-  }
+function init() {
+  document.getElementById('api-url').value = defaultApiBase();
+  restoreKey();
 
   // Default date = today
   const today = new Date().toISOString().slice(0, 10);
   document.getElementById('inp-date').value = today;
 
-  // Load tokens from API or fallback
-  let tokens = FALLBACK_TOKENS;
-  try {
-    const base = apiBase();
-    const r = await fetch(`${base}/v1/assets`, { signal: AbortSignal.timeout(2000) });
-    if (r.ok) {
-      const d = await r.json();
-      tokens = d.assets.map(a => a.asset);
-    }
-  } catch (_) { /* use fallback */ }
-  buildTokenPills(tokens);
+  // Fallback list until /v1/assets answers (see loadTokens)
+  buildTokenPills(FALLBACK_TOKENS);
 
   // Granularity buttons
   document.querySelectorAll('.gran-btn').forEach(b => {
@@ -875,7 +941,7 @@ async function init() {
 
   initTheme();
   updatePreview();
-  checkHealth();
+  refreshApi();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -896,18 +962,27 @@ function applyLang() {
   document.querySelectorAll('[data-i18n]').forEach(el => {
     el.textContent = t(el.dataset.i18n);
   });
-  // Attributes (aria-label etc.)
+  // Attributes (aria-label, placeholder, title)
   document.querySelectorAll('[data-i18n-attr-arialabel]').forEach(el => {
     el.setAttribute('aria-label', t(el.dataset.i18nAttrArialabel));
   });
+  document.querySelectorAll('[data-i18n-attr-placeholder]').forEach(el => {
+    el.setAttribute('placeholder', t(el.dataset.i18nAttrPlaceholder));
+  });
+  document.querySelectorAll('[data-i18n-attr-title]').forEach(el => {
+    el.setAttribute('title', t(el.dataset.i18nAttrTitle));
+  });
 
   document.getElementById('ver-tip-box').innerHTML = t('verTipHtml');
+  updateKeyToggle();
+  renderDot();
 
   const btn = document.getElementById('btn-query');
   if (!btn.disabled) btn.querySelector('[data-i18n]').textContent = t('queryBtn');
 
-  // Re-render the last result (if any) so every dynamically-built string updates too.
+  // Re-render the last result or error (if any) so every dynamically-built string updates too.
   if (lastResult) renderResult(lastResult);
+  else if (lastError) renderLastError();
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1018,25 +1093,127 @@ function toggleAdv() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Health check
+// API access: URL, key, status
 // ─────────────────────────────────────────────────────────────────────────────
 
-function apiBase() { return document.getElementById('api-url').value.replace(/\/$/, ''); }
+// The API serves this page at /ui (internal link): the API is then the page's own URL minus
+// "/ui", and no key is needed. Anywhere else, go through the gateway.
+function defaultApiBase() {
+  const { protocol, origin, pathname } = window.location;
+  if (protocol !== 'file:' && /\/ui\/?$/.test(pathname)) return origin + pathname.replace(/\/ui\/?$/, '');
+  return GATEWAY_BASE;
+}
 
-async function checkHealth() {
-  const dot = document.getElementById('api-dot');
-  dot.style.color = 'var(--muted)';
-  dot.textContent = '● …';
+function apiBase() { return document.getElementById('api-url').value.trim().replace(/\/+$/, ''); }
+function apiKey()  { return document.getElementById('api-key').value.trim(); }
+
+// Every API call goes through here. The key rides in the X-API-Key header, never in the URL
+// (URLs end up in logs and browser history), and only when one was entered.
+function apiFetch(path, options = {}) {
+  const headers = new Headers(options.headers);
+  const key = apiKey();
+  if (key) headers.set('X-API-Key', key);
+  return fetch(apiBase() + path, { ...options, headers });
+}
+
+// The key is kept in sessionStorage (survives a reload, gone when the tab closes), or in
+// localStorage when "Remember on this device" is ticked; never in both.
+function restoreKey() {
+  let key = '', remembered = false;
   try {
-    const r = await fetch(`${apiBase()}/health`, { signal: AbortSignal.timeout(3000) });
-    if (r.ok) {
-      dot.style.color = 'var(--ok)'; dot.textContent = '● ok';
-    } else {
-      dot.style.color = 'var(--warn)'; dot.textContent = '● ' + r.status;
-    }
+    key = localStorage.getItem(KEY_STORAGE) || '';
+    remembered = key !== '';
+    if (!remembered) key = sessionStorage.getItem(KEY_STORAGE) || '';
+  } catch (_) {}
+  document.getElementById('api-key').value = key;
+  document.getElementById('key-remember').checked = remembered;
+}
+
+function saveKey() {
+  const key = apiKey();
+  const remember = document.getElementById('key-remember').checked;
+  try {
+    localStorage.removeItem(KEY_STORAGE);
+    sessionStorage.removeItem(KEY_STORAGE);
+    if (key) (remember ? localStorage : sessionStorage).setItem(KEY_STORAGE, key);
+  } catch (_) {}
+}
+
+function onKeyChange() {
+  const input = document.getElementById('api-key');
+  input.value = input.value.trim();
+  saveKey();
+  refreshApi();
+}
+
+function onApiUrlChange() {
+  const input = document.getElementById('api-url');
+  input.value = input.value.trim();
+  refreshApi();
+}
+
+function toggleKeyVisibility() {
+  const input = document.getElementById('api-key');
+  input.type = input.type === 'password' ? 'text' : 'password';
+  updateKeyToggle();
+}
+
+function updateKeyToggle() {
+  const shown = document.getElementById('api-key').type === 'text';
+  const btn = document.getElementById('key-toggle');
+  btn.innerHTML = shown ? EYE_OFF_SVG : EYE_SVG; // icon = what a click does
+  btn.setAttribute('aria-label', t(shown ? 'keyHide' : 'keyShow'));
+  btn.title = btn.getAttribute('aria-label');
+}
+
+// Re-checks the status and reloads the token list after the API URL or the key changed.
+// Wired to the fields' change event (blur / Enter), not to every keystroke: through the
+// gateway, every call counts toward its per-IP rate limit.
+function refreshApi() {
+  const gen = ++apiGen;
+  checkHealth(gen);
+  loadTokens(gen);
+}
+
+async function checkHealth(gen) {
+  healthState = 'pending';
+  renderDot();
+  let state;
+  try {
+    const r = await apiFetch('/health', { signal: AbortSignal.timeout(5000) });
+    state = r.ok ? 'ok' : r.status === 401 ? 'keyMissing' : r.status === 403 ? 'keyInvalid' : String(r.status);
   } catch {
-    dot.style.color = 'var(--err)'; dot.textContent = '● offline';
+    state = 'offline';
   }
+  if (gen !== apiGen) return; // the URL or the key changed meanwhile
+  healthState = state;
+  renderDot();
+}
+
+function renderDot() {
+  const s = healthState;
+  const [color, label] =
+      s === 'pending'    ? ['--muted', '…']
+    : s === 'ok'         ? ['--ok',    'ok']
+    : s === 'keyMissing' ? ['--warn',  t('dotKeyMissing')]
+    : s === 'keyInvalid' ? ['--err',   t('dotKeyInvalid')]
+    : s === 'offline'    ? ['--err',   t('dotOffline')]
+    :                      ['--warn',  s]; // any other HTTP status, shown as-is
+  const dot = document.getElementById('api-dot');
+  dot.style.color = `var(${color})`;
+  dot.textContent = '● ' + label;
+}
+
+// Through the gateway without a valid key, /v1/assets answers 401/403: the current list stays.
+async function loadTokens(gen) {
+  try {
+    const r = await apiFetch('/v1/assets', { signal: AbortSignal.timeout(5000) });
+    if (!r.ok) return;
+    const tokens = (await r.json()).assets.map(a => a.asset);
+    if (gen !== apiGen || !tokens.length) return;
+    if (!tokens.includes(selectedToken)) selectedToken = tokens[0];
+    buildTokenPills(tokens);
+  } catch (_) { /* keep the current list */ }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1052,37 +1229,96 @@ async function runQuery() {
   const source = document.getElementById('inp-source').value;
   const branch = document.getElementById('inp-branch').value;
   const versionAtRequest = selectedVersion;
-  const url    = `${apiBase()}/${versionAtRequest}/prices/${selectedToken}/at?timestamp=${encodeURIComponent(ts)}&granularity=${selectedGran}&source=${source}&branch=${branch}&include_confidence=true&include_provenance=true`;
+  const path   = `/${versionAtRequest}/prices/${selectedToken}/at?timestamp=${encodeURIComponent(ts)}&granularity=${selectedGran}&source=${source}&branch=${branch}&include_confidence=true&include_provenance=true`;
 
   try {
-    const r = await fetch(url);
+    const r = await apiFetch(path);
     if (!r.ok) {
-      const err = await r.json().catch(() => ({ detail: r.statusText }));
+      const body = await r.json().catch(() => null);
       lastResult = null;
-      renderError(err.detail || r.statusText);
+      // Retry-After is readable cross-origin only if the gateway lists it in Access-Control-Expose-Headers
+      lastError = { status: r.status, body, retryAfter: r.headers.get('Retry-After') };
+      if (r.status === 401 || r.status === 403) {
+        healthState = r.status === 401 ? 'keyMissing' : 'keyInvalid';
+        renderDot();
+      }
+      renderLastError();
     } else {
       const body = await r.json();
       lastResult = body;
+      lastError = null;
       lastResultLabel = { asset: selectedToken, version: versionAtRequest };
       renderResult(body);
     }
   } catch (e) {
     lastResult = null;
-    renderError(t('errUnreachable') + e.message);
+    lastError = { network: true, message: e.message, mixedContent: isMixedContent(apiBase()) };
+    renderLastError();
   } finally {
     btn.disabled = false;
     btn.innerHTML = `<span data-i18n="queryBtn">${esc(t('queryBtn'))}</span>`;
   }
 }
 
+// An https page cannot call a plain-http API (loopback excepted): the browser blocks the
+// request and fetch only reports a generic network error.
+function isMixedContent(base) {
+  return window.location.protocol === 'https:'
+    && /^http:\/\//i.test(base)
+    && !/^http:\/\/(localhost|127\.\d+\.\d+\.\d+|\[::1\])(:\d+)?(\/|$)/i.test(base);
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Render error
 // ─────────────────────────────────────────────────────────────────────────────
 
-function renderError(msg) {
+// Localized hint shown above the server's own message
+const ERROR_HINTS = {
+  401: 'errKeyMissing', 403: 'errKeyInvalid', 429: 'errRateLimited',
+  502: 'errUnavailable', 503: 'errNotReady', 504: 'errTimeout',
+};
+
+// Two error shapes reach the page: FastAPI's {"detail": "..." | [{loc, msg}, ...]} from the
+// API itself, and the gateway's {"error", "message"?}.
+function serverMessage(body) {
+  if (!body || typeof body !== 'object') return '';
+  const d = body.detail;
+  if (Array.isArray(d)) { // FastAPI validation error (422): one entry per invalid field
+    return d.map(e => {
+      const field = (e.loc || []).filter(p => p !== 'query' && p !== 'path').join('.');
+      return field ? `${field}: ${e.msg}` : e.msg;
+    }).join(' · ');
+  }
+  if (typeof d === 'string') return d;
+  return String(body.message || body.error || '');
+}
+
+function renderLastError() {
+  const e = lastError;
+  if (e.network) {
+    renderError(t('errTitle'), [e.mixedContent
+      ? t('errMixedContent').replace('{gw}', GATEWAY_BASE)
+      : t('errUnreachable') + e.message]);
+    return;
+  }
+  const server = serverMessage(e.body);
+  const lines = [];
+  if (ERROR_HINTS[e.status]) lines.push(t(ERROR_HINTS[e.status]));
+  // A 404 without an OpenPrice message (the gateway's "Endpoint not found", FastAPI's
+  // "Not Found") means a wrong API URL, e.g. the gateway without /prices.
+  if (e.status === 404 && (!server || server === 'Endpoint not found' || server === 'Not Found')) {
+    lines.push(t('errNotFound').replace('{gw}', GATEWAY_BASE));
+  }
+  if (e.retryAfter) lines.push(t('errRetryAfter').replace('{s}', e.retryAfter));
+  if (server) lines.push(server);
+  renderError(`${t('errTitle')} ${e.status}`, lines);
+}
+
+function renderError(title, lines) {
   show('results');
+  const detail = lines.map(l => '<br>' + esc(String(l))).join('');
   document.getElementById('card-price').innerHTML = `
-    <div class="unavail-box"><strong>${esc(t('errTitle'))}</strong><br>${esc(String(msg))}</div>`;
+    <div class="unavail-box"><strong>${esc(title)}</strong>${detail}</div>`;
   hide('card-conf');
   document.getElementById('acc-section').innerHTML = '';
   addClass('card-price', 'fade-in');
