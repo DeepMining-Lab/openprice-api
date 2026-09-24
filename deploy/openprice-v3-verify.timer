@@ -1,0 +1,9 @@
+[Unit]
+Description=Weekly full check of the CSV bytes converted by the OpenPrice V3 sync
+
+[Timer]
+OnCalendar=Sun *-*-* 04:20:00
+Persistent=true
+
+[Install]
+WantedBy=timers.target

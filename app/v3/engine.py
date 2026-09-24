@@ -10,7 +10,9 @@ same branch order, same warnings and provenance. Only the data access changed:
 * the ETH/USD reference leg is resolved once per request and shared by the levels;
 * the 10 000-row truncation of the windowed VWMP read (``api.max_limit`` used as a SQL
   LIMIT, V1/V2 behaviour) is removed. ``v3.legacy_truncation: true`` restores it so
-  the engine can be proven identical to V2.
+  the engine can be proven identical to V2;
+* a Chainlink fallback (level 3) reads only the rounds of the aggregator phase the proxy
+  served at T (``v3.chainlink_active_phase_only``; not in legacy mode).
 
 Every candidate file that the hierarchy evaluates and does not use is recorded with the
 rule that rejected it (``get_price_at(..., trace=[...])``). This is bookkeeping only: the
@@ -46,10 +48,12 @@ _ROW_CANON = (
 
 
 def _row_cols(ds: DatasetInfo) -> list[str]:
-    """Parquet columns fetched with an as-of row (superset of what V1/V2 selected)."""
+    """Parquet columns fetched with an as-of row (superset of what V1/V2 selected), plus the on-chain identity
+    of the row for the provenance (transaction and log index of a swap, phase and round of a Chainlink answer)."""
     cols = [c for c in (ds.col(k) for k in _ROW_CANON) if c]
     if any(b in ds.raw_columns for b in _BLOCK_TS_CANDIDATES):
         cols.append("block_ts")
+    cols += [c for c in ("tx_hash", "log_index", "phase", "agg_round") if c in ds.columns]
     return cols
 
 
@@ -69,6 +73,23 @@ class _Ctx:
 
 def _hms(t: datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def phase_note(ds: DatasetInfo, phase: int) -> str:
+    """Calculation-path line of a Chainlink read restricted to the phase the proxy served at T."""
+    start = ds.phases.start_of(phase) if ds.phases else None
+    since = f" since {_hms(start)}" if start else ""
+    return f"Rounds of aggregator phase {phase} only: the one the proxy served at T{since}"
+
+
+def no_round_message(ds: DatasetInfo, phase: int | None) -> str:
+    if phase is None:
+        return "no Chainlink round at or before T"
+    if phase == 0:
+        first = ds.phases.starts[0] if ds.phases and ds.phases.starts else None
+        return "the Chainlink proxy did not exist yet at T" + (f" (deployed {_hms(first)})" if first else "")
+    return (f"no round of aggregator phase {phase} (the one the proxy served at T) at or before T; "
+            "rounds of the other phases are not used")
 
 
 class Engine:
@@ -186,6 +207,13 @@ class Engine:
         else:
             ctx.reject(level, rel, "missing_columns", "no timestamp or price column for this level")
 
+    def _empty(self, ctx: _Ctx, level: str, ds: DatasetInfo) -> bool:
+        """Record and skip a candidate whose CSV has a header but no data row (it can never answer)."""
+        if ds.files and ds.n_rows:
+            return False
+        ctx.reject(level, ds.rel, "dataset_empty", "the CSV file has a header but no data row")
+        return True
+
     def _reject_lag(self, ctx: _Ctx, level: str, ds: DatasetInfo, token_ts: datetime, eth_ts: datetime,
                     lag: float) -> None:
         limit = self.cfg.thresholds.cross_rate_max_lag_seconds
@@ -229,6 +257,8 @@ class Engine:
             ts_col, price_col = (ds.col("timestamp"), ds.col("price_usd")) if ds else (None, None)
             if not ts_col or not price_col:
                 self._reject_unreadable(ctx, level, self._rel(path), ds)
+                continue
+            if self._empty(ctx, level, ds):
                 continue
             row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if row is None or row.get(price_col) is None:
@@ -277,6 +307,8 @@ class Engine:
             ts_col, price_col = (ds.col("timestamp"), ds.col("price_token_eth")) if ds else (None, None)
             if not ts_col or not price_col:
                 self._reject_unreadable(ctx, level, self._rel(path), ds)
+                continue
+            if self._empty(ctx, level, ds):
                 continue
             row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if row is None or row.get(price_col) is None:
@@ -361,6 +393,8 @@ class Engine:
             ts_col, price_col = (ds.col("timestamp"), ds.col("price_usd")) if ds else (None, None)
             if not ts_col or not price_col:
                 self._reject_unreadable(ctx, level, self._rel(path), ds)
+                continue
+            if self._empty(ctx, level, ds):
                 continue
             row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if row is None:
@@ -447,6 +481,8 @@ class Engine:
             if not ts_col or not price_col:
                 self._reject_unreadable(ctx, level, self._rel(path), ds)
                 continue
+            if self._empty(ctx, level, ds):
+                continue
             viability_row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
             if viability_row is None:
                 ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
@@ -532,6 +568,8 @@ class Engine:
             if not ts_col or not inv_col:
                 self._reject_unreadable(ctx, "2", rel, ds)
                 continue
+            if self._empty(ctx, "2", ds):
+                continue
             row = self.store.as_of(rel, timestamp, _row_cols(ds))
             if row is None or row.get(inv_col) is None or float(row[inv_col]) == 0:
                 ctx.reject("2", rel, "no_observation", "no observation at or before T")
@@ -570,6 +608,8 @@ class Engine:
             ts_col, inv_col = (ds.col("timestamp"), ds.col("price_inverse_eth")) if ds else (None, None)
             if not ts_col or not inv_col:
                 self._reject_unreadable(ctx, "2", rel, ds)
+                continue
+            if self._empty(ctx, "2", ds):
                 continue
             viability_row = self.store.as_of(rel, timestamp, _row_cols(ds))
             if viability_row is None:
@@ -639,11 +679,17 @@ class Engine:
             if not ts_col or not price_col:
                 self._reject_unreadable(ctx, "3", self._rel(path), ds)
                 continue
-            row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
+            if self._empty(ctx, "3", ds):
+                continue
+            phase = self.store.active_phase(ds.rel, timestamp)
+            row = self.store.as_of(ds.rel, timestamp, _row_cols(ds), phase=phase)
             if row is None or row.get(price_col) is None:
-                ctx.reject("3", ds.rel, "no_observation", "no Chainlink round at or before T")
+                ctx.reject("3", ds.rel, "no_observation", no_round_message(ds, phase))
                 continue
             bn, bts, bwarns = self._extract_block_ref(ds, row)
+            path_ = ["Chainlink oracle — latest observation at or before T"]
+            if phase is not None:
+                path_.append(phase_note(ds, phase))
             return PriceResult(
                 price_usd=float(row[price_col]),
                 timestamp_observed=row[ts_col],
@@ -651,7 +697,7 @@ class Engine:
                 branch_label="chainlink_fallback",
                 data_status="oracle_fallback",
                 files_used=[ds.rel],
-                calculation_path=["Chainlink oracle — latest observation at or before T"],
+                calculation_path=path_,
                 detected_columns={ds.csv_name: ds.raw_columns},
                 source_row=row,
                 source_schema=ds.schema,

@@ -1,14 +1,22 @@
-"""Permanent parity guard: API V3 in legacy mode must reproduce the V2 golden master.
+"""Permanent guards on the real data.
 
-The golden master (tests/golden/v2_golden.jsonl) was captured from the unchanged V2 CSV engine on the real
-datasets. This test replays it on the real Parquet store, so it is skipped when the store has not been built
-(`python -m app.v3.sync`). The only excused differences are the windows containing the 110 duplicated swaps
-that V3 removes on purpose. Regenerate the golden data only after a deliberate V2 change.
+* API V3 in legacy mode must reproduce the V2 golden master (tests/golden/v2_golden.jsonl, captured from the
+  unchanged V2 CSV engine). The only excused differences are the windows containing the 110 duplicated swaps
+  that V3 removes on purpose. Regenerate it only after a deliberate V2 change.
+* Without the Chainlink phase filter, V3 must reproduce its own capture of 2026-09-24, taken before the validity
+  fixes of that day (tests/golden/v3_golden_base.jsonl): quality counters, explicit ties, versions and the other
+  additions change no number.
+* As configured, V3 must reproduce tests/golden/v3_golden.jsonl (capture_v3.py). Regenerate it only after a
+  deliberate change of a V3 number, and say which in the commit.
+
+The tests replay the golden requests on the real Parquet store (``OPENPRICE_CONFIG`` selects another config), so
+they are skipped when the store has not been built (`python -m app.v3.sync`).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
 
 import pytest
@@ -20,6 +28,8 @@ from app.v3 import store as store_mod
 
 ROOT = Path(__file__).resolve().parent.parent
 GOLDEN = ROOT / "tests" / "golden" / "v2_golden.jsonl"
+V3_BASE = ROOT / "tests" / "golden" / "v3_golden_base.jsonl"
+V3_GOLDEN = ROOT / "tests" / "golden" / "v3_golden.jsonl"
 
 
 def _load_compare():
@@ -31,7 +41,7 @@ def _load_compare():
 
 @pytest.fixture
 def real_v3(monkeypatch):
-    cfg = load_config(ROOT / "config" / "openprice.yaml")
+    cfg = load_config(os.environ.get("OPENPRICE_CONFIG", ROOT / "config" / "openprice.yaml"))
     if not (cfg.v3.parquet_path / "manifest.json").exists() or not GOLDEN.exists():
         config_module._config = None
         pytest.skip("V3 Parquet store or golden master not available")
@@ -52,6 +62,24 @@ def test_v3_legacy_mode_reproduces_v2_golden_master(real_v3):
 
 
 def test_v3_default_mode_only_changes_eth_confidence_and_windowed_prices(real_v3):
-    """The two truncation fixes must not touch any other asset."""
-    counts, _, bad = _load_compare().compare(legacy=False)
+    """The two truncation fixes must not touch any other asset (Chainlink phase filter off)."""
+    counts, _, bad = _load_compare().compare(legacy=False, phase_filter=False)
     assert {rid.split("|")[0] for rid, _ in bad} <= {"ETH"}
+
+
+def test_v3_additions_change_no_number(real_v3):
+    """Without the phase filter, V3 answers exactly as it did before the validity fixes of 2026-09-24."""
+    if not V3_BASE.exists():
+        pytest.skip("V3 base capture not available")
+    counts, _, bad = _load_compare().compare(legacy=False, golden=str(V3_BASE), v3_golden=True, phase_filter=False)
+    assert counts["total"] >= 200
+    assert not bad, f"{len(bad)} record(s) differ from the base capture, first: {bad[0][0]} {bad[0][1][:3]}"
+
+
+def test_v3_matches_its_golden_capture(real_v3):
+    if not V3_GOLDEN.exists():
+        pytest.skip("V3 golden capture not available")
+    counts, _, bad = _load_compare().compare(legacy=False, golden=str(V3_GOLDEN), v3_golden=True,
+                                             phase_filter=real_v3.v3.chainlink_active_phase_only)
+    assert counts["total"] >= 200
+    assert not bad, f"{len(bad)} record(s) differ from v3_golden.jsonl, first: {bad[0][0]} {bad[0][1][:3]}"

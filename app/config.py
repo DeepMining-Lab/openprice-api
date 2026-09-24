@@ -205,9 +205,15 @@ class ConfidenceV2Config(BaseModel):
 class V3Config(BaseModel):
     # Derived data lives OUTSIDE the datasets directory (CSV files are never written to).
     parquet_root: str = "~/openprice/parquet"
-    # True replays the V1/V2 behaviour that truncates the S_stat 7-day window and the
-    # windowed-VWMP window to `api.max_limit` rows (used only to prove parity with V2).
+    # True replays V1/V2 exactly, to prove parity with V2: the S_stat 7-day window and the windowed-VWMP
+    # window are truncated to `api.max_limit` rows, same-timestamp ties follow the CSV order, and Chainlink
+    # rounds of every aggregator phase are read.
     legacy_truncation: bool = False
+    # Chainlink: read only the rounds of the aggregator phase that the proxy served at T (app.v3.chainlink_phases).
+    chainlink_active_phase_only: bool = True
+    # Environment variable holding the Ethereum RPC URL the sync uses to read the proxy phase switches. The URL
+    # itself is never written in this file (it can carry an access token). Unset: the phase table is kept as is.
+    rpc_url_env: str = "OPENPRICE_RPC_URL"
     cache_size: int = 4096            # LRU entries for point responses (0 disables)
     duckdb_threads: int = 4
     range_workers: int = 8            # threads computing the points of one range request in parallel

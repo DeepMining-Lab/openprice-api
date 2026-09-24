@@ -6,6 +6,10 @@ After=local-fs.target
 Type=oneshot
 User=debian
 WorkingDirectory=/home/debian/OpenPrice-API/openprice-api
+# OPENPRICE_RPC_URL=<Ethereum RPC URL>: the sync reads the Chainlink proxy phase switches with it. Optional: without
+# the file the phase table is kept as it is and each run logs a warning. Keep it private (chmod 600): the URL can
+# carry an access token, and it is never written to the repository or to the Parquet store.
+EnvironmentFile=-/home/debian/.openprice_rpc_env
 ExecStart=/home/debian/OpenPrice-API/openprice-api/.venv/bin/python -m app.v3.sync
 Nice=10
 IOSchedulingClass=idle

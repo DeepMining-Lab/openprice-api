@@ -80,7 +80,9 @@ confidence_v2:
 #   python -m app.v3.sync        (incremental; run it after each daily CSV update)
 v3:
   parquet_root: "~/openprice/parquet"   # derived data; never inside the datasets directory
-  legacy_truncation: false               # true = replay V1/V2 (window cut to api.max_limit rows) to prove parity
+  legacy_truncation: false               # true = replay V1/V2 exactly (windows cut to api.max_limit rows, CSV-order ties, all Chainlink phases)
+  chainlink_active_phase_only: true      # Chainlink: only the rounds of the aggregator phase the proxy served at T
+  rpc_url_env: "OPENPRICE_RPC_URL"       # env variable with the Ethereum RPC URL; the sync reads the proxy phase switches with it
   cache_size: 4096                       # LRU of point responses, invalidated on every dataset_version change
   duckdb_threads: 4
   range_workers: 8                       # points of one range request computed in parallel

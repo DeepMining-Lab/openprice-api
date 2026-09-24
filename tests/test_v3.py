@@ -7,6 +7,7 @@ real datasets nor ``~/openprice/parquet`` are touched.
 from __future__ import annotations
 
 import csv
+import json
 import math
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -497,3 +498,287 @@ class TestRanges:
             nf = client.get("/v3/confidence/LINK/at", params=future)
             assert nf.status_code == 404 and "future_timestamp" in nf.json()["detail"]
         store_mod.reset_store(); service_mod.reset_service()
+
+
+# ---------------------------------------------------------------------------
+# Validity fixes of 2026-09-24: quality counters, explicit ties, versions, empty files, Chainlink phases
+# ---------------------------------------------------------------------------
+
+def _raw_csv(path: Path, lines: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n")
+
+
+def _pool_line(i: int, price: str = None, tvl: str = "2000000.0") -> str:
+    t = _iso(T0 + timedelta(minutes=i))
+    return f"{t},{price or 14.0 + i * 0.01},1000.0,{tvl},0.001,{1000 + i},0x{i:064x},0"
+
+
+class TestQuality:
+    def test_every_line_is_accounted_for(self, v3cfg):
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        lines = [",".join(POOL_HEADER)] + [_pool_line(i) for i in range(10)]
+        lines += [",".join(POOL_HEADER),                          # header repeated in the middle
+                  _pool_line(10, price="abc"),                    # unreadable price: row dropped (as V1/V2)
+                  _pool_line(11, tvl="n/a"),                      # unreadable TVL: row kept, TVL NULL
+                  _pool_line(12) + ",EXTRA",                      # one column too many: kept, truncated
+                  _pool_line(13) + ",0x" + "f" * 110_000,         # longer than max_line_size: dropped
+                  _pool_line(14)]
+        _raw_csv(p, lines)
+        res = [r for r in sync_mod.run_sync(v3cfg) if r.rel == POOL_REL][0]
+        q = sync_mod.load_manifest(v3cfg.v3.parquet_path)["datasets"][POOL_REL]["quality"]
+        assert q["physical_lines"] == 16 and q["rows_read"] == 15 and q["unaccounted_lines"] == 0
+        assert q["reader_dropped"] == {"LINE SIZE OVER MAXIMUM": 1}
+        assert q["strict_anomalies"] == {"TOO MANY COLUMNS": 2, "LINE SIZE OVER MAXIMUM": 1}  # line 16 has both
+        assert (q["repeated_headers"], q["unreadable_timestamp_rows"], q["unreadable_price_rows"]) == (1, 1, 1)
+        assert q["cast_failures"] == {"px_usd": 1, "tvl": 1}
+        assert {s["line"] for s in q["samples"] if s.get("line")} == {15, 16}  # 1-based lines of the CSV file
+        assert res.issues > 0
+        st = store_mod.Store(v3cfg)
+        assert st.dataset(POOL_REL).n_rows == 13  # 10 + TVL row + truncated row + last row
+        # the row with the unreadable price is skipped: the as-of answer is the previous swap
+        assert st.as_of(POOL_REL, T0 + timedelta(minutes=10, seconds=30), ["px_usd"])["ts"] == T0 + timedelta(minutes=9)
+
+    def test_clean_file_has_no_issue(self, v3cfg):
+        _simple_link(v3cfg)
+        d = sync_mod.load_manifest(v3cfg.v3.parquet_path)["datasets"][POOL_REL]
+        assert sync_mod.quality_issues(d["quality"]) == 0
+        assert d["quality"]["physical_lines"] == d["quality"]["rows_read"] == 20
+
+
+class TestTieBreak:
+    def _reversed_block(self, cfg) -> datetime:
+        p = Path(cfg.paths.datasets_root) / POOL_REL
+        same = T0 + timedelta(hours=1)
+        rows = [[_iso(T0), 10.0, 1e5, 2e6, 0.001, 1, "0xa", 0],
+                [_iso(same), 13.0, 1e5, 2e6, 0.001, 2, "0xd", 2],   # written in reverse log order
+                [_iso(same), 12.0, 1e5, 2e6, 0.001, 2, "0xc", 1],
+                [_iso(same), 11.0, 1e5, 2e6, 0.001, 2, "0xb", 0]]
+        _write(p, POOL_HEADER, rows)
+        _write(Path(cfg.paths.datasets_root) / "link" / "chainlink_link_usd.csv", CL_HEADER, [[_iso(T0), 11.0]])
+        sync_mod.run_sync(cfg)
+        return same + timedelta(minutes=5)
+
+    def test_ties_follow_on_chain_order_and_legacy_follows_the_csv(self, v3cfg):
+        T = self._reversed_block(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        resp, _ = svc.price_at("LINK", T)
+        ev = resp.provenance.source_event
+        assert resp.price_usd == 11.0
+        assert (ev.tx_hash, ev.log_index, ev.block_number, ev.rows_at_same_timestamp, ev.tie_break_rule) == (
+            "0xb", 0, 2, 3, "first_swap_of_block")
+        v3cfg.v3.legacy_truncation = True
+        legacy, _ = svc.price_at("LINK", T)
+        assert legacy.price_usd == 13.0 and legacy.provenance.source_event.tie_break_rule == "first_csv_row"
+
+
+class TestVersions:
+    def test_history_log_and_versions_in_the_response(self, v3cfg):
+        from fastapi.testclient import TestClient
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        _write(p, POOL_HEADER, _pool_rows(10))
+        _write(Path(v3cfg.paths.datasets_root) / "link" / "chainlink_link_usd.csv", CL_HEADER, [[_iso(T0), 14.0]])
+        sync_mod.run_sync(v3cfg)
+        v1 = sync_mod.load_manifest(v3cfg.v3.parquet_path)["version"]
+        new = _pool_rows(3, start=T0 + timedelta(hours=1))
+        for i, r in enumerate(new):
+            r[5], r[6] = 2000 + i, f"0x{100 + i:064x}"
+        _append(p, new)
+        sync_mod.run_sync(v3cfg)
+        m = sync_mod.load_manifest(v3cfg.v3.parquet_path)
+        assert m["version"] != v1 and sync_mod.load_history(v3cfg.v3.parquet_path, v1)["version"] == v1
+        log = [json.loads(line) for line in sync_mod.sync_log_path(v3cfg.v3.parquet_path).read_text().splitlines()]
+        pool = [(e["action"], e["reason"], e["version"]) for e in log if e["dataset"] == POOL_REL]
+        assert pool == [("rebuild", "first_build", v1), ("append", None, m["version"])]
+        store_mod.reset_store(); service_mod.reset_service()
+        with TestClient(app) as client:
+            r = client.get("/v3/prices/LINK/at", params={"timestamp": "2024-01-01T00:10:00Z"}).json()
+            prov = r["provenance"]
+            assert prov["dataset_version"] == m["version"]
+            assert prov["dataset_files"][POOL_REL] == m["datasets"][POOL_REL]["file_version"]
+            assert "link/chainlink_link_usd.csv" in prov["dataset_files"]
+            assert client.get(f"/v3/datasets/versions/{v1}").json()["version"] == v1
+            assert client.get("/v3/datasets/versions/nope").status_code == 404
+            ds = {d["file"]: d for d in client.get("/v3/datasets").json()["datasets"]}
+            assert ds[POOL_REL]["status"] == "ok" and ds[POOL_REL]["rows"] == 13
+        store_mod.reset_store(); service_mod.reset_service()
+
+    def test_sampled_fingerprint_detects_a_rewrite_before_the_tail(self, v3cfg, monkeypatch):
+        monkeypatch.setattr(sync_mod, "SAMPLE_STRIDE", 1024)
+        monkeypatch.setattr(sync_mod, "FINGERPRINT_BYTES", 256)
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        _write(p, POOL_HEADER, _pool_rows(200))
+        sync_mod.run_sync(v3cfg)
+        b = bytearray(p.read_bytes())
+        i = b.index(b"14.03", 3000)
+        b[i:i + 5] = b"14.09"  # same length, far from the end of the file
+        p.write_bytes(bytes(b))
+        _append(p, _pool_rows(2, start=T0 + timedelta(days=1)))
+        res = [r for r in sync_mod.run_sync(v3cfg) if r.rel == POOL_REL][0]
+        assert (res.action, res.reason) == ("rebuild", "sampled_fingerprint_mismatch")
+
+    def test_verify_detects_what_the_samples_miss(self, v3cfg, monkeypatch):
+        monkeypatch.setattr(sync_mod, "FINGERPRINT_BYTES", 256)
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        _write(p, POOL_HEADER, _pool_rows(200))
+        sync_mod.run_sync(v3cfg)
+        b = bytearray(p.read_bytes())
+        i = b.index(b"14.03", 5000)
+        b[i:i + 5] = b"14.09"  # past the only sample ([0, 4 KB) with the 256 MB stride): incremental runs miss it
+        p.write_bytes(bytes(b))
+        assert [r.action for r in sync_mod.run_sync(v3cfg) if r.rel == POOL_REL] == ["unchanged"]
+        res = [r for r in sync_mod.run_sync(v3cfg, verify=True) if r.rel == POOL_REL][0]
+        assert (res.action, res.reason) == ("rebuild", "verify_mismatch")
+        again = [r for r in sync_mod.run_sync(v3cfg, verify=True) if r.rel == POOL_REL][0]
+        assert again.action == "verified"  # same bytes; only the date of the last verification moves
+
+
+class TestEmptyDataset:
+    def test_header_only_file_is_reported_as_empty(self, v3cfg):
+        from fastapi.testclient import TestClient
+        root = Path(v3cfg.paths.datasets_root)
+        _write(root / "eth" / "crvusd_weth_curve.csv",
+               ["timestamp", "price_weth_per_crvusd", "crvusd_amount", "weth_amount", "volume_crvusd"], [])
+        _write(root / ETH_REF_REL, ETH_REF_HEADER, [[_iso(T0), 2200.0, 1e5, 5e6, 0.0005]])
+        sync_mod.run_sync(v3cfg)
+        resp, _ = service_mod.Service(v3cfg).price_at("ETH", T0 + timedelta(minutes=1), branch="2")
+        assert resp.branch_level == "4"
+        assert [(r.level, r.rule) for r in resp.provenance.rejected_candidates] == [("2", "dataset_empty")]
+        store_mod.reset_store(); service_mod.reset_service()
+        with TestClient(app) as client:
+            ds = {d["file"]: d for d in client.get("/v3/datasets").json()["datasets"]}
+            assert ds["eth/crvusd_weth_curve.csv"]["status"] == "empty"
+        store_mod.reset_store(); service_mod.reset_service()
+
+
+class TestParameters:
+    def test_config_and_confidence_expose_every_parameter_used(self, v3cfg):
+        from fastapi.testclient import TestClient
+        _simple_link(v3cfg)
+        store_mod.reset_store(); service_mod.reset_service()
+        with TestClient(app) as client:
+            c = client.get("/v3/config").json()
+            assert len(c["config_sha256"]) == 64
+            assert c["thresholds"]["seuil_TVL_min_usd"] == v3cfg.thresholds.seuil_TVL_min_usd
+            assert c["scoring"]["tvl_score_mode"] == v3cfg.scoring.tvl_score_mode
+            assert {"confidence_v2", "v3", "api"} <= c.keys()
+            r = client.get("/v3/prices/LINK/at", params={"timestamp": "2024-01-01T00:10:00Z"}).json()
+            params = r["confidence"]["parameters"]
+            assert set(service_mod.V3_PARAMETER_KEYS) <= params.keys()
+            assert params["coh_delta_tol_used"] == v3cfg.confidence_v2.coh.delta_tol_by_asset.get(
+                "LINK", v3cfg.confidence_v2.coh.default_delta_tol)
+            stripped = service_mod.strip_v3_diagnostics(r)
+            assert not set(service_mod.V3_PARAMETER_KEYS) & stripped["confidence"]["parameters"].keys()
+            assert not set(service_mod.V3_PROVENANCE_FIELDS) & stripped["provenance"].keys()
+        store_mod.reset_store(); service_mod.reset_service()
+
+
+# --- Chainlink phases -------------------------------------------------------
+
+CL_PHASE_HEADER = ["round_updated_at_utc", "answer_normalized", "phase", "aggregator_round", "feed_proxy_address"]
+PROXY = "0x00000000000000000000000000000000000000aa"
+BLOCK_S = 12
+
+
+class FakeRpc:
+    """Chain where block b is at T0 + 12 s * b and ``phaseId()`` switches at the given first blocks."""
+
+    def __init__(self, first_block: dict[int, int], head: int):
+        self.first_block, self.head, self.calls = first_block, head, 0
+
+    def block_number(self) -> int:
+        self.calls += 1
+        return self.head
+
+    def block_time(self, block: int) -> datetime:
+        self.calls += 1
+        return T0 + timedelta(seconds=BLOCK_S * block)
+
+    def phase_id(self, proxy: str, block: int) -> int:
+        self.calls += 1
+        return max([p for p, b in self.first_block.items() if b <= block], default=0)
+
+
+def _phase_feed(cfg) -> None:
+    """LINK/USD rounds: phase 1 every 10 min for 3 h (it keeps publishing after the switch at T0 + 1 h), phase 2
+    every 10 min from T0 + 35 min (before the switch). Phase 2 rounds 10 (209.0) and 11 (310.0) share the second
+    T0 + 125 min, the earlier round written first."""
+    p1 = [(10 * i, 100.0 + i) for i in range(19)]
+    p2 = sorted([(35 + 10 * i, 200.0 + i) for i in range(15)] + [(125, 310.0)])
+    rows = [[_iso(T0 + timedelta(minutes=m)), v, 1, r + 1, PROXY] for r, (m, v) in enumerate(p1)]
+    rows += [[_iso(T0 + timedelta(minutes=m)), v, 2, r + 1, PROXY] for r, (m, v) in enumerate(p2)]
+    rows.sort(key=lambda r: r[0])  # stable: within a second, rounds keep their order
+    _write(Path(cfg.paths.datasets_root) / "link" / "chainlink_link_usd.csv", CL_PHASE_HEADER, rows)
+
+
+class TestChainlinkPhases:
+    def test_binary_search_finds_each_switch_and_extends_the_table(self):
+        from app.v3 import chainlink_phases as cp
+        rpc = FakeRpc({1: 10, 2: 300, 3: 777}, head=1000)
+        table = cp.refresh(None, PROXY, rpc)
+        assert [(s["phase"], s["block"]) for s in table["switches"]] == [(1, 10), (2, 300), (3, 777)]
+        assert table["verified_block"] == 1000
+        rpc.first_block[4] = 1500
+        rpc.head, rpc.calls = 2000, 0
+        table = cp.refresh(table, PROXY, rpc)
+        assert [(s["phase"], s["block"]) for s in table["switches"]][-1] == (4, 1500)
+        assert rpc.calls < 20  # one new binary search, the known switches are not recomputed
+        pt = cp.PhaseTable(table)
+        assert [pt.active_phase(T0 + timedelta(seconds=BLOCK_S * b)) for b in (5, 10, 299, 300, 1600)] == [0, 1, 1, 2, 4]
+
+    def test_level_3_reads_the_phase_served_at_t(self, v3cfg):
+        _phase_feed(v3cfg)
+        sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0, 2: 300}, head=900))  # switch at T0 + 1 h; checked to T0 + 3 h
+        svc = service_mod.Service(v3cfg)
+
+        def level3(minutes: int):
+            r, _ = svc.price_at("LINK", T0 + timedelta(minutes=minutes))
+            assert r.branch_level == "3"
+            return r
+
+        before = level3(47)   # proxy on phase 1; phase 2 already published at +45 min
+        assert before.price_usd == 104.0 and before.provenance.source_event.phase == 1
+        assert before.provenance.source_event.tie_break_rule == "latest_round_of_active_phase"
+        assert "phase 1 only" in before.provenance.calculation_path[-1]
+        after = level3(62)    # proxy on phase 2; phase 1 published again at +60 min
+        assert after.price_usd == 202.0 and after.provenance.source_event.phase == 2
+        tie = level3(126)     # two phase-2 rounds at +125 min: the latest round wins
+        assert tie.price_usd == 310.0 and tie.provenance.source_event.aggregator_round == 11
+        assert "chainlink_phase_unverified" not in [w.code for w in tie.warnings]
+        late = level3(190)    # after the last on-chain check (T0 + 3 h)
+        assert "chainlink_phase_unverified" in [w.code for w in late.warnings]
+
+        v3cfg.v3.legacy_truncation = True  # V1/V2: rounds of every phase, first CSV row on ties
+        assert level3(47).price_usd == 201.0 and level3(62).price_usd == 106.0 and level3(126).price_usd == 209.0
+        v3cfg.v3.legacy_truncation = False
+        v3cfg.v3.chainlink_active_phase_only = False
+        assert level3(47).price_usd == 201.0
+
+    def test_compare_lists_the_rounds_the_proxy_served(self, v3cfg):
+        _phase_feed(v3cfg)
+        sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0, 2: 300}, head=900))
+        page = service_mod.Service(v3cfg).compare("LINK", T0, T0 + timedelta(minutes=90), 100)
+        served = [(p.timestamp - T0, p.chainlink_price_usd) for p in page.items]
+        assert served == [(timedelta(minutes=m), v) for m, v in
+                          [(0, 100.0), (10, 101.0), (20, 102.0), (30, 103.0), (40, 104.0), (50, 105.0),
+                           (65, 203.0), (75, 204.0), (85, 205.0)]]
+
+    def test_without_a_phase_table_every_phase_is_read_and_flagged(self, v3cfg, monkeypatch):
+        monkeypatch.delenv(v3cfg.v3.rpc_url_env, raising=False)
+        _phase_feed(v3cfg)
+        res = sync_mod.run_sync(v3cfg)
+        assert any("is not set" in n for r in res for n in r.notes)
+        cl = sync_mod.load_manifest(v3cfg.v3.parquet_path)["datasets"]["link/chainlink_link_usd.csv"]["chainlink"]
+        assert cl["status"] == "rpc_not_configured" and cl["proxy"] == PROXY
+        r, _ = service_mod.Service(v3cfg).price_at("LINK", T0 + timedelta(minutes=47))
+        assert r.price_usd == 201.0
+        w = [w for w in r.warnings if w.code == "chainlink_phase_unverified"]
+        assert w and "no phase switch table" in w[0].message
+
+    def test_rounds_are_deduplicated_on_phase_and_round(self, v3cfg):
+        _phase_feed(v3cfg)
+        p = Path(v3cfg.paths.datasets_root) / "link" / "chainlink_link_usd.csv"
+        _append(p, [[_iso(T0 + timedelta(minutes=180)), 118.0, 1, 19, PROXY]])  # round (1, 19) again
+        res = [r for r in sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0, 2: 300}, head=900))
+               if r.rel == "link/chainlink_link_usd.csv"][0]
+        assert res.dups_removed == 1

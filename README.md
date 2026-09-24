@@ -569,24 +569,50 @@ sync that adds data (every 30 min with `deploy/`).
    (e.g. S_stat = 0.000 instead of 0.84 on 2022-05-12). V3 reads the whole window.
 2. **The windowed VWMP read is not truncated either** (it hit the same limit on ~6 % of ETH `day` windows).
 3. **110 duplicated swap events** of `eth_usdc_uniswap_v3_005` (same `tx_hash` + `log_index`, only the
-   extraction metadata differs) are ignored. The CSV is never modified.
+   extraction metadata differs) are ignored. The CSV is never modified. Chainlink rounds are de-duplicated the
+   same way on `(phase, aggregator_round)` (no duplicate there today).
+4. **Chainlink is read from the aggregator phase its proxy served at T** (`v3.chainlink_active_phase_only`,
+   see [Chainlink aggregator phases](#chainlink-aggregator-phases)). V1/V2 take the latest round of the file,
+   whatever its phase. This moves S_coh, the level-3 fallback, the S_stat reference of a cross-rate, and the
+   peg used to neutralize a stablecoin-quoted price, hence `price_usd` itself (by at most 0.057 % on the
+   245 golden requests).
 
 No other number is meant to differ; V3 only adds the [diagnostics](#diagnostics-added-by-v3) and the
-[range pagination](#ranges-pagination-and-latency) below. `v3.legacy_truncation: true` restores (1) and (2), which lets
-`tests/golden/compare_v3.py --legacy` prove that V3 reproduces V2 exactly (the only remaining differences are
-the windows containing the 110 duplicates). Same-timestamp ties still return the *first* row of the CSV, as V2 did.
+[range pagination](#ranges-pagination-and-latency) below. `v3.legacy_truncation: true` replays V1/V2 exactly
+((1), (2), CSV-order ties and rounds of every phase), which lets `tests/golden/compare_v3.py --legacy` prove that V3
+reproduces V2 (the only remaining differences are the windows containing the 110 duplicates).
 
-### Validated against real V2 traffic
+**Same-timestamp ties** return the first swap of the block, by on-chain order `(block_number, log_index)`. V1/V2
+reached the same swap through the CSV order: on the data of 2026-09-24 both rules pick the same row in each of the
+6.2 million shared timestamps, and a timestamp never spans two blocks. The choice is methodological and has a
+measurable effect: on an hourly grid, 37 % of the ETH/USDC as-of prices fall in a block with several swaps, where
+the first and the last swap differ by 0.11 bp at the median and 27 bp at p99 (on the 0.3 % Uniswap V2 pools,
+about 61 bp at p95: a swap's own price includes the fee in its direction). Each raw price names its swap in
+`provenance.source_event`.
 
-`tests/golden/` captures real V2 responses (`capture_v2.py`) and replays them through V3
-(`compare_v3.py`). On a 245-request sample spanning the five assets, every granularity, and several
-market-stress dates (LUNA, the Aug-2024 flash crash, the Mar-2023 USDC depeg):
+### Validation on the real data
+
+`tests/golden/` captures real V2 responses (`capture_v2.py`) and V3 responses (`capture_v3.py`) and replays
+them through V3 (`compare_v3.py`). On a 245-request sample spanning the five assets, every granularity, and
+several market-stress dates (LUNA, the Aug-2024 flash crash, the Mar-2023 USDC depeg):
 
 * in `legacy_truncation` mode, **242/245 are byte-identical** to V2; the 3 remaining differences are
-  entirely explained by the 110 removed duplicates (`tests/test_v3_golden.py` runs this as a permanent
-  regression guard whenever the Parquet store and the golden file are present);
-* in default (fixed) mode, **LINK, UNI, AAVE and COMP are unaffected** (0 differences); only ETH changes,
-  through S_stat/C/`fragility_flag` and the four `day`-granularity prices listed above.
+  entirely explained by the 110 removed duplicates;
+* without the phase filter, the truncation fixes change only ETH (S_stat/C/`fragility_flag` and four
+  `day`-granularity prices); **LINK, UNI, AAVE and COMP are unaffected**;
+* the validity fixes of 2026-09-24 (quality counters, explicit ties, versions, diagnostics) change **no
+  number**: without the phase filter, 245/245 responses equal the capture taken before them
+  (`v3_golden_base.jsonl`);
+* the phase filter changes 68 of the 245 responses: 42 prices through the peg (at most 0.057 %), 45 C values
+  (at most 0.014), 15 warning messages only; no source level, no `fragility_flag` and no null C changes.
+  `v3_golden.jsonl` pins V3 as configured;
+* `tests/test_v3_oracle.py` recomputes S_stat and the day VWMP in plain Python from the stored rows on the dates
+  of the validity audit (S_stat 0.840, 0.872 and 0.944 on 2022-05-12, 2024-08-05 and 2025-06-01, where V1/V2
+  gave 0.000, 0.000 and 0.837), and `tests/test_v3_docs.py` checks that this README states the parameters of
+  `config/openprice.yaml`.
+
+`tests/test_v3_golden.py` and `tests/test_v3_oracle.py` run all of this as permanent guards whenever the Parquet
+store and the golden files are present (`OPENPRICE_CONFIG` selects another store).
 
 ### Build and run
 
@@ -602,8 +628,10 @@ curl  http://127.0.0.1:8000/v3/ready
 | `GET /v3/prices/{asset}/at` | point price (V2 schema plus the V3 diagnostics) |
 | `GET /v3/prices/{asset}` | time series (`raw` = one point per distinct swap timestamp of the winning source, or `minute|hour|day`) |
 | `GET /v3/confidence/{asset}/at` | V2 confidence breakdown: the confidence block of the default `/at` response |
-| `GET /v3/compare/{asset}` | DEX vs Chainlink over a range (identical to `/v1/compare`) |
-| `GET /v3/config`, `GET /v3/ready` | effective V3 config; readiness (503 until the store is built) |
+| `GET /v3/compare/{asset}` | DEX vs Chainlink over a range (`/v1/compare`, with the rounds the proxy served) |
+| `GET /v3/datasets` | per CSV file: rows, dates, version, quality counters, Chainlink phase switches |
+| `GET /v3/datasets/versions/{version}` | the manifest published under a dataset version (every version is kept) |
+| `GET /v3/config`, `GET /v3/ready` | every parameter V3 uses, with `config_sha256`; readiness (503 until the store is built) |
 
 Paths are case-sensitive (`/V3/...` returns 404); asset symbols are not (`eth` = `ETH`).
 
@@ -629,6 +657,7 @@ They are additive: they never change a price, a score or a branch.
 | `future_timestamp` | warning | `timestamp` is after the server time. The response is an explicit NULL: level `4`, `unavailable_reason: "future_timestamp"`, no confidence, never cached. Before this rule, a future date returned the last known price, even as a level `0a` "observed" price with a confidence score when it fell within 30 days of the last swap. |
 | `beyond_data_coverage` | warning | The requested time (or, for `minute`/`hour`/`day`, the end of the VWMP window) is after the last synced data of a folder the price depends on (source files and peg feed). The price is still returned (as-of rule) but is provisional: it can change after the next extraction. A folder's coverage is its latest synced observation. Each asset folder holds its Chainlink feed (1 h heartbeat), so its coverage trails the extraction run by at most about an hour; for the peg feeds (`stablecoins/`, 24 h heartbeat) it can trail by up to a day, which errs on the side of flagging. |
 | `fallback_explained` | info | The answer does not come from the first level of the hierarchy (or is level `4`). The message lists each rejected higher-priority candidate with the rule and the measured value. |
+| `chainlink_phase_unverified` | warning | A Chainlink feed read for this answer (S_coh, level 3, peg) had its phase switches last checked on-chain before `T` (a switch after that check would be missed), or has no switch table yet (then the rounds of every phase are read, as V2 does). |
 
 `provenance.rejected_candidates` lists every candidate file evaluated and not used, in evaluation order,
 including siblings of the winning level (for example a zombie `0a` pool next to the one that answered):
@@ -640,11 +669,24 @@ including siblings of the winning level (for example a zombie `0a` pool next to 
 ```
 
 Rules: `zombie_tvl`, `zombie_volume_24h`, `inactive` (no observation for `fenetre_inactivite_jours`),
-`cross_rate_lag`, `eth_leg_unavailable`, `no_observation` (nothing at or before T), `no_swaps_in_window`
-(windowed granularities, after R1 expansion), `missing_columns`, `dataset_missing`. The diagnostics go to
-the top-level `warnings` and, when there is a confidence block, to its `warnings` too (they explain a
-provisional score or a `C = null` after a fallback to Chainlink). The parity tools remove them with
-`strip_v3_diagnostics` before comparing with V2.
+`cross_rate_lag`, `eth_leg_unavailable`, `no_observation` (nothing at or before T; for Chainlink, nothing in the
+phase the proxy served), `no_swaps_in_window` (windowed granularities, after R1 expansion), `missing_columns`,
+`dataset_missing`, `dataset_empty` (the CSV has a header and no data row: `eth/crvusd_weth_curve.csv` today, so
+the ETH level 2 cannot answer). The diagnostics go to the top-level `warnings` and, when there is a confidence
+block, to its `warnings` too (they explain a provisional score or a `C = null` after a fallback to Chainlink).
+
+The provenance of a V3 response also carries:
+
+* `source_event` (raw point reads): the on-chain event behind the price, `tx_hash`, `log_index`,
+  `block_number` for a swap, `phase` and `aggregator_round` for a Chainlink answer, with
+  `rows_at_same_timestamp` and the `tie_break_rule` applied (`first_swap_of_block`, `latest_round_of_active_phase`,
+  or `first_csv_row` in legacy mode); `eth_usd_leg_event` is the ETH/USD point read of a cross-rate;
+* `dataset_version` (as `X-Dataset-Version`) and `dataset_files`, the version of each file read for the answer;
+  `GET /v3/datasets/versions/{version}` resolves it later.
+
+`confidence.parameters` adds the parameters V2 did not list: `coh_delta_tol_used` (the tolerance of the asset),
+`seuil_TVL_min_usd`, `tvl_score_mode`, `tvl_log_min_usd`, `tvl_log_ref_usd`, `min_swaps_for_stat_score`,
+`s_stat_floor`. The parity tools remove all these additions with `strip_v3_diagnostics` before comparing.
 
 ### Ranges: pagination and latency
 
@@ -668,16 +710,48 @@ curl -s -D - -o page1.json "http://127.0.0.1:8000/v3/prices/ETH?start=2024-03-01
   where the previous one stopped. `/compare` pages never split rounds that share a timestamp.
 * Prefer `hour` (or `minute` over a few hours) when a coarser series is enough: 25 hourly points take ~0.3 s.
 
+### Chainlink aggregator phases
+
+A Chainlink feed is read through a proxy contract that points to one aggregator at a time, its *phase*. When
+Chainlink replaces the aggregator, the proxy moves to the next phase, but the new aggregator publishes for days or
+weeks before the switch and the old one often keeps publishing after it. The extraction stores the rounds of every
+phase without saying which one the proxy served, so "the latest round at or before T" can be a round no consumer
+of the feed ever received. The switch times are read on-chain: `phaseId()` of the proxy never decreases, so a
+binary search over blocks finds the first block of each phase (about 25 `eth_call`, done once; the sync then
+checks each feed once per run). For ETH/USD the proxy moved to phases 2 to 7 on 2020-08-06, 2020-10-07,
+2021-04-06, 2021-05-17, 2023-05-08 and 2024-09-24; for phases 3 to 7 that was 6 to 62 days after the new
+aggregator's first round in the CSV.
+
+Measured on an hourly grid over each feed's history (2026-09-24), the round that V1/V2 read was not from the
+served phase for 3.7 % of the hours for ETH, 1.6 % for LINK and UNI, 2.1 % for AAVE, 1.5 % for COMP, 7.5 % for
+USDC/USD and 4.8 % for USDT/USD, with a gap of 1 to 13 bp at the median and up to about 1 % at p99 (35 % at worst
+for COMP). The served phase is sometimes missing from the CSV (ETH phase 2, 2020-08-06 to 2020-10-07, and a few
+days at the start of the LINK, AAVE and COMP files): V3 then says there is no Chainlink round rather than using
+one the proxy did not serve.
+Among rounds of the served phase sharing a timestamp, the latest round wins (what the proxy returned).
+
+The sync reads the switches through the node URL in `$OPENPRICE_RPC_URL` (`v3.rpc_url_env`), which is never
+written to a file of the repository or of the store; the API itself never calls the node.
+
 ### How the store works
 
 * `python -m app.v3.sync` converts each CSV to canonical, time-sorted Parquet segments under
   `v3.parquet_root` (default `~/openprice/parquet`; never inside the datasets directory) and writes
   `manifest.json` atomically. The CSV row number is kept (`rn`), so the CSV order (which V1/V2 relied on
-  for ties) is reproduced exactly.
-* It is incremental: only bytes appended since the last run are read, after checking a fingerprint of what
-  was already consumed; a rewritten header, truncated or rewritten file triggers a rebuild of that dataset
-  only. A partially written last line is never consumed. It is safe to run while the extraction containers
+  for ties) can still be replayed. The store format is versioned (`schema_version` 2 since 2026-09-24); a sync
+  finding an older one rebuilds every file (about 6 min), and the running API keeps answering meanwhile.
+* Every CSV line is accounted for (`quality` in `GET /v3/datasets`): physical lines, rows read, lines dropped by
+  the tolerant reader (e.g. longer than 100 KB), structural anomalies found by a strict RFC 4180 pass, unreadable
+  timestamps (a header repeated mid-file), unreadable prices (the row is skipped, as V1/V2 did), other cells that
+  could not be converted (kept as NULL) and duplicates removed. On 2026-09-24 every counter is 0 for the 31 files;
+  a run that finds an anomaly writes a warning to the journal.
+* It is incremental: only bytes appended since the last run are read, after checking what was already consumed
+  (header, last 64 KB, one 4 KB sample every 256 MB); a rewritten header, truncated or rewritten file triggers a
+  rebuild of that dataset only. `--verify` (weekly timer in `deploy/`) also compares a full SHA-256 of the consumed
+  bytes. A partially written last line is never consumed. It is safe to run while the extraction containers
   append to the CSVs (see `deploy/`).
+* Every published manifest is kept in `history/<version>.json.gz`, and `sync_log.jsonl` records each rebuild,
+  append and Chainlink phase switch with its reason and the resulting version.
 * The API polls the manifest (`v3.manifest_poll_seconds`) and reloads it without restart; the LRU cache key
   includes the dataset version, so it can never serve a stale price after a sync.
 * Range endpoints run the same per-point engine in parallel (`v3.range_workers`, default 8; about 5 ms

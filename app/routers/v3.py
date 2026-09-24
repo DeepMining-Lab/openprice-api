@@ -7,6 +7,8 @@ orders of magnitude faster.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import time
 from datetime import datetime, timezone
 
@@ -15,6 +17,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from app.config import get_config
 from app.routers.prices import _validate_asset, _validate_branch, _validate_granularity, _validate_source
 from app.schemas import ComparePoint, ConfidenceV2Detail, PriceV3Response
+from app.v3 import sync as sync_mod
 from app.v3.service import Service, get_service
 
 router = APIRouter(prefix="/v3")
@@ -74,13 +77,19 @@ _H_PAGE = {
     description=(
         "Same source hierarchy, VWMP, peg neutralization and confidence model as `/v2`, "
         "served from an indexed Parquet store. Differences from V2: the S_stat 7-day window "
-        "and the windowed VWMP read are no longer truncated to 10 000 rows, and 110 duplicated "
-        "swap events of the ETH/USDC pool are ignored.\n\n"
+        "and the windowed VWMP read are no longer truncated to 10 000 rows, 110 duplicated "
+        "swap events of the ETH/USDC pool are ignored, and Chainlink is read only from the aggregator "
+        "phase its proxy served at T.\n\n"
         "Additive diagnostics (never change a number):\n"
         "- a `timestamp` after the server time returns level 4 with `unavailable_reason: future_timestamp`;\n"
         "- `beyond_data_coverage` warns that the price depends on data after the last sync (provisional);\n"
         "- `fallback_explained` says why higher-priority sources were rejected; the full list is in "
-        "`provenance.rejected_candidates`."
+        "`provenance.rejected_candidates`;\n"
+        "- `chainlink_phase_unverified` warns that a Chainlink phase switch after the last on-chain check "
+        "could be missing.\n\n"
+        "The provenance names the on-chain event of a point read (`source_event`, `eth_usd_leg_event`: "
+        "transaction and log index of a swap, or phase and round of a Chainlink answer) and the data version "
+        "that answered (`dataset_version`, `dataset_files`)."
     ),
     tags=["Prices V3"],
     responses={200: {"headers": {**_H_COMMON, "X-Cache": _H_CACHE}}},
@@ -136,8 +145,58 @@ def confidence_at_v3(
 
 @router.get("/config", summary="Effective V3 configuration", tags=["System"])
 def effective_config_v3():
+    """Every parameter V3 reads, as loaded. ``config_sha256`` identifies this set of values (canonical JSON)."""
     cfg = get_config()
-    return {"v3": cfg.v3.model_dump(), "confidence_v2": cfg.confidence_v2.model_dump()}
+    effective = {
+        "api": {"default_limit": cfg.api.default_limit, "max_limit": cfg.api.max_limit},
+        "thresholds": cfg.thresholds.model_dump(),
+        "scoring": cfg.scoring.model_dump(),
+        "confidence_v2": cfg.confidence_v2.model_dump(),
+        "v3": cfg.v3.model_dump(),
+    }
+    digest = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()
+    return {"config_sha256": digest, **effective}
+
+
+@router.get("/datasets", summary="V3 datasets: rows, quality counters, Chainlink phase switches", tags=["System"])
+def datasets_v3():
+    """One entry per CSV file of the store. ``quality`` accounts for every line read from the CSV (lines dropped
+    or anomalous, cells that could not be converted, duplicates removed); ``status`` is ``empty`` (header only),
+    ``anomalies`` (some line or cell was not stored as it is in the CSV) or ``ok``."""
+    svc = _service()
+    manifest = sync_mod.load_manifest(svc.store.root)
+    out = []
+    for rel, d in sorted(manifest["datasets"].items()):
+        q = d.get("quality") or {}
+        cl = d.get("chainlink")
+        out.append({
+            "file": rel,
+            "status": "empty" if not d["n_rows"] else ("anomalies" if sync_mod.quality_issues(q) else "ok"),
+            "rows": d["n_rows"],
+            "first_observation_utc": d["min_ts"],
+            "last_observation_utc": d["max_ts"],
+            "file_version": d.get("file_version"),
+            "csv_bytes_read": d["csv_offset"],
+            "csv_lines_read": d.get("csv_lines"),
+            "csv_sha256": d.get("csv_sha256"),
+            "last_change": d.get("last_change"),
+            "quality": q,
+            "chainlink": {k: cl.get(k) for k in ("proxy", "switches", "verified_block", "verified_ts", "status")}
+            if cl else None,
+        })
+    return {"dataset_version": manifest.get("version"), "generated_at": manifest.get("generated_at"),
+            "schema_version": manifest.get("schema_version"), "datasets": out}
+
+
+@router.get("/datasets/versions/{version}", summary="A past manifest of the V3 store", tags=["System"])
+def dataset_version_v3(version: str):
+    """The manifest published under ``version`` (the ``X-Dataset-Version`` / ``provenance.dataset_version`` of a
+    response): per file, the CSV bytes and rows it contained. Every published version is kept."""
+    svc = _service()
+    m = sync_mod.load_history(svc.store.root, version)
+    if m is None:
+        raise HTTPException(status_code=404, detail=f"Unknown dataset version {version!r}.")
+    return m
 
 
 @router.get("/ready", summary="V3 readiness: Parquet store loaded", tags=["System"])

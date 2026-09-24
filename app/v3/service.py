@@ -10,11 +10,19 @@ V1/V2 truncation of a window to ``api.max_limit`` rows:
 
 ``v3.legacy_truncation: true`` restores both, to prove parity with V2.
 
+A third correction reads Chainlink (S_coh, the level-3 fallback, the peg feeds, the S_stat
+reference of a cross-rate) only from the aggregator phase the proxy served at T
+(``v3.chainlink_active_phase_only``, off in legacy mode). V2 read the rounds of every phase.
+
 On top of the V2 response, V3 adds diagnostics that never change a number (additive, listed in
 ``V3_DIAGNOSTIC_CODES``): a timestamp in the future is answered as an explicit NULL, a price that
 depends on data not yet synced is flagged as provisional, a fallback to a lower source level says
-which candidates were rejected and why (``provenance.rejected_candidates``). Range endpoints report
-truncation and the start of the next page; ``raw`` series have one point per distinct timestamp.
+which candidates were rejected and why (``provenance.rejected_candidates``), a Chainlink read whose
+phase table was not checked up to T is flagged. The provenance also names the on-chain event behind
+a point price (``source_event``, ``eth_usd_leg_event``) and the data version that answered
+(``dataset_version``, ``dataset_files``); ``confidence.parameters`` lists every parameter used.
+Range endpoints report truncation and the start of the next page; ``raw`` series have one point per
+distinct timestamp.
 """
 
 from __future__ import annotations
@@ -32,11 +40,12 @@ from typing import Any
 from app import registry
 from app.config import AppConfig, get_config
 from app.routers.prices_v2 import _compute_s_liq
-from app.schemas import ComparePoint, ConfidenceV2Detail, PriceV3Response, ProvenanceV3, RejectedCandidate, Warning
+from app.schemas import (ComparePoint, ConfidenceV2Detail, PriceV3Response, ProvenanceV3, RejectedCandidate,
+                         SourceEventV3, Warning)
 from app.services import confidence_v2_service as v2
 from app.services.price_service import PriceResult, _level_4
 from app.services.provenance_service import build_provenance
-from app.v3.engine import Engine
+from app.v3.engine import Engine, no_round_message
 from app.v3.store import Store, get_store
 
 
@@ -60,9 +69,10 @@ def compute_s_stat(store: Store, rel: str, timestamp: datetime, price_at_t: floa
     limit = cfg.api.max_limit if cfg.v3.legacy_truncation else None
     min_n = cfg.thresholds.min_swaps_for_stat_score
     sigma = cfg.thresholds.sigma_mad
+    served = store.phase_filtering(rel)  # a Chainlink reference: rounds of the phase served at their time
 
     if not s_cfg.normalize_by_volatility:
-        n, median_p, mad = store.price_stats(rel, price_col, window_start, timestamp, limit)
+        n, median_p, mad = store.price_stats(rel, price_col, window_start, timestamp, limit, served=served)
         if n < min_n:
             warnings.append(Warning(code="s_stat_insufficient_data",
                                     message=f"Only {n} observations in window (min {min_n}); using floor."))
@@ -73,7 +83,7 @@ def compute_s_stat(store: Store, rel: str, timestamp: datetime, price_at_t: floa
         return math.exp(-(z ** 2) / (2 * sigma ** 2)), warnings
 
     # Volatility-normalized variant (off by default): needs the raw series.
-    prices = store.prices(rel, price_col, window_start, timestamp, limit)
+    prices = store.prices(rel, price_col, window_start, timestamp, limit, served=served)
     if len(prices) < min_n:
         warnings.append(Warning(code="s_stat_insufficient_data",
                                 message=f"Only {len(prices)} observations in window (min {min_n}); using floor."))
@@ -112,10 +122,13 @@ def compute_s_coh(store: Store, asset: str, dex_price_neutralized: float, cl_rel
         warnings.append(Warning(code="s_coh_chainlink_missing_columns",
                                 message="Cannot compute S_coh: Chainlink file missing columns."))
         return None, warnings
-    row = store.as_of(cl_rel, timestamp, [price_col])
+    phase = store.active_phase(cl_rel, timestamp)
+    row = store.as_of(cl_rel, timestamp, [price_col], phase=phase)
     if row is None or row.get(price_col) is None:
-        warnings.append(Warning(code="s_coh_no_chainlink_observation",
-                                message="No Chainlink observation found at or before timestamp."))
+        message = "No Chainlink observation found at or before timestamp."
+        if phase is not None:
+            message = f"No Chainlink observation found: {no_round_message(ds, phase)}."
+        warnings.append(Warning(code="s_coh_no_chainlink_observation", message=message))
         return None, warnings
     cl_price = float(row[price_col])
     if cl_price == 0:
@@ -139,7 +152,7 @@ def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppC
     ts_col, price_col = ds.col("timestamp"), ds.col("price_usd")
     if not ts_col or not price_col:
         return None, None, None
-    row = store.as_of(rel, timestamp, [price_col])
+    row = store.as_of(rel, timestamp, [price_col], phase=store.active_phase(rel, timestamp))
     if row is None or row.get(price_col) is None:
         return None, None, None
     return float(row[price_col]), row[ts_col], rel
@@ -149,7 +162,12 @@ def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppC
 # V3 diagnostics (additive: they never change a price or a score)
 # ---------------------------------------------------------------------------
 
-V3_DIAGNOSTIC_CODES = frozenset({"future_timestamp", "beyond_data_coverage", "fallback_explained"})
+V3_DIAGNOSTIC_CODES = frozenset({"future_timestamp", "beyond_data_coverage", "fallback_explained",
+                                 "chainlink_phase_unverified"})
+# Additive V3 fields: provenance blocks and confidence parameters that V2 does not have.
+V3_PROVENANCE_FIELDS = ("rejected_candidates", "source_event", "eth_usd_leg_event", "dataset_version", "dataset_files")
+V3_PARAMETER_KEYS = ("coh_delta_tol_used", "seuil_TVL_min_usd", "tvl_score_mode", "tvl_log_min_usd", "tvl_log_ref_usd",
+                     "min_swaps_for_stat_score", "s_stat_floor")
 
 _LEVEL_RANK = {"0a": 0, "0b": 1, "1": 2, "2": 3, "3": 4, "4": 5}
 
@@ -182,7 +200,8 @@ def fallback_warning(result: PriceResult, rejected: list[RejectedCandidate]) -> 
 
 def strip_v3_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
     """V2-comparable copy of a V3 point response (JSON dict) for the parity tools: drops the
-    warnings whose code is in ``V3_DIAGNOSTIC_CODES`` and ``provenance.rejected_candidates``."""
+    warnings whose code is in ``V3_DIAGNOSTIC_CODES``, the provenance fields of ``V3_PROVENANCE_FIELDS``
+    and the confidence parameters of ``V3_PARAMETER_KEYS``."""
     out = copy.deepcopy(payload)
 
     def keep(ws: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -193,7 +212,11 @@ def strip_v3_diagnostics(payload: dict[str, Any]) -> dict[str, Any]:
         if out.get(block):
             out[block]["warnings"] = keep(out[block].get("warnings") or [])
     if out.get("provenance"):
-        out["provenance"].pop("rejected_candidates", None)
+        for k in V3_PROVENANCE_FIELDS:
+            out["provenance"].pop(k, None)
+    if out.get("confidence") and out["confidence"].get("parameters"):
+        for k in V3_PARAMETER_KEYS:
+            out["confidence"]["parameters"].pop(k, None)
     return out
 
 
@@ -316,6 +339,15 @@ class Service:
                 "sigma_mad": t.sigma_mad,
                 "slip_max": t.slip_max,
                 "fragility_c_threshold": cfg.confidence_v2.fragility.c_threshold,
+                # V3: the remaining parameters of the scores, as used (V3_PARAMETER_KEYS)
+                "coh_delta_tol_used": cfg.confidence_v2.coh.delta_tol_by_asset.get(
+                    asset, cfg.confidence_v2.coh.default_delta_tol),
+                "seuil_TVL_min_usd": t.seuil_TVL_min_usd,
+                "tvl_score_mode": cfg.scoring.tvl_score_mode,
+                "tvl_log_min_usd": cfg.scoring.tvl_log_min_usd,
+                "tvl_log_ref_usd": cfg.scoring.tvl_log_ref_usd,
+                "min_swaps_for_stat_score": t.min_swaps_for_stat_score,
+                "s_stat_floor": t.s_stat_floor,
             },
             warnings=warnings,
         )
@@ -339,6 +371,48 @@ class Service:
             code="beyond_data_coverage",
             message=(f"The {what} {_iso(horizon)} is after the last synced data ({synced}); this price is "
                      "provisional and may change after the next data update."),
+        )
+
+    def _phase_warning(self, timestamp: datetime, rels: list[str]) -> Warning | None:
+        """Flag a Chainlink read at T whose phase switches were not checked on-chain up to T."""
+        late, missing = [], []
+        for rel in dict.fromkeys(rels):
+            status = self.store.phase_status(rel, timestamp)
+            if status == "unverified":
+                late.append(rel)
+            elif status == "no_table":
+                missing.append(rel)
+        if not late and not missing:
+            return None
+        parts = []
+        if late:
+            checked = {rel: self.store.dataset(rel).phases.verified for rel in late}
+            parts.append("the aggregator phase switches of " + ", ".join(
+                f"{rel} were last checked on-chain at {_iso(t)}" if t else f"{rel} were never checked on-chain"
+                for rel, t in checked.items())
+                + ", before T: a switch after that time is not taken into account")
+        if missing:
+            parts.append("no phase switch table for " + ", ".join(missing)
+                         + " (not read from the chain yet): rounds of every aggregator phase were used, as V2 does")
+        return Warning(code="chainlink_phase_unverified", message="Chainlink: " + "; ".join(parts) + ".")
+
+    def _event(self, rel: str | None, row: dict[str, Any] | None) -> SourceEventV3 | None:
+        """The on-chain event behind a point read: a swap (transaction, log index) or a Chainlink round."""
+        ds = self.store.dataset(rel) if rel else None
+        if ds is None or row is None or row.get("ts") is None:
+            return None
+        ts = row["ts"]
+        phase = row.get("phase") if ds.has_phases else None
+        if phase is not None and self.store.phase_filtering(rel):
+            rule, n = "latest_round_of_active_phase", self.store.count_at(rel, ts, phase)
+        else:
+            n = self.store.count_at(rel, ts)
+            rule = ("first_swap_of_block" if row.get("log_index") is not None and not self.store.legacy
+                    else "first_csv_row")
+        return SourceEventV3(
+            file=rel, timestamp=ts, tx_hash=row.get("tx_hash"), log_index=row.get("log_index"),
+            block_number=row.get("block_number"), phase=phase, aggregator_round=row.get("agg_round"),
+            rows_at_same_timestamp=n, tie_break_rule=rule,
         )
 
     def _future_response(self, asset: str, timestamp: datetime, granularity: str, include_provenance: bool,
@@ -367,19 +441,35 @@ class Service:
             headline_price = price_neutralized_usd
         price_for_coh = price_neutralized_usd if price_neutralized_usd is not None else price_raw_in_quote
 
-        # V3 diagnostics: appended after the V2 warnings, and to the confidence block when there
-        # is one (they qualify the scores too: provisional data, why C is null after a fallback).
-        diagnostics = [w for w in (*(extra or []), self._coverage_warning(timestamp, result, peg_rel),
-                                   fallback_warning(result, rejected)) if w is not None]
-
         confidence = None
+        cl_rel: str | None = None
         if include_confidence and result.price_usd is not None:
             confidence = self._confidence(result, asset, timestamp, peg_value, price_for_coh)
+            cl_paths = registry.get_chainlink_paths(asset)
+            cl_rel = str(cl_paths[0].relative_to(cfg.paths.datasets_path)) if cl_paths else None
+
+        # V3 diagnostics: appended after the V2 warnings, and to the confidence block when there
+        # is one (they qualify the scores too: provisional data, why C is null after a fallback).
+        chainlink_read = [r for r in [*result.files_used, cl_rel, peg_rel] if r]
+        diagnostics = [w for w in (*(extra or []), self._coverage_warning(timestamp, result, peg_rel),
+                                   fallback_warning(result, rejected),
+                                   self._phase_warning(timestamp, chainlink_read) if result.price_usd is not None
+                                   else None) if w is not None]
+        if confidence is not None:
             confidence.warnings.extend(diagnostics)
 
         provenance: ProvenanceV3 | None = None
         if include_provenance:
-            prov = ProvenanceV3(**dict(build_provenance(result)), rejected_candidates=rejected)
+            files = [r for r in dict.fromkeys([*result.files_used, cl_rel, peg_rel]) if r and self.store.dataset(r)]
+            prov = ProvenanceV3(
+                **dict(build_provenance(result)), rejected_candidates=rejected,
+                source_event=self._event(result.files_used[0] if result.files_used else None,
+                                         result.source_row) if result.granularity == "raw" else None,
+                eth_usd_leg_event=self._event(result.files_used[1], result.eth_source_row)
+                if result.eth_source_row is not None and len(result.files_used) > 1 else None,
+                dataset_version=self.store.version,
+                dataset_files={r: self.store.dataset(r).file_version for r in files},
+            )
             prov.parameters = {
                 "seuil_TVL_min_usd": cfg.thresholds.seuil_TVL_min_usd,
                 "seuil_vol_min_usd_24h": cfg.thresholds.seuil_vol_min_usd_24h,
@@ -434,8 +524,8 @@ class Service:
         now = datetime.now(timezone.utc)
         if timestamp > now:
             return self._future_response(asset, timestamp, granularity, include_provenance, now), False
-        key = (self.store.version, self.cfg.v3.legacy_truncation, asset, timestamp, branch, source,
-               granularity, include_confidence, include_provenance)
+        key = (self.store.version, self.cfg.v3.legacy_truncation, self.cfg.v3.chainlink_active_phase_only, asset,
+               timestamp, branch, source, granularity, include_confidence, include_provenance)
         hit = self.cache.get(key)
         if hit is not None:
             return hit, True
@@ -495,7 +585,8 @@ class Service:
         return Page([r for r, _ in results], next_start, sum(1 for _, cached in results if cached))
 
     def compare(self, asset: str, start: datetime, end: datetime, limit: int) -> Page:
-        """DEX price vs Chainlink at every Chainlink round in [start, end) (V1 ``/compare`` semantics)."""
+        """DEX price vs Chainlink at every Chainlink round in [start, end) (V1 ``/compare`` semantics); with the
+        phase filter, only the rounds of the phase the proxy served when they were published."""
         self.store.maybe_reload()
         limit = min(limit, self.cfg.api.max_limit)
         cl_paths = registry.get_chainlink_paths(asset)
@@ -505,7 +596,7 @@ class Service:
         if ds is None or not ds.col("timestamp") or not ds.col("price_usd"):
             return Page([])
         price_col = ds.col("price_usd")
-        rows = self.store.window(ds.rel, start, end, [price_col], limit + 1)
+        rows = self.store.window(ds.rel, start, end, [price_col], limit + 1, served=True)
         next_start: datetime | None = None
         if len(rows) > limit:
             next_start, rows = rows[limit]["ts"], rows[:limit]

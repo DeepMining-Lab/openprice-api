@@ -1,0 +1,14 @@
+[Unit]
+Description=OpenPrice API V3 - sync + full SHA-256 check of the CSV bytes already converted
+After=local-fs.target
+
+[Service]
+Type=oneshot
+User=debian
+WorkingDirectory=/home/debian/OpenPrice-API/openprice-api
+EnvironmentFile=-/home/debian/.openprice_rpc_env
+# Reads every CSV once (about 31 GB): a file rewritten in place with the same length, which the incremental checks
+# (header, last 64 KB, one 4 KB sample every 256 MB) can miss, is rebuilt. Waits for a running sync.
+ExecStart=/home/debian/OpenPrice-API/openprice-api/.venv/bin/python -m app.v3.sync --verify
+Nice=10
+IOSchedulingClass=idle

@@ -125,8 +125,25 @@ class RejectedCandidate(BaseModel):
     last_observation_utc: datetime | None = None
 
 
+class SourceEventV3(BaseModel):
+    """The on-chain event behind a point read: a swap, or a Chainlink round."""
+    file: str
+    timestamp: datetime
+    tx_hash: str | None = None
+    log_index: int | None = None
+    block_number: int | None = None
+    phase: int | None = None                  # Chainlink aggregator phase
+    aggregator_round: int | None = None       # Chainlink round within that phase
+    rows_at_same_timestamp: int               # rows of the file sharing this timestamp
+    tie_break_rule: str                       # first_swap_of_block | latest_round_of_active_phase | first_csv_row
+
+
 class ProvenanceV3(Provenance):
     rejected_candidates: list[RejectedCandidate] = []
+    source_event: SourceEventV3 | None = None          # raw point reads only (a VWMP aggregates many swaps)
+    eth_usd_leg_event: SourceEventV3 | None = None     # cross-rates: the ETH/USD point read
+    dataset_version: str | None = None                 # version of the Parquet store that answered
+    dataset_files: dict[str, str] = {}                 # version of each file read for this answer
 
 
 class PriceV3Response(PriceV2Response):

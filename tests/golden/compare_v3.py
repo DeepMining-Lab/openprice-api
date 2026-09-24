@@ -1,13 +1,16 @@
-"""Compare API V3 against the V2 golden master (tests/golden/v2_golden.jsonl).
+"""Compare API V3 against a golden file: the V2 golden master (default) or a V3 capture (--v3).
 
-  python tests/golden/compare_v3.py --legacy   # parity proof: V3 replays V2's 10 000-row truncation
-  python tests/golden/compare_v3.py            # V3 as shipped (truncations fixed): lists what changes
+  python tests/golden/compare_v3.py --legacy   # parity proof: V3 replays V1/V2 (truncation, CSV ties, all phases)
+  python tests/golden/compare_v3.py            # V3 as shipped: lists what changes compared with V2
+  python tests/golden/compare_v3.py --v3 --golden tests/golden/v3_golden_base.jsonl --no-phase-filter
+                                               # V3 against its own capture of 2026-09-24 (before the validity fixes)
 
 Exit code 0 only if every non-excused record is identical (floats: rel 1e-9).
-Records whose window can contain one of the 110 duplicated ETH swaps (removed in the
-Parquet store, on purpose) are reported separately as "dup-zone". The additive V3 diagnostics
-(warning codes in V3_DIAGNOSTIC_CODES, provenance.rejected_candidates) are stripped before the
-comparison: they never change a number and V2 has no equivalent.
+Against V2, records whose window can contain one of the 110 duplicated ETH swaps (removed in the
+Parquet store, on purpose) are reported separately as "dup-zone". The additive V3 fields (warning codes
+in V3_DIAGNOSTIC_CODES, V3_PROVENANCE_FIELDS, V3_PARAMETER_KEYS) are stripped before the comparison: they
+never change a number and V2 has no equivalent. Against a V3 capture they are stripped on both sides and
+nothing is excused.
 """
 import argparse, json, math, os, sys
 from collections import Counter
@@ -48,10 +51,14 @@ def diff(a, b, path=""):
         yield (path, a, b)
 
 
-def compare(legacy: bool, limit: int | None = None, golden: str | None = None):
+def compare(legacy: bool, limit: int | None = None, golden: str | None = None, v3_golden: bool = False,
+            phase_filter: bool | None = None):
     """Run every golden record through V3. Returns (counts, differing_fields, bad) with
-    bad = [(record_id, [(path, v2_value, v3_value), ...])] for non-excused differences."""
+    bad = [(record_id, [(path, golden_value, v3_value), ...])] for non-excused differences.
+    ``phase_filter`` sets ``v3.chainlink_active_phase_only`` (legacy mode never filters)."""
     cfg = get_config(); cfg.v3.legacy_truncation = legacy
+    if phase_filter is not None:
+        cfg.v3.chainlink_active_phase_only = phase_filter
     svc = get_service()
     golden = golden or os.path.join(os.path.dirname(os.path.abspath(__file__)), "v2_golden.jsonl")
     recs = [json.loads(l) for l in open(golden) if l.strip()]
@@ -62,9 +69,10 @@ def compare(legacy: bool, limit: int | None = None, golden: str | None = None):
         q = r["req"]
         got, _ = svc.price_at(q["asset"], datetime.fromisoformat(q["timestamp"].replace("Z", "+00:00")),
                               granularity=q["granularity"])
-        d = list(diff(r["response"], strip_v3_diagnostics(got.model_dump(mode="json"))))
+        expected = strip_v3_diagnostics(r["response"]) if v3_golden else r["response"]
+        d = list(diff(expected, strip_v3_diagnostics(got.model_dump(mode="json"))))
         if not d: counts["identical"] += 1; continue
-        if in_dup_zone(q["asset"], q["timestamp"]): counts["dup_zone"] += 1; continue
+        if not v3_golden and in_dup_zone(q["asset"], q["timestamp"]): counts["dup_zone"] += 1; continue
         counts["other"] += 1; bad.append((r["id"], d))
         for p, _, _ in d: fields[p.split("[")[0] if "warnings" in p else p] += 1
     return counts, fields, bad
@@ -73,11 +81,16 @@ def compare(legacy: bool, limit: int | None = None, golden: str | None = None):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--legacy", action="store_true")
+    ap.add_argument("--golden", help="golden file (default: v2_golden.jsonl)")
+    ap.add_argument("--v3", action="store_true", help="the golden file is a V3 capture (capture_v3.py)")
+    ap.add_argument("--no-phase-filter", action="store_true", help="v3.chainlink_active_phase_only = false")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--show", type=int, default=12)
     args = ap.parse_args()
-    counts, fields, bad = compare(args.legacy, args.limit)
+    counts, fields, bad = compare(args.legacy, args.limit, args.golden, args.v3,
+                                  False if args.no_phase_filter else None)
     mode = "LEGACY (parity proof)" if args.legacy else "FIXED (as shipped)"
+    if args.no_phase_filter: mode += ", no Chainlink phase filter"
     print(f"mode={mode}: {counts['total']} golden records | identical={counts['identical']} | "
           f"dup-zone diffs={counts['dup_zone']} | other diffs={counts['other']} | skipped={counts['skipped']}")
     if fields:
@@ -85,7 +98,7 @@ def main():
         for p, n in fields.most_common(15): print(f"  {n:4d}  {p}")
     for rid, d in bad[:args.show]:
         print(f"\n{rid}")
-        for p, x, y in d[:6]: print(f"   {p}: V2={x!r}  V3={y!r}")
+        for p, x, y in d[:6]: print(f"   {p}: golden={x!r}  V3={y!r}")
     sys.exit(0 if not bad else 1)
 
 

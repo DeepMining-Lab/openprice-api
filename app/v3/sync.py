@@ -6,28 +6,39 @@ containers). This module derives a query-friendly copy under ``v3.parquet_root``
 * one directory per dataset, made of immutable, time-sorted *segments*;
 * every segment is sorted by ``(ts, rn)`` where ``rn`` is the original CSV row
   number, so the CSV scan order (which V1/V2 relied on for same-timestamp ties)
-  is reproduced by construction;
-* swap events are de-duplicated on ``(tx_hash, log_index)`` keeping the first row
-  (the CSV itself is never modified);
+  can still be replayed;
+* events are de-duplicated keeping the first row: swaps on ``(tx_hash, log_index)``,
+  Chainlink rounds on ``(phase, aggregator_round)`` (the CSV itself is never modified);
 * the sync is incremental: only the bytes appended since the last run are read,
-  after verifying a fingerprint of what was already consumed. Any mismatch
-  (rewritten header, truncated or rewritten file) triggers a full rebuild of that
-  dataset only;
+  after verifying what was already consumed (header, last 64 KB, and one 4 KB sample
+  every 256 MB). Any mismatch triggers a full rebuild of that dataset only;
+  ``--verify`` also compares a full SHA-256 of the consumed prefix;
 * a partial last line (writer in the middle of an append) is never consumed;
-* ``manifest.json`` is swapped atomically; the API reloads it when it changes.
+* every line is accounted for (``quality`` in the manifest): physical lines, rows read,
+  lines dropped by the tolerant reader, structural anomalies found by a strict pass,
+  unreadable timestamps (repeated headers), unreadable prices (row dropped, as V1/V2 did),
+  other cells that could not be converted (kept as NULL), duplicates removed;
+* for Chainlink feeds, the proxy phase switches are read from the chain (see
+  ``app.v3.chainlink_phases``) when ``$<v3.rpc_url_env>`` is set;
+* ``manifest.json`` is swapped atomically and every published version is also kept in
+  ``history/<version>.json.gz``; ``sync_log.jsonl`` records each rebuild, append and phase
+  switch with its reason. The API reloads the manifest when it changes.
 
-Usage:  python -m app.v3.sync [--rebuild] [--only SUBSTR] [--dry-run]
+Usage:  python -m app.v3.sync [--rebuild] [--verify] [--only SUBSTR]
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
 import fcntl
+import gzip
 import hashlib
+import io
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -36,12 +47,17 @@ import duckdb
 
 from app import csv_adapter, registry
 from app.config import AppConfig, get_config
+from app.v3 import chainlink_phases
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 FINGERPRINT_BYTES = 65536
+SAMPLE_BYTES = 4096
+SAMPLE_STRIDE = 256 << 20
+MAX_QUALITY_SAMPLES = 20
 ROW_GROUP_SIZE = 50_000
 _BLOCK_TS_CANDIDATES = ("block_timestamp_utc", "block_timestamp", "block_time")
 _QUOTE_SYMBOL_COLUMNS = ("quote_token_symbol", "quote_asset", "quote_currency")
+_PRICE_COLUMNS = ("px_usd", "px_token_eth", "px_inv_eth")
 
 # Same reader options as V1/V2 (duckdb_client._CSV_OPTS) + all_varchar: values are
 # cast explicitly below, so a malformed cell becomes NULL instead of dropping the row.
@@ -49,6 +65,15 @@ _CSV_OPTS = (
     "delim=',', header=true, max_line_size=102400, strict_mode=false, "
     "null_padding=true, ignore_errors=true, all_varchar=true"
 )
+# The same tolerant read with the header's columns given explicitly (no dialect sniffing): a malformed line that
+# falls in DuckDB's sniffing sample (e.g. longer than max_line_size) is then one rejected line, not a failed read.
+_CSV_OPTS_EXPLICIT = (
+    "delim=',', quote='\"', escape='\"', header=true, auto_detect=false, max_line_size=102400, strict_mode=false, "
+    "null_padding=true, ignore_errors=true"
+)
+# DuckDB fills a rejects table only for a query that materialises rows, and creates it only when there is a reject.
+_TOLERANT_REJECTS = "store_rejects=true, rejects_table='v3_tol_rej', rejects_scan='v3_tol_scan'"
+_STRICT_REJECTS = "store_rejects=true, rejects_table='v3_strict_rej', rejects_scan='v3_strict_scan'"
 
 # canonical (csv_adapter) name -> Parquet column name
 CANON_TO_PQ: dict[str, str] = {
@@ -68,6 +93,10 @@ def _q(col: str) -> str:
     return '"' + col.replace('"', '""') + '"'
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
 # ---------------------------------------------------------------------------
 # Paths / manifest
 # ---------------------------------------------------------------------------
@@ -80,6 +109,14 @@ def manifest_path(root: Path) -> Path:
     return root / "manifest.json"
 
 
+def history_path(root: Path, version: str) -> Path:
+    return root / "history" / f"{version}.json.gz"
+
+
+def sync_log_path(root: Path) -> Path:
+    return root / "sync_log.jsonl"
+
+
 def load_manifest(root: Path) -> dict[str, Any]:
     p = manifest_path(root)
     if not p.exists():
@@ -87,22 +124,55 @@ def load_manifest(root: Path) -> dict[str, Any]:
     return json.loads(p.read_text())
 
 
+def load_history(root: Path, version: str) -> dict[str, Any] | None:
+    if not version.isalnum():
+        return None
+    p = history_path(root, version)
+    if not p.exists():
+        return None
+    with gzip.open(p, "rt") as f:
+        return json.load(f)
+
+
+def file_version(d: dict[str, Any]) -> str:
+    """Version of one dataset: its data (segments, consumed CSV bytes, rows) and, for Chainlink, its phase switches."""
+    switches = (d.get("chainlink") or {}).get("switches") or []
+    stable = [d["segments"], d["csv_offset"], d["n_rows"], [[s["phase"], s["block"]] for s in switches]]
+    return hashlib.sha1(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:16]
+
+
 def _version_of(datasets: dict[str, Any]) -> str:
-    stable = {k: (v["segments"], v["csv_offset"], v["n_rows"]) for k, v in sorted(datasets.items())}
+    stable = {k: v["file_version"] for k, v in sorted(datasets.items())}
     return hashlib.sha1(json.dumps(stable, sort_keys=True).encode()).hexdigest()[:16]
 
 
 def _write_manifest(root: Path, datasets: dict[str, Any]) -> dict[str, Any]:
+    for d in datasets.values():
+        d["file_version"] = file_version(d)
     m = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_VERSION if all(d.get("schema") == SCHEMA_VERSION for d in datasets.values()) else 1,
         "version": _version_of(datasets),
-        "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "generated_at": _now(),
         "datasets": datasets,
     }
+    hist = history_path(root, m["version"])
+    if not hist.exists():
+        hist.parent.mkdir(parents=True, exist_ok=True)
+        tmp_h = hist.with_suffix(".tmp")
+        with gzip.open(tmp_h, "wt") as f:
+            json.dump(m, f, sort_keys=True)
+        os.replace(tmp_h, hist)
     tmp = manifest_path(root).with_suffix(".json.tmp")
     tmp.write_text(json.dumps(m, indent=1, sort_keys=True))
     os.replace(tmp, manifest_path(root))
     return m
+
+
+def _append_log(root: Path, entries: list[dict[str, Any]]) -> None:
+    if entries:
+        with sync_log_path(root).open("a") as f:
+            for e in entries:
+                f.write(json.dumps(e, sort_keys=True, default=str) + "\n")
 
 
 # ---------------------------------------------------------------------------
@@ -118,12 +188,42 @@ def _read_header_line(path: Path) -> bytes:
         return f.readline()
 
 
+def _header_names(header_line: bytes) -> list[str]:
+    """Every field of the header, stripped like ``duckdb_client.describe_csv`` (empty names get a placeholder)."""
+    fields = next(csv.reader(io.StringIO(header_line.decode("utf-8", errors="replace").rstrip("\r\n"))), [])
+    return [f.strip() or f"_unnamed_{i}" for i, f in enumerate(fields)]
+
+
+def _columns_sql(names: list[str]) -> str:
+    return "{" + ", ".join(f"'{n.replace(chr(39), chr(39) * 2)}': 'VARCHAR'" for n in names) + "}"
+
+
 def _fingerprint(path: Path, end: int) -> str:
     """sha1 of the last FINGERPRINT_BYTES bytes before ``end`` (detects rewrites)."""
     start = max(0, end - FINGERPRINT_BYTES)
     with path.open("rb") as f:
         f.seek(start)
         return _sha1(f.read(end - start))
+
+
+def _samples(path: Path, start: int, end: int) -> list[list]:
+    """[position, sha1] of a SAMPLE_BYTES block at every multiple of SAMPLE_STRIDE in [start, end - SAMPLE_BYTES]."""
+    out = []
+    first = -(-start // SAMPLE_STRIDE) * SAMPLE_STRIDE
+    with path.open("rb") as f:
+        for pos in range(first, end - SAMPLE_BYTES + 1, SAMPLE_STRIDE):
+            f.seek(pos)
+            out.append([pos, _sha1(f.read(SAMPLE_BYTES))])
+    return out
+
+
+def _samples_match(path: Path, samples: list[list]) -> bool:
+    with path.open("rb") as f:
+        for pos, sha in samples:
+            f.seek(pos)
+            if _sha1(f.read(SAMPLE_BYTES)) != sha:
+                return False
+    return True
 
 
 def _last_newline_end(path: Path, size: int) -> int:
@@ -141,35 +241,145 @@ def _last_newline_end(path: Path, size: int) -> int:
     return 0
 
 
-def _canonical_select(schema: csv_adapter.SchemaInfo, rn_base: int) -> str:
+def _scan_prefix(path: Path, end: int, check_offset: int | None = None) -> tuple[int, str, str | None]:
+    """One pass over [0, end): (newline count, sha256 of [0, end), sha256 of [0, check_offset) or None)."""
+    h = hashlib.sha256()
+    lines, pos, at_check = 0, 0, None
+    with path.open("rb") as f:
+        while pos < end:
+            n = min(8 << 20, end - pos)
+            if check_offset is not None and at_check is None and pos < check_offset <= pos + n:
+                n = check_offset - pos
+            b = f.read(n)
+            if not b:
+                break
+            h.update(b)
+            lines += b.count(b"\n")
+            pos += len(b)
+            if check_offset is not None and pos == check_offset:
+                at_check = h.copy().hexdigest()
+    return lines, h.hexdigest(), at_check
+
+
+def _copy_range(src: Path, dest: Path, start: int, end: int, prefix: bytes = b"") -> int:
+    """Copy [start, end) of ``src`` after ``prefix`` into ``dest``; returns the newline count of the copied range."""
+    lines = 0
+    with src.open("rb") as fi, dest.open("wb") as fo:
+        fo.write(prefix)
+        fi.seek(start)
+        remaining = end - start
+        while remaining > 0:
+            b = fi.read(min(1 << 20, remaining))
+            fo.write(b)
+            lines += b.count(b"\n")
+            remaining -= len(b)
+    return lines
+
+
+def _canonical_select(schema: csv_adapter.SchemaInfo, rn_base: int) -> tuple[str, list[str]]:
+    """SELECT list of a CSV read: the canonical columns stored in Parquet, then helper columns (names in the
+    second return value) used for the quality counters and never stored."""
     m, raw = schema.mapping, schema.raw_columns
 
-    def col(canon: str, cast: str) -> str:
-        c = m.get(canon)
-        return f"TRY_CAST({_q(c)} AS {cast})" if c else f"CAST(NULL AS {cast})"
+    def cast(c: str | None, typ: str) -> str:
+        return f"TRY_CAST({_q(c)} AS {typ})" if c else f"CAST(NULL AS {typ})"
 
-    def rawcol(names: tuple[str, ...], cast: str) -> str:
-        c = next((n for n in names if n in raw), None)
-        return f"TRY_CAST({_q(c)} AS {cast})" if c else f"CAST(NULL AS {cast})"
+    def raw_of(names: tuple[str, ...]) -> str | None:
+        return next((n for n in names if n in raw), None)
 
-    qs = next((n for n in _QUOTE_SYMBOL_COLUMNS if n in raw), None)
-    exprs = {
-        "ts": col("timestamp", "TIMESTAMPTZ"),
-        "rn": f"CAST({rn_base} + row_number() OVER () AS BIGINT)",
-        "px_usd": col("price_usd", "DOUBLE"),
-        "px_token_eth": col("price_token_eth", "DOUBLE"),
-        "px_inv_eth": col("price_inverse_eth", "DOUBLE"),
-        "vol_usd": col("volume_usd", "DOUBLE"),
-        "vol_token": col("volume_token", "DOUBLE"),
-        "tvl": col("tvl_usd", "DOUBLE"),
-        "slip": col("slippage", "DOUBLE"),
-        "block_number": col("block_number", "BIGINT"),
-        "block_ts": rawcol(_BLOCK_TS_CANDIDATES, "TIMESTAMPTZ"),
-        "log_index": rawcol(("log_index",), "INTEGER"),
-        "tx_hash": _q("transaction_hash") if "transaction_hash" in raw else "CAST(NULL AS VARCHAR)",
-        "quote_symbol": f"upper(trim({_q(qs)}))" if qs else "CAST(NULL AS VARCHAR)",
+    qs = raw_of(_QUOTE_SYMBOL_COLUMNS)
+    typed = {  # Parquet column -> (raw column, type)
+        "ts": (m.get("timestamp"), "TIMESTAMPTZ"),
+        "px_usd": (m.get("price_usd"), "DOUBLE"),
+        "px_token_eth": (m.get("price_token_eth"), "DOUBLE"),
+        "px_inv_eth": (m.get("price_inverse_eth"), "DOUBLE"),
+        "vol_usd": (m.get("volume_usd"), "DOUBLE"),
+        "vol_token": (m.get("volume_token"), "DOUBLE"),
+        "tvl": (m.get("tvl_usd"), "DOUBLE"),
+        "slip": (m.get("slippage"), "DOUBLE"),
+        "block_number": (m.get("block_number"), "BIGINT"),
+        "block_ts": (raw_of(_BLOCK_TS_CANDIDATES), "TIMESTAMPTZ"),
+        "log_index": (raw_of(("log_index",)), "INTEGER"),
+        "phase": (raw_of(("phase",)), "INTEGER"),
+        "agg_round": (raw_of(("aggregator_round",)), "BIGINT"),
     }
-    return ", ".join(f"{e} AS {k}" for k, e in exprs.items())
+    exprs = {k: cast(c, t) for k, (c, t) in typed.items()}
+    exprs["rn"] = f"CAST({rn_base} + row_number() OVER () AS BIGINT)"
+    exprs["tx_hash"] = _q("transaction_hash") if "transaction_hash" in raw else "CAST(NULL AS VARCHAR)"
+    exprs["quote_symbol"] = f"upper(trim({_q(qs)}))" if qs else "CAST(NULL AS VARCHAR)"
+    order = ["ts", "rn", "px_usd", "px_token_eth", "px_inv_eth", "vol_usd", "vol_token", "tvl", "slip", "block_number",
+             "block_ts", "log_index", "tx_hash", "quote_symbol", "phase", "agg_round"]
+    helpers: dict[str, str] = {
+        "_ts_raw": _q(m["timestamp"]) if m.get("timestamp") else "CAST(NULL AS VARCHAR)",
+        "_proxy": f"lower(trim({_q('feed_proxy_address')}))" if "feed_proxy_address" in raw else "CAST(NULL AS VARCHAR)",
+    }
+    for k, (c, t) in typed.items():
+        if c:  # a non-empty cell that cannot be converted
+            helpers[f"_bad_{k}"] = f"({_q(c)} IS NOT NULL AND trim({_q(c)}) <> '' AND TRY_CAST({_q(c)} AS {t}) IS NULL)"
+    sel = ", ".join(f"{exprs[k]} AS {k}" for k in order) + ", " + ", ".join(f"{e} AS {k}" for k, e in helpers.items())
+    return sel, list(helpers)
+
+
+_EVENT_KEY = ("CASE WHEN tx_hash IS NOT NULL AND log_index IS NOT NULL THEN tx_hash || ':' || CAST(log_index AS VARCHAR) "
+              "WHEN phase IS NOT NULL AND agg_round IS NOT NULL THEN 'round:' || CAST(phase AS VARCHAR) || ':' "
+              "|| CAST(agg_round AS VARCHAR) END")
+
+
+def _rejects(con: duckdb.DuckDBPyConnection, table: str) -> list[tuple[int, str, str]]:
+    """(line, error type, start of the line) of the rejects of the last read, one per line and type."""
+    if not con.execute("SELECT count(*) FROM duckdb_tables() WHERE table_name = ?", [table]).fetchone()[0]:
+        return []
+    return con.execute(f"SELECT line, error_type, any_value(left(csv_line, 160)) FROM {table} "
+                       "GROUP BY line, error_type ORDER BY line").fetchall()
+
+
+def _drop_rejects(con: duckdb.DuckDBPyConnection, *tables: str) -> None:
+    for t in tables:
+        con.execute(f"DROP TABLE IF EXISTS {t}")
+
+
+def _strict_pass(con: duckdb.DuckDBPyConnection, src: Path, names: list[str]) -> list[tuple[int, str, str]]:
+    """Structural anomalies of ``src`` under an RFC 4180 parser with the header's columns (nothing is stored)."""
+    if not names:
+        return []
+    opts = (f"delim=',', quote='\"', escape='\"', header=true, columns={_columns_sql(names)}, auto_detect=false, "
+            f"max_line_size=102400, strict_mode=true, null_padding=false, {_STRICT_REJECTS}")
+    _drop_rejects(con, "v3_strict_rej", "v3_strict_scan")
+    try:
+        con.execute(f"CREATE OR REPLACE TEMP TABLE v3_strict AS SELECT {_q(names[0])} AS c FROM read_csv('{src}', {opts})")
+    except duckdb.Error as e:  # e.g. mixed line endings: the whole file is anomalous for a strict parser
+        first = str(e).strip().splitlines()[0][:160]
+        return [(0, "STRICT PARSE FAILED", first)]
+    con.execute("DROP TABLE IF EXISTS v3_strict")
+    return _rejects(con, "v3_strict_rej")
+
+
+def _empty_quality() -> dict[str, Any]:
+    return {"physical_lines": 0, "rows_read": 0, "reader_dropped": {}, "strict_anomalies": {}, "samples": [],
+            "unreadable_timestamp_rows": 0, "repeated_headers": 0, "unreadable_price_rows": 0, "cast_failures": {},
+            "duplicates_removed": 0, "unaccounted_lines": 0}
+
+
+def _merge_quality(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
+    out = dict(a)
+    for k, v in b.items():
+        if isinstance(v, int):
+            out[k] = a.get(k, 0) + v
+        elif isinstance(v, dict):
+            d = dict(a.get(k, {}))
+            for kk, vv in v.items():
+                d[kk] = d.get(kk, 0) + vv
+            out[k] = d
+        elif isinstance(v, list):
+            out[k] = (list(a.get(k, [])) + v)[:MAX_QUALITY_SAMPLES]
+    return out
+
+
+def quality_issues(q: dict[str, Any]) -> int:
+    """Number of anomalies recorded (lines dropped or malformed, rows or cells that could not be read); 0 = clean."""
+    return (sum(q.get("reader_dropped", {}).values()) + sum(q.get("strict_anomalies", {}).values())
+            + q.get("unreadable_timestamp_rows", 0) + q.get("unreadable_price_rows", 0)
+            + sum(q.get("cast_failures", {}).values()) + abs(q.get("unaccounted_lines", 0)))
 
 
 # ---------------------------------------------------------------------------
@@ -179,10 +389,13 @@ def _canonical_select(schema: csv_adapter.SchemaInfo, rn_base: int) -> str:
 @dataclass
 class SyncResult:
     rel: str
-    action: str          # unchanged | append | rebuild | missing
+    action: str          # unchanged | append | rebuild | verified | missing | error
     new_rows: int = 0
     dups_removed: int = 0
     seconds: float = 0.0
+    reason: str | None = None
+    issues: int = 0      # quality_issues() of the lines read by this run
+    notes: list[str] = field(default_factory=list)
 
 
 def _connect(root: Path, cfg: AppConfig) -> duckdb.DuckDBPyConnection:
@@ -194,13 +407,22 @@ def _connect(root: Path, cfg: AppConfig) -> duckdb.DuckDBPyConnection:
     return con
 
 
-def _needs_full(prev: dict[str, Any] | None, csv_path: Path, size: int, header_sha: str) -> bool:
-    if prev is None or prev.get("csv_header_sha1") != header_sha:
-        return True
+def _rebuild_reason(prev: dict[str, Any] | None, csv_path: Path, size: int, header_sha: str) -> str | None:
+    """Why the dataset cannot be extended incrementally (None when it can)."""
+    if prev is None:
+        return "first_build"
+    if prev.get("schema") != SCHEMA_VERSION:
+        return "schema_upgrade"
+    if prev.get("csv_header_sha1") != header_sha:
+        return "header_changed"
     off = prev["csv_offset"]
     if size < off:
-        return True
-    return _fingerprint(csv_path, off) != prev["csv_fingerprint"]
+        return "file_truncated"
+    if _fingerprint(csv_path, off) != prev["csv_fingerprint"]:
+        return "tail_fingerprint_mismatch"
+    if not _samples_match(csv_path, prev.get("csv_samples", [])):
+        return "sampled_fingerprint_mismatch"
+    return None
 
 
 def _write_segment(con, sql_select: str, dest: Path) -> int:
@@ -212,7 +434,8 @@ def _write_segment(con, sql_select: str, dest: Path) -> int:
 
 
 def sync_dataset(
-    con: duckdb.DuckDBPyConnection, cfg: AppConfig, rel: str, prev: dict[str, Any] | None, force_rebuild: bool = False,
+    con: duckdb.DuckDBPyConnection, cfg: AppConfig, rel: str, prev: dict[str, Any] | None,
+    force_rebuild: bool = False, verify: bool = False,
 ) -> tuple[dict[str, Any] | None, SyncResult]:
     t0 = time.perf_counter()
     root = cfg.v3.parquet_path
@@ -220,50 +443,72 @@ def sync_dataset(
     if not csv_path.exists():
         return prev, SyncResult(rel, "missing")
 
-    st = csv_path.stat()
-    size = st.st_size
+    size = csv_path.stat().st_size
     header_line = _read_header_line(csv_path)
     header_sha = _sha1(header_line)
     end = _last_newline_end(csv_path, size)
     # Fingerprint taken BEFORE reading: it describes the bytes we are about to consume.
     fp_before = _fingerprint(csv_path, end)
-    full = force_rebuild or _needs_full(prev, csv_path, size, header_sha)
+    reason = "forced" if force_rebuild else _rebuild_reason(prev, csv_path, size, header_sha)
+
+    # --verify: full SHA-256 of the prefix hashed last time, computed in the same pass as the new one.
+    verified: dict[str, Any] | None = None
+    if verify and reason is None:
+        old = prev.get("csv_sha256") or {}
+        _, sha_end, sha_old = _scan_prefix(csv_path, end, old.get("offset"))
+        if old and sha_old != old["sha256"]:
+            reason = "verify_mismatch"
+        else:
+            verified = {"offset": end, "sha256": sha_end, "verified_at": _now()}
+
+    full = reason is not None
     if not full and end <= prev["csv_offset"]:
+        if verified:
+            state = prev if verified == prev.get("csv_sha256") else {**prev, "csv_sha256": verified}
+            return state, SyncResult(rel, "verified", seconds=time.perf_counter() - t0)
         return prev, SyncResult(rel, "unchanged", seconds=time.perf_counter() - t0)
 
     ddir = dataset_dir(root, rel)
     ddir.mkdir(parents=True, exist_ok=True)
     schema = csv_adapter.inspect(csv_path)
-    raw_columns = schema.raw_columns
+    names = _header_names(header_line)
+    quality = _empty_quality()
 
     if full:
-        rn_base, segments_prev, existing = 0, [], []
+        rn_base, segments_prev, existing, lines_before = 0, [], [], 0
         src_path = csv_path
         snapshot = None
         # Files that can change under us (in-place appends) are small: snapshot the
         # consistent prefix. Large files are replaced atomically by the extractor.
         if size < (1 << 30):
             snapshot = root / ".tmp" / f"{ddir.name}.full.csv"
-            with csv_path.open("rb") as fi, snapshot.open("wb") as fo:
-                remaining = end
-                while remaining > 0:
-                    b = fi.read(min(1 << 20, remaining)); fo.write(b); remaining -= len(b)
+            _copy_range(csv_path, snapshot, 0, end)
             src_path = snapshot
+        newlines, sha_end, _ = _scan_prefix(src_path, end)
+        quality["physical_lines"] = max(0, newlines - 1)
+        verified = {"offset": end, "sha256": sha_end, "verified_at": _now()}
     else:
         rn_base, segments_prev = prev["n_parsed"], list(prev["segments"])
         existing = [str(ddir / s["file"]) for s in segments_prev]
+        lines_before = prev.get("csv_lines", prev["n_parsed"])
         snapshot = root / ".tmp" / f"{ddir.name}.tail.csv"
-        with csv_path.open("rb") as fi, snapshot.open("wb") as fo:
-            fo.write(header_line)
-            fi.seek(prev["csv_offset"])
-            remaining = end - prev["csv_offset"]
-            while remaining > 0:
-                b = fi.read(min(1 << 20, remaining)); fo.write(b); remaining -= len(b)
+        quality["physical_lines"] = _copy_range(csv_path, snapshot, prev["csv_offset"], end, prefix=header_line)
         src_path = snapshot
 
-    sel = _canonical_select(schema, rn_base)
-    con.execute(f"CREATE OR REPLACE TEMP TABLE t AS SELECT {sel} FROM read_csv('{src_path}', {_CSV_OPTS})")
+    # Strict pass: structural anomalies with their line numbers (in the CSV file, header = line 1).
+    strict = _strict_pass(con, src_path, names)
+    for line, err, text in strict:
+        quality["strict_anomalies"][err] = quality["strict_anomalies"].get(err, 0) + 1
+        quality["samples"].append({"line": int(line) + lines_before if line else None, "error": err, "text": text})
+
+    # Tolerant read (V1/V2 options): what is converted.
+    sel, helpers = _canonical_select(schema, rn_base)
+    _drop_rejects(con, "v3_tol_rej", "v3_tol_scan")
+    opts = (f"{_CSV_OPTS_EXPLICIT}, columns={_columns_sql(names)}" if names and len(set(names)) == len(names)
+            else _CSV_OPTS)
+    con.execute(f"CREATE OR REPLACE TEMP TABLE t AS SELECT {sel} FROM read_csv('{src_path}', {opts}, {_TOLERANT_REJECTS})")
     n_parsed_new = con.execute("SELECT count(*) FROM t").fetchone()[0]
+    dropped = _rejects(con, "v3_tol_rej")
 
     # A full rebuild reads the live file directly when it is large: drop a trailing
     # partial line, which is always the last parsed row.
@@ -271,25 +516,50 @@ def sync_dataset(
         con.execute("DELETE FROM t WHERE rn = (SELECT max(rn) FROM t)")
         n_parsed_new -= 1
 
-    # Drop rows with an unparsable timestamp, then de-duplicate swap events.
-    con.execute("CREATE OR REPLACE TEMP TABLE v AS SELECT * FROM t WHERE ts IS NOT NULL")
+    for line, err, text in dropped:
+        quality["reader_dropped"][err] = quality["reader_dropped"].get(err, 0) + 1
+        quality["samples"].append({"line": int(line) + lines_before, "error": f"dropped: {err}", "text": text})
+    quality["rows_read"] = n_parsed_new
+    quality["unaccounted_lines"] = quality["physical_lines"] - n_parsed_new - len({line for line, _, _ in dropped})
+
+    bad_cols = [h for h in helpers if h.startswith("_bad_") and h != "_bad_ts"]
+    ts_name = schema.mapping.get("timestamp") or ""
+    bad_price = " OR ".join(f"_bad_{c}" for c in _PRICE_COLUMNS if f"_bad_{c}" in bad_cols) or "FALSE"
+    counts = con.execute(
+        "SELECT count(*) FILTER (WHERE ts IS NULL), count(*) FILTER (WHERE ts IS NULL AND trim(_ts_raw) = ?), "
+        f"count(*) FILTER (WHERE ts IS NOT NULL AND ({bad_price}))"
+        + "".join(f", count(*) FILTER (WHERE ts IS NOT NULL AND {b})" for b in bad_cols) + " FROM t", [ts_name]).fetchone()
+    quality["unreadable_timestamp_rows"], quality["repeated_headers"], quality["unreadable_price_rows"] = counts[:3]
+    quality["cast_failures"] = {b.removeprefix("_bad_"): n for b, n in zip(bad_cols, counts[3:]) if n}
+    if bad_cols and any(counts[3:]):
+        any_bad = " OR ".join(bad_cols)
+        for rn, *flags in con.execute(f"SELECT rn, {', '.join(bad_cols)} FROM t WHERE ts IS NOT NULL AND ({any_bad}) "
+                                      "ORDER BY rn LIMIT 5").fetchall():
+            cols_bad = [b.removeprefix("_bad_") for b, f in zip(bad_cols, flags) if f]
+            quality["samples"].append({"row": int(rn), "error": "unconvertible cell", "text": ", ".join(cols_bad)})
+
+    proxies = [r[0] for r in con.execute("SELECT DISTINCT _proxy FROM t WHERE _proxy IS NOT NULL LIMIT 3").fetchall()]
+
+    # Rows kept: a readable timestamp and, as V1/V2 did when a price cell fails to parse, a readable price.
+    con.execute(f"CREATE OR REPLACE TEMP TABLE v AS SELECT * EXCLUDE ({', '.join(helpers)}), {_EVENT_KEY} AS ev "
+                f"FROM t WHERE ts IS NOT NULL AND NOT ({bad_price})")
     n_valid = con.execute("SELECT count(*) FROM v").fetchone()[0]
     if not full and existing and n_valid:
         # Events already stored (boundary overlap between two extractions).
         min_ts = con.execute("SELECT min(ts) FROM v").fetchone()[0]
         con.execute(
-            f"DELETE FROM v WHERE tx_hash IS NOT NULL AND log_index IS NOT NULL AND (tx_hash, log_index) IN "
-            f"(SELECT (tx_hash, log_index) FROM read_parquet({existing!r}) WHERE ts >= ?::TIMESTAMPTZ - INTERVAL 1 DAY)",
+            f"DELETE FROM v WHERE ev IS NOT NULL AND ev IN (SELECT {_EVENT_KEY} FROM read_parquet({existing!r}) "
+            "WHERE ts >= ?::TIMESTAMPTZ - INTERVAL 1 DAY)",
             [min_ts],
         )
     con.execute(
-        "CREATE OR REPLACE TEMP TABLE k AS SELECT * EXCLUDE (dup_rk) FROM ("
-        " SELECT *, CASE WHEN tx_hash IS NOT NULL AND log_index IS NOT NULL"
-        "  THEN row_number() OVER (PARTITION BY tx_hash, log_index ORDER BY rn) ELSE 1 END AS dup_rk FROM v)"
-        " WHERE dup_rk = 1"
+        "CREATE OR REPLACE TEMP TABLE k AS SELECT * EXCLUDE (dup_rk, ev) FROM ("
+        " SELECT *, CASE WHEN ev IS NOT NULL THEN row_number() OVER (PARTITION BY ev ORDER BY rn) ELSE 1 END AS dup_rk"
+        " FROM v) WHERE dup_rk = 1"
     )
     n_kept = con.execute("SELECT count(*) FROM k").fetchone()[0]
     dups = n_valid - n_kept
+    quality["duplicates_removed"] = dups
 
     seq = 1 + max([int(s["file"][4:10]) for s in segments_prev], default=0)
     segments = segments_prev
@@ -312,25 +582,49 @@ def sync_dataset(
 
     if snapshot is not None and snapshot.exists():
         snapshot.unlink()
+    for tbl in ("t", "v", "k"):
+        con.execute(f"DROP TABLE IF EXISTS {tbl}")
+
+    notes: list[str] = []
+    chainlink = dict((prev or {}).get("chainlink") or {}) if not full or reason != "schema_upgrade" else {}
+    if proxies:
+        if len(proxies) > 1:
+            notes.append(f"several feed_proxy_address values {proxies}: phase switches not tracked")
+            chainlink = {}
+        elif chainlink.get("proxy") not in (None, proxies[0]):
+            notes.append(f"feed proxy changed from {chainlink['proxy']} to {proxies[0]}")
+            chainlink = {"proxy": proxies[0]}
+        else:
+            chainlink["proxy"] = proxies[0]
 
     state = {
+        "schema": SCHEMA_VERSION,
         "csv_name": csv_path.name,
-        "raw_columns": raw_columns,
+        "raw_columns": schema.raw_columns,
         "mapping": schema.mapping,
         "tvl_unit": schema.tvl_unit,
         "csv_header_sha1": header_sha,
         "csv_offset": end,
         "csv_fingerprint": fp_before,
+        "csv_samples": (_samples(csv_path, 0, end) if full else
+                        prev.get("csv_samples", []) + _samples(csv_path, prev["csv_offset"], end)),
+        "csv_sha256": verified if verified else prev.get("csv_sha256"),
+        "csv_lines": lines_before + quality["physical_lines"],
         "n_parsed": rn_base + n_parsed_new,
         "n_rows": int(n_rows),
         "dups_removed": (0 if full else prev.get("dups_removed", 0)) + dups,
+        "quality": quality if full else _merge_quality(prev.get("quality") or _empty_quality(), quality),
         "min_ts": lo.isoformat() if lo else None,
         "max_ts": hi.isoformat() if hi else None,
         "segments": segments,
+        "last_change": {"at": _now(), "action": "rebuild" if full else "append", "reason": reason},
     }
+    if chainlink:
+        state["chainlink"] = chainlink
     # A live file that changed while we were converting it is picked up by the next run.
     action = "rebuild" if full else "append"
-    return state, SyncResult(rel, action, new_rows=n_kept, dups_removed=dups, seconds=time.perf_counter() - t0)
+    return state, SyncResult(rel, action, new_rows=n_kept, dups_removed=dups, seconds=time.perf_counter() - t0,
+                             reason=reason, issues=quality_issues(quality), notes=notes)
 
 
 def all_relative_paths() -> list[str]:
@@ -355,35 +649,97 @@ def _cleanup_orphans(root: Path, manifest: dict[str, Any], grace_seconds: int = 
             seg.unlink()
 
 
+# ---------------------------------------------------------------------------
+# Chainlink phase switches
+# ---------------------------------------------------------------------------
+
+def _refresh_phases(cfg: AppConfig, datasets: dict[str, Any], rpc: chainlink_phases.Rpc | None,
+                    only: str | None) -> tuple[bool, list[dict[str, Any]], list[str]]:
+    """Bring the phase table of every Chainlink dataset up to the chain head.
+
+    Returns (switches changed, log entries, messages). Without a node the tables are kept as they are.
+    """
+    targets = [rel for rel, d in datasets.items() if (d.get("chainlink") or {}).get("proxy") and (not only or only in rel)]
+    if not targets:
+        return False, [], []
+    if rpc is None:
+        url = os.environ.get(cfg.v3.rpc_url_env, "")
+        if not url:
+            for rel in targets:
+                datasets[rel]["chainlink"]["status"] = "rpc_not_configured"
+            return False, [], [f"WARNING ${cfg.v3.rpc_url_env} is not set: Chainlink phase switches not checked "
+                               f"({len(targets)} feeds)"]
+        rpc = chainlink_phases.Rpc(url)
+    changed, log, msgs = False, [], []
+    for rel in targets:
+        cl = datasets[rel]["chainlink"]
+        try:
+            new = chainlink_phases.refresh(cl, cl["proxy"], rpc)
+        except chainlink_phases.RpcError as e:
+            cl["status"] = f"rpc_error: {e}"
+            msgs.append(f"WARNING {rel}: Chainlink phases not checked ({e}); keeping the table of "
+                        f"{cl.get('verified_ts') or 'never'}")
+            continue
+        before = {s["phase"] for s in cl.get("switches", [])}
+        for s in new["switches"]:
+            if s["phase"] not in before:
+                changed = True
+                log.append({"at": _now(), "dataset": rel, "action": "chainlink_phase_switch", "proxy": new["proxy"],
+                            "phase": s["phase"], "block": s["block"], "block_ts": s["ts"]})
+        datasets[rel]["chainlink"] = {**new, "status": "ok"}
+    msgs.append(f"Chainlink phases checked for {len(targets)} feeds ({rpc.calls} RPC calls)")
+    return changed, log, msgs
+
+
 def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: bool = False,
-             dry_run: bool = False) -> list[SyncResult]:
+             dry_run: bool = False, verify: bool = False,
+             rpc: chainlink_phases.Rpc | None = None) -> list[SyncResult]:
     cfg = cfg or get_config()
     root = cfg.v3.parquet_path
     root.mkdir(parents=True, exist_ok=True)
     results: list[SyncResult] = []
     with (root / ".sync.lock").open("w") as lock:
         try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            # A --verify run (weekly timer) waits for the regular sync instead of failing.
+            fcntl.flock(lock, fcntl.LOCK_EX if verify else fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit("another sync is already running")
         manifest = load_manifest(root)
         datasets = dict(manifest["datasets"])
         con = _connect(root, cfg)
         changed = False
+        log: list[dict[str, Any]] = []
         for rel in all_relative_paths():
             if only and only not in rel:
                 continue
             if dry_run:
                 continue
-            state, res = sync_dataset(con, cfg, rel, datasets.get(rel), force_rebuild=rebuild)
+            prev = datasets.get(rel)
+            try:
+                state, res = sync_dataset(con, cfg, rel, prev, force_rebuild=rebuild, verify=verify)
+            except Exception as e:  # one unreadable file must not stop the others; its previous state is kept
+                first = (str(e).strip().splitlines() or [""])[0][:200]
+                state, res = prev, SyncResult(rel, "error", notes=[f"sync failed, previous state kept: "
+                                                                   f"{type(e).__name__}: {first}"])
             results.append(res)
-            if state is not None and res.action in ("append", "rebuild"):
+            if state is not None and res.action in ("append", "rebuild", "verified"):
                 datasets[rel] = state
                 changed = True
+                if res.action != "verified":
+                    log.append({"at": _now(), "dataset": rel, "action": res.action, "reason": res.reason,
+                                "rows_before": (prev or {}).get("n_rows", 0), "rows_after": state["n_rows"],
+                                "new_rows": res.new_rows, "duplicates_removed": res.dups_removed,
+                                "quality_issues": res.issues})
                 # Publish progressively so a crash never loses converted datasets.
                 _write_manifest(root, datasets)
-        if changed:
+        phases_changed, phase_log, msgs = (False, [], []) if dry_run else _refresh_phases(cfg, datasets, rpc, only)
+        results.append(SyncResult("chainlink phases", "checked", notes=msgs))
+        log.extend(phase_log)
+        if changed or phases_changed or any((d.get("chainlink") or {}).get("status") for d in datasets.values()):
             manifest = _write_manifest(root, datasets)
+        for e in log:
+            e["version"] = manifest.get("version")
+        _append_log(root, log)
         _cleanup_orphans(root, manifest)
     return results
 
@@ -391,10 +747,23 @@ def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: boo
 def main() -> None:
     ap = argparse.ArgumentParser(description="Sync the V3 Parquet store from the CSV datasets.")
     ap.add_argument("--rebuild", action="store_true", help="force a full rebuild of the selected datasets")
+    ap.add_argument("--verify", action="store_true",
+                    help="also compare a full SHA-256 of the CSV bytes consumed so far (reads every file once)")
     ap.add_argument("--only", help="only datasets whose relative path contains this text")
     args = ap.parse_args()
-    for r in run_sync(only=args.only, rebuild=args.rebuild):
-        print(f"{r.action:9s} {r.rel:40s} +{r.new_rows:>9,} rows  dups_removed={r.dups_removed:<4d} {r.seconds:6.1f}s", flush=True)
+    for r in run_sync(only=args.only, rebuild=args.rebuild, verify=args.verify):
+        if r.rel == "chainlink phases":
+            for m in r.notes:
+                print(m, flush=True)
+            continue
+        why = f" ({r.reason})" if r.reason else ""
+        print(f"{r.action:9s} {r.rel:40s} +{r.new_rows:>9,} rows  dups_removed={r.dups_removed:<4d} "
+              f"{r.seconds:6.1f}s{why}", flush=True)
+        if r.issues:
+            print(f"WARNING {r.rel}: {r.issues} line(s) or cell(s) not stored as they are in the CSV; "
+                  "see quality in /v3/datasets", flush=True)
+        for n in r.notes:
+            print(f"WARNING {r.rel}: {n}", flush=True)
 
 
 if __name__ == "__main__":
