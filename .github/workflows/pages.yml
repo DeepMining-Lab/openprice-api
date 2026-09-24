@@ -1,5 +1,5 @@
 # Publishes the web explorer (interface-api/: index.html + favicon.svg) to GitHub Pages:
-# https://deepmining-lab.github.io/openprice-api/
+# https://openprice-explorer.deepmining.ch/ (custom domain; the github.io URL redirects to it)
 # Only that folder is published, not the rest of the repository. The FastAPI app keeps
 # serving the same file at /ui.
 # One-time setup: Settings → Pages → Build and deployment → Source: "GitHub Actions".

@@ -776,13 +776,15 @@ excepted.
 
 ### Public explorer (GitHub Pages)
 
-The same file is published at **https://deepmining-lab.github.io/openprice-api/** by
-`.github/workflows/pages.yml`, on every push to `main` that changes `interface-api/`
-(only that folder is published). One-time setup: *Settings → Pages → Build and
-deployment → Source: GitHub Actions*.
+The same file is published at **https://openprice-explorer.deepmining.ch/** (custom
+domain of the GitHub Pages site; https://deepmining-lab.github.io/openprice-api/ redirects
+to it) by `.github/workflows/pages.yml`, on every push to `main` that changes
+`interface-api/` (only that folder is published). One-time setup: *Settings → Pages →
+Build and deployment → Source: GitHub Actions*.
 
-That page calls the API through the gateway, so it needs a gateway API key (generate one
-with `POST /api-keys/generate`, see https://gateway.deepmining.ch/docs/):
+That page calls the API through the gateway, so it needs a gateway API key. During the
+test phase, keys are given on request through the contact form of the OpenPrice site,
+https://fair.deepmining.ch/contact (the **Request a key** link of the page opens it):
 
 - paste it in the **API key** field; the status dot then reads `ok`, `key required`
   (401) or `invalid key` (403);
