@@ -589,8 +589,11 @@ class TestVersions:
         m = sync_mod.load_manifest(v3cfg.v3.parquet_path)
         assert m["version"] != v1 and sync_mod.load_history(v3cfg.v3.parquet_path, v1)["version"] == v1
         log = [json.loads(line) for line in sync_mod.sync_log_path(v3cfg.v3.parquet_path).read_text().splitlines()]
-        pool = [(e["action"], e["reason"], e["version"]) for e in log if e["dataset"] == POOL_REL]
+        pool = [(e["action"], e["reason"], e["version"]) for e in log
+                if e["dataset"] == POOL_REL and e["action"] in ("rebuild", "append")]
         assert pool == [("rebuild", "first_build", v1), ("append", None, m["version"])]
+        natives = [e["file"] for e in log if e["dataset"] == POOL_REL and e["action"] == "native_copy"]
+        assert len(natives) == 2 and natives[-1] == m["datasets"][POOL_REL]["native"]  # one copy per data version
         store_mod.reset_store(); service_mod.reset_service()
         with TestClient(app) as client:
             r = client.get("/v3/prices/LINK/at", params={"timestamp": "2024-01-01T00:10:00Z"}).json()
@@ -1192,3 +1195,47 @@ class TestBatchedQuietPools:
             assert bulk.probe(POOL_REL, t, ["px_usd"], "vol_usd") == st.probe(POOL_REL, t, ["px_usd"], "vol_usd")
             assert bulk.as_of(POOL_REL, t, ["px_usd"]) == st.as_of(POOL_REL, t, ["px_usd"])
         assert st.probe(POOL_REL, points[0], ["px_usd"], "vol_usd").row is not None
+
+
+class TestNativeCopies:
+    def test_reads_from_the_native_copy_equal_the_parquet_reads(self, v3cfg):
+        _simple_link(v3cfg)
+        native = store_mod.Store(v3cfg)
+        d = native.dataset(POOL_REL)
+        assert d.native and d.native == sync_mod.load_manifest(v3cfg.v3.parquet_path)["datasets"][POOL_REL]["native"]
+        v3cfg.v3.native_store = False
+        parquet = store_mod.Store(v3cfg)
+        assert parquet.dataset(POOL_REL).native is None
+        cols = ["px_usd", "vol_usd", "tvl", "block_number", "log_index", "rn"]
+        for m in (0, 5, 19, 60):
+            t = T0 + timedelta(minutes=m)
+            assert native.probe(POOL_REL, t, cols, "vol_usd") == parquet.probe(POOL_REL, t, cols, "vol_usd")
+            assert native.window(POOL_REL, T0, t, cols) == parquet.window(POOL_REL, T0, t, cols)
+            assert native.price_stats(POOL_REL, "px_usd", T0, t) == parquet.price_stats(POOL_REL, "px_usd", T0, t)
+            assert native.tx_hash_of(POOL_REL, T0, 1) == parquet.tx_hash_of(POOL_REL, T0, 1)
+
+    def test_a_stale_or_missing_copy_falls_back_to_parquet(self, v3cfg):
+        _simple_link(v3cfg)
+        mp = sync_mod.manifest_path(v3cfg.v3.parquet_path)
+        m = json.loads(mp.read_text())
+        m["datasets"][POOL_REL]["native"] = "native-0000000000000000.duckdb"  # not the copy of these segments
+        mp.write_text(json.dumps(m))
+        st = store_mod.Store(v3cfg)
+        assert st.dataset(POOL_REL).native is None and st.as_of(POOL_REL, T0 + timedelta(minutes=5), ["px_usd"])
+
+    def test_new_data_gets_a_new_copy_and_the_old_one_is_cleaned_up(self, v3cfg):
+        _simple_link(v3cfg)
+        root = v3cfg.v3.parquet_path
+        first = sync_mod.load_manifest(root)["datasets"][POOL_REL]["native"]
+        new = _pool_rows(3, start=T0 + timedelta(hours=1))
+        for i, r in enumerate(new):
+            r[5], r[6] = 2000 + i, f"0x{100 + i:064x}"
+        _append(Path(v3cfg.paths.datasets_root) / POOL_REL, new)
+        sync_mod.run_sync(v3cfg)
+        second = sync_mod.load_manifest(root)["datasets"][POOL_REL]["native"]
+        ddir = sync_mod.dataset_dir(root, POOL_REL)
+        assert second != first and (ddir / first).exists() and (ddir / second).exists()
+        st = store_mod.Store(v3cfg)
+        assert st.as_of(POOL_REL, T0 + timedelta(hours=2), ["px_usd"])["ts"] == T0 + timedelta(hours=1, minutes=2)
+        sync_mod._cleanup_orphans(root, sync_mod.load_manifest(root), grace_seconds=0)
+        assert not (ddir / first).exists() and (ddir / second).exists()

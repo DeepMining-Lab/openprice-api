@@ -241,10 +241,16 @@ class V3Config(BaseModel):
     rpc_url_env: str = "OPENPRICE_RPC_URL"
     cache_size: int = 4096            # LRU entries for point responses (0 disables)
     duckdb_threads: int = 4
+    # DuckDB buffer pool of each API worker process: blocks of the native copies read stay cached up to this size
+    # (the OS page cache is shared by the workers besides).
+    duckdb_memory_limit: str = "1GB"
     range_workers: int = 8            # threads computing the points of one range request in parallel
     # Range requests read the per-point lookups (as-of rows, 24 h volumes) of all their timestamps in bulk
     # (app.v3.batch); false = one query per point, as /prices/{asset}/at. Never used in legacy mode.
     batch_ranges: bool = True
+    # Read each dataset from its native DuckDB copy written by the sync (2-3x faster than Parquet); false, or a copy
+    # missing or stale, reads the Parquet segments. The sync writes the copies only when true.
+    native_store: bool = True
     batch_workers: int = 6            # threads per range request with bulk lookups (much of the rest is Python)
     manifest_poll_seconds: float = 5.0
     max_segments_before_compaction: int = 30

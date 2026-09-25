@@ -23,6 +23,10 @@ containers). This module derives a query-friendly copy under ``v3.parquet_root``
 * the extraction head of every file (how far the extractor had scanned the chain on its last run, read from the
   ``extraction_timestamp_utc`` / ``node_head_block_at_extraction`` columns of the last rows) is kept in the manifest:
   it is the data coverage the API reports (``beyond_data_coverage``);
+* every dataset also gets a native DuckDB copy of its segments (``native-<hash>.duckdb``, one table in (ts, rn)
+  order, ``v3.native_store``): the API reads it 2 to 3 times faster than the Parquet files. It is derived from the
+  segments only, named after them (a new name whenever they change) and written once, atomically; the Parquet
+  segments stay the reference, and the API falls back to them when the copy is missing or stale;
 * ``manifest.json`` is swapped atomically and every published version is also kept in
   ``history/<version>.json.gz``; ``sync_log.jsonl`` records each rebuild, append and phase
   switch with its reason. The API reloads the manifest when it changes.
@@ -689,13 +693,86 @@ def all_relative_paths() -> list[str]:
 
 
 def _cleanup_orphans(root: Path, manifest: dict[str, Any], grace_seconds: int = 3600) -> None:
+    """Delete segments and native copies no longer named by the manifest, an hour after they were written (an API
+    process may still be reading the previous version; an open file stays readable after it is unlinked)."""
     keep = {
         str(dataset_dir(root, rel) / s["file"]) for rel, d in manifest["datasets"].items() for s in d["segments"]
     }
+    keep |= {str(dataset_dir(root, rel) / d["native"]) for rel, d in manifest["datasets"].items() if d.get("native")}
     now = time.time()
-    for seg in root.glob("*/seg-*.parquet"):
-        if str(seg) not in keep and now - seg.stat().st_mtime > grace_seconds:
-            seg.unlink()
+    for f in [*root.glob("*/seg-*.parquet"), *root.glob("*/native-*.duckdb"), *root.glob("*/.native-*.tmp*")]:
+        if str(f) not in keep and now - f.stat().st_mtime > grace_seconds:
+            f.unlink()
+
+
+# ---------------------------------------------------------------------------
+# Native DuckDB copy of a dataset (what the API reads)
+# ---------------------------------------------------------------------------
+
+NATIVE_TABLE = "t"
+
+
+def native_name(d: dict[str, Any]) -> str | None:
+    """File name of the native DuckDB copy of a dataset: a hash of what identifies its data (segment list, CSV bytes
+    consumed and their fingerprint, rows, time of the last append or rebuild). A rebuild can reuse a segment file
+    name with the same row count, so the segment list alone is not enough: any data change gives a new name and a
+    copy never outlives the data it was made from."""
+    if not d.get("segments"):
+        return None
+    identity = [d["segments"], d.get("csv_offset"), d.get("csv_fingerprint"), d.get("n_rows"),
+                (d.get("last_change") or {}).get("at")]
+    digest = hashlib.sha1(json.dumps(identity, sort_keys=True, default=str).encode()).hexdigest()[:16]
+    return f"native-{digest}.duckdb"
+
+
+def build_native(root: Path, rel: str, d: dict[str, Any], threads: int) -> tuple[str | None, float]:
+    """Write, once, the native copy of the dataset (table ``t``: its segments in (ts, rn) order). Returns its name and
+    the seconds spent (0 when it already existed)."""
+    name = native_name(d)
+    if name is None:
+        return None, 0.0
+    ddir = dataset_dir(root, rel)
+    path = ddir / name
+    if path.exists():
+        return name, 0.0
+    t0 = time.perf_counter()
+    tmp = ddir / f".{name}.tmp"
+    for leftover in (tmp, Path(f"{tmp}.wal")):
+        if leftover.exists():
+            leftover.unlink()
+    files = [str(ddir / s["file"]) for s in d["segments"]]
+    con = duckdb.connect(str(tmp))
+    try:
+        con.execute(f"SET threads={max(1, threads)}; SET TimeZone='UTC'")
+        con.execute(f"CREATE TABLE {NATIVE_TABLE} AS SELECT * FROM read_parquet({files!r}) ORDER BY ts, rn")
+        con.execute("CHECKPOINT")
+    finally:
+        con.close()
+    os.replace(tmp, path)
+    return name, time.perf_counter() - t0
+
+
+def _refresh_natives(cfg: AppConfig, datasets: dict[str, Any], only: str | None) -> tuple[bool, list[dict[str, Any]],
+                                                                                           list[str]]:
+    """Give every dataset an up-to-date native copy. Returns (manifest changed, log entries, messages)."""
+    changed, log, msgs = False, [], []
+    for rel, d in datasets.items():
+        if only and only not in rel:
+            continue
+        try:
+            name, seconds = build_native(cfg.v3.parquet_path, rel, d, cfg.v3.duckdb_threads)
+        except Exception as e:  # the API keeps reading the Parquet segments of this dataset
+            first = (str(e).strip().splitlines() or [""])[0][:200]
+            msgs.append(f"WARNING {rel}: native copy not built ({type(e).__name__}: {first}); Parquet is read instead")
+            name, seconds = None, 0.0
+        if name != d.get("native"):
+            datasets[rel] = {**d, "native": name}
+            changed = True
+        if seconds:
+            log.append({"at": _now(), "dataset": rel, "action": "native_copy", "file": name,
+                        "rows": d.get("n_rows"), "seconds": round(seconds, 1)})
+            msgs.append(f"native    {rel:40s} {d.get('n_rows', 0):>10,} rows  {seconds:6.1f}s")
+    return changed, log, msgs
 
 
 # ---------------------------------------------------------------------------
@@ -794,6 +871,11 @@ def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: boo
         phases_changed, phase_log, msgs = (False, [], []) if dry_run else _refresh_phases(cfg, datasets, rpc, only)
         results.append(SyncResult("chainlink phases", "checked", notes=msgs))
         log.extend(phase_log)
+        if cfg.v3.native_store and not dry_run:
+            natives_changed, native_log, native_msgs = _refresh_natives(cfg, datasets, only)
+            changed = changed or natives_changed
+            log.extend(native_log)
+            results.append(SyncResult("native copies", "checked", notes=native_msgs))
         if changed or phases_changed or any((d.get("chainlink") or {}).get("status") for d in datasets.values()):
             manifest = _write_manifest(root, datasets)
         for e in log:
@@ -811,7 +893,7 @@ def main() -> None:
     ap.add_argument("--only", help="only datasets whose relative path contains this text")
     args = ap.parse_args()
     for r in run_sync(only=args.only, rebuild=args.rebuild, verify=args.verify):
-        if r.rel == "chainlink phases":
+        if r.rel in ("chainlink phases", "native copies"):
             for m in r.notes:
                 print(m, flush=True)
             continue

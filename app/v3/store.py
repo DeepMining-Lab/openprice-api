@@ -2,7 +2,8 @@
 
 * a single in-process DuckDB database, one cursor per thread (cursors share the
   database instance, its Parquet metadata cache and buffer pool);
-* one view per dataset over its immutable segments;
+* one view per dataset: over its native DuckDB copy (``native-<hash>.duckdb``, attached read-only; 2 to 3 times
+  faster than Parquet) when the manifest names an up-to-date one, else over its immutable Parquet segments;
 * every lookup is an indexed range query on the sorted ``ts`` column (row-group
   min/max pruning), never a file scan;
 * ties on the same timestamp resolve to the first swap of the block, by on-chain order
@@ -19,6 +20,7 @@ views are rebuilt and dependent caches are invalidated through ``store.version``
 
 from __future__ import annotations
 
+import hashlib
 import threading
 import time
 from dataclasses import dataclass, field
@@ -60,6 +62,7 @@ class DatasetInfo:
     chainlink: dict[str, Any] = field(default_factory=dict)   # proxy, switches, verified_ts, status
     phases: PhaseTable | None = None                          # None: no switch table for this feed
     extraction_head: datetime | None = None                   # chain time the last extraction of the file reached
+    native: str | None = None                                 # native copy the view reads; None: Parquet segments
 
     def has(self, canonical: str) -> bool:
         return canonical in self.schema.mapping
@@ -119,12 +122,14 @@ class Store:
         self._coverage: dict[str, datetime] = {}
         self._manifest_mtime = 0.0
         self._last_poll = 0.0
+        self._attached: dict[str, int] = {}   # alias of an attached native copy -> last generation that used it
+        self._generation = 0
         self.version: str | None = None
         self.generated_at: str | None = None
         self._con = duckdb.connect()
         self._con.execute(
             f"SET threads={max(1, cfg.v3.duckdb_threads)}; SET TimeZone='UTC'; "
-            "SET parquet_metadata_cache=true; SET memory_limit='4GB'"
+            f"SET parquet_metadata_cache=true; SET memory_limit='{cfg.v3.duckdb_memory_limit}'"
         )
         self.reload(force=True)
 
@@ -138,7 +143,10 @@ class Store:
         if not force and mtime == self._manifest_mtime:
             return False
         manifest = sync_mod.load_manifest(self.root)
-        if not force and manifest.get("version") == self.version:
+        same_natives = all(
+            self._native_of(rel, d) == (self._datasets[rel].native if rel in self._datasets else None)
+            for rel, d in manifest["datasets"].items())
+        if not force and manifest.get("version") == self.version and same_natives:
             # Same data; only the Chainlink phase check (verified_ts, status) and the extraction heads can have moved.
             with self._lock:
                 for rel, d in manifest["datasets"].items():
@@ -151,14 +159,17 @@ class Store:
                 self._manifest_mtime = mtime
             return False
         with self._lock:
+            self._generation += 1
             datasets: dict[str, DatasetInfo] = {}
             for i, (rel, d) in enumerate(sorted(manifest["datasets"].items())):
                 ddir = sync_mod.dataset_dir(self.root, rel)
                 files = [str(ddir / s["file"]) for s in d["segments"]]
                 view = f"ds_{i}"
                 columns: frozenset[str] = frozenset()
+                native = self._native_of(rel, d)
                 if files:
-                    self._con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM read_parquet({files!r})")
+                    source = self._attach(rel, native) if native else f"read_parquet({files!r})"
+                    self._con.execute(f"CREATE OR REPLACE VIEW {view} AS SELECT * FROM {source}")
                     columns = frozenset(r[0] for r in self._con.execute(f"DESCRIBE {view}").fetchall())
                 pq_map = {c: CANON_TO_PQ[c] for c in d["mapping"] if c in CANON_TO_PQ}
                 schema = csv_adapter.SchemaInfo(
@@ -171,14 +182,45 @@ class Store:
                     view=view, schema=schema, columns=columns, file_version=d.get("file_version"),
                     chainlink=chainlink, phases=_phase_table(chainlink),
                     extraction_head=_parse_ts(d.get("extraction_head_utc")),
+                    native=native if files else None,
                 )
             self._datasets = datasets
+            self._detach_old()
             self._coverage = _coverage(datasets)
             self._quote_cache = {}
             self._manifest_mtime = mtime
             self.version = manifest.get("version")
             self.generated_at = manifest.get("generated_at")
         return True
+
+    # ------------------------------------------------------------ native copies
+    def _native_of(self, rel: str, d: dict[str, Any]) -> str | None:
+        """The native copy the view of ``rel`` should read: the one the manifest names, if it matches the current
+        segments and exists; None (read the Parquet segments) otherwise or with ``v3.native_store: false``."""
+        name = d.get("native")
+        if not (self.cfg.v3.native_store and name and name == sync_mod.native_name(d)):
+            return None
+        return name if (sync_mod.dataset_dir(self.root, rel) / name).exists() else None
+
+    def _attach(self, rel: str, name: str) -> str:
+        # The alias names the file (dataset directory + copy): two datasets can have identical segment lists.
+        path = sync_mod.dataset_dir(self.root, rel) / name
+        alias = "nat_" + hashlib.sha1(str(path).encode()).hexdigest()[:20]
+        if alias not in self._attached:
+            self._con.execute(f"ATTACH '{path}' AS {alias} (READ_ONLY)")
+        self._attached[alias] = self._generation
+        return f"{alias}.{sync_mod.NATIVE_TABLE}"
+
+    def _detach_old(self) -> None:
+        """Detach the copies no view has read for two reloads (a query started before the last reload may still use
+        the previous generation)."""
+        for alias, gen in list(self._attached.items()):
+            if gen < self._generation - 1:
+                try:
+                    self._con.execute(f"DETACH {alias}")
+                except duckdb.Error:
+                    continue
+                del self._attached[alias]
 
     def maybe_reload(self) -> bool:
         """Cheap poll (one stat every ``manifest_poll_seconds``) used on the request path."""

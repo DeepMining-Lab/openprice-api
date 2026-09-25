@@ -29,5 +29,9 @@ on another host, or if you ever reinstall this one. The validity fixes of 2026-0
    `systemctl enable --now openprice-v3-verify.timer`. It runs the sync with `--verify` (a full SHA-256 of the CSV
    bytes already converted, about 31 GB read once a week) and waits for a running sync instead of failing.
 
+The sync also writes a native DuckDB copy of each dataset next to its Parquet segments (about 2.1 GB in total,
+25 s for all files; `native_copy` lines in the log), which the API reads; old copies are deleted an hour after
+they are replaced.
+
 What a sync did, and why, is in `~/openprice/parquet/sync_log.jsonl` (one JSON line per rebuild, append and phase
 switch, with the resulting dataset version); `GET /v3/datasets` shows the per-file counters.

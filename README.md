@@ -8,6 +8,13 @@ CSV files → FastAPI → DuckDB (direct CSV reads) → JSON responses
 
 The API never imports data into a database. Every request triggers a direct DuckDB query against the CSV files on disk. There is no setup step beyond installing Python dependencies and pointing the config at your dataset directory.
 
+This describes `/v1` and `/v2`. `/v3` serves the same methodology from a derived, indexed copy of the CSV files, one
+to three orders of magnitude faster ([API V3](#api-v3-performance-engine)).
+
+**Try it:** the public explorer, **https://openprice-explorer.deepmining.ch/**, queries the API through the Deep
+Mining gateway (an API key is needed; see [Public explorer](#public-explorer-github-pages)). The same page is served
+by the API itself at `/ui`.
+
 ## Supported assets
 
 `ETH`, `LINK`, `UNI`, `AAVE`, `COMP`
@@ -815,10 +822,19 @@ written to a file of the repository or of the store; the API itself never calls 
   append to the CSVs (see `deploy/`).
 * Every published manifest is kept in `history/<version>.json.gz`, and `sync_log.jsonl` records each rebuild,
   append and Chainlink phase switch with its reason and the resulting version.
+* The API reads each dataset from a native DuckDB copy of its segments (`native-<hash>.duckdb` next to them, one
+  table in (ts, rn) order, `v3.native_store`), written by the sync after each data change (about 25 s for all 31
+  files, 7.5 s for the ETH/USDC pool; 2.1 GB). DuckDB reads its own format 2 to 3 times faster than Parquet: a
+  point request with confidence and provenance went from 56 to 26 ms (ETH), 47 to 23 ms (LINK), 104 to 43 ms
+  (AAVE), and 3 workers from 64 to about 100 uncached requests per second. The copy is named after the data it was
+  made from and attached read-only by every API worker; a missing or stale copy, or `native_store: false`, reads
+  the Parquet segments, which stay the reference (versions, history, quality). 300 random point requests and 20
+  ranges gave the same responses from both. Each worker caches the blocks it reads up to
+  `v3.duckdb_memory_limit` (1 GB).
 * The API polls the manifest (`v3.manifest_poll_seconds`) and reloads it without restart; the LRU cache key
   includes the dataset version, so it can never serve a stale price after a sync.
-* Range endpoints run the same per-point engine in parallel (`v3.range_workers`, default 8; about 5 ms
-  per point on the 12-core host). A set-based ASOF-join version would be faster still and is not implemented.
+* Range endpoints read the per-point lookups of all their timestamps in bulk (see
+  [Ranges](#ranges-pagination-and-latency)) and compute the rest in parallel (`v3.batch_workers`, 6 threads).
 
 ## Installation
 
@@ -892,7 +908,9 @@ It lets you, without writing any `curl`:
 - pick an asset, granularity (`raw`/`minute`/`hour`/`day`) and timestamp, and
   switch between **V1**, **V2** and **V3** of the API (the info bubble next to the
   version selector explains the differences: V3 answers the V2 schema from the
-  fast Parquet engine described below, in ~0.05 s instead of 3 to 40 s);
+  fast engine described below, in ~0.03 s instead of 3 to 40 s). With V3 selected, the
+  **Source** / **Branch** options that V3 refuses (HTTP 422: `dex` with level 3,
+  `chainlink` with a DEX level) are disabled;
 - read the price with its branch level and `data_status` (colour-coded:
   *observé* / *reconstruit* / *rejeté* / *repli oracle*);
 - see the confidence gauge with the S_stat / S_liq / S_coh sub-scores (and the

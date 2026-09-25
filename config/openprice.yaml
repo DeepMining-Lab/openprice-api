@@ -100,7 +100,9 @@ v3:
   rpc_url_env: "OPENPRICE_RPC_URL"       # env variable with the Ethereum RPC URL; the sync reads the proxy phase switches with it
   cache_size: 4096                       # LRU of point responses, invalidated on every dataset_version change
   duckdb_threads: 4
+  duckdb_memory_limit: "1GB"             # DuckDB cache per API worker process (3 workers: ~3 GB at most)
   range_workers: 8                       # points of one range request computed in parallel
+  native_store: true                     # read the native DuckDB copy of each dataset built by the sync (Parquet = reference, fallback)
   batch_ranges: true                     # ranges and /compare read the per-point lookups of all their timestamps in bulk
   batch_workers: 6                       # threads per range request in that mode (measured: 2 best for lookups only, 8 for ETH windows)
   manifest_poll_seconds: 5
