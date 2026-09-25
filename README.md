@@ -576,11 +576,55 @@ sync that adds data (every 30 min with `deploy/`).
    whatever its phase. This moves S_coh, the level-3 fallback, the S_stat reference of a cross-rate, and the
    peg used to neutralize a stablecoin-quoted price, hence `price_usd` itself (by at most 0.057 % on the
    245 golden requests).
+5. **Four corrections of the source hierarchy** (2026-09-25), each with its `v3` key:
+   * `strict_source_filter: true`: `source=dex` stays on the DEX levels (0a, 0b, 1, 2) and returns an explicit
+     NULL when none answers. V1/V2 fell back to Chainlink, so `/compare` compared Chainlink with itself
+     (deviation 0) whenever no DEX source answered: 287 of 2 000 COMP rows in Jan–Feb 2024. Pairs that no source
+     can satisfy (`source=dex&branch=3`, `source=chainlink&branch=0a|0b|1|2`) and `branch=4` return 422.
+   * `raw_max_age_seconds: 3600`: a `raw` DEX price is never built from an observation more than 1 h before T,
+     whether it is the pool of a direct read or either leg of a cross-rate (rule `stale_observation`). V1/V2 only
+     required a swap in the last 30 days for a direct read, so a level `0a` "observed" price could be days old
+     (up to 4.7 days for LINK on a random sample, 18 % of the LINK `0a` answers older than 1 h), while a
+     cross-rate was bounded by the 1 h lag between its legs.
+   * `windowed_lag_check: "eth_leg"`: an `hour`/`day` cross-rate bounds the distance between the ETH/USD point read
+     and T by `cross_rate_max_lag_seconds`. V1/V2 compared the ETH/USD read with the token pool's last swap
+     *before* T, which rejected pools that had swaps in the window (82 of 85 such rejections for COMP on 120
+     random days), and the answer then fell to a lower level or to Chainlink.
+   * `no_swap_is_zero_volume: true`: a pool without any swap in the 24 h before T fails the 24 h volume rule
+     (0 USD < `seuil_vol_min_usd_24h`). V1/V2 skipped the check in that case, so a pool with no swap passed while
+     a pool with one small swap was a zombie.
+6. **Three smaller corrections** (2026-09-25):
+   * `windowed_eth_leg: "vwmp"`: an `hour`/`day` (and `minute`) cross-rate multiplies the TOKEN/ETH VWMP by the
+     ETH/USD VWMP of the same window (MAD-filtered, from the ETH/USD reference file of the point read), not by a
+     single ETH/USD swap at T. Both legs then aggregate the same window: `cross_rate_lag_seconds` is 0,
+     `eth_usd_leg_timestamp` is T and `eth_usd_leg_event` is null. An empty ETH/USD window falls back to the point
+     read. A `day` cross-rate is now a daily VWMP like a direct `day` price; it moves by 0.4–0.6 % at the median
+     (p90 about 2 %, up to 8 % on volatile days) and, as for a direct `day` price, S_coh compares this daily VWMP
+     with the Chainlink round at T (12:00), so `day` C values of cross-rates are lower on average (`hour`: no
+     material change).
+   * `/v3/compare` reports the price `/v3/prices` returns: `dex_price_usd` is peg-neutralized like the price S_coh
+     compares with Chainlink, with `dex_price_raw_in_quote`, `quote_currency` and `quote_currency_peg` next to it
+     (V1/V2 compared the raw price in the quote currency).
+   * `v2_oracle_coherence_label: false`: a level-3 confidence block has `coherence_mode: null`. V2 labels it
+     `oracle_only_staleness` although it computes no S_coh there. An oracle price has no confidence index.
 
 No other number is meant to differ; V3 only adds the [diagnostics](#diagnostics-added-by-v3) and the
 [range pagination](#ranges-pagination-and-latency) below. `v3.legacy_truncation: true` replays V1/V2 exactly
-((1), (2), CSV-order ties and rounds of every phase), which lets `tests/golden/compare_v3.py --legacy` prove that V3
-reproduces V2 (the only remaining differences are the windows containing the 110 duplicates).
+((1), (2), (5), (6), CSV-order ties and rounds of every phase), which lets `tests/golden/compare_v3.py --legacy` prove
+that V3 reproduces V2 (the only remaining differences are the windows containing the 110 duplicates).
+
+Two optimisations change no number: the viability checks of a candidate (as-of row, rows sharing its timestamp,
+24 h volume) are read in one query, and on windows expected to hold 2 000 swaps or more the MAD filter and the VWMP
+run inside DuckDB instead of materialising the swaps in Python (the Python formulas of V1/V2 remain the reference
+and the fallback when a cumulative volume is within 1e-9 of half the total). Measured against the previous V3 on
+the same host: ETH `raw` 66 → 49 ms, ETH `day` 119 → 74 ms, a year of ETH `day` points 13.4 → 4.1 s, a month of
+LINK `/compare` 8.3 → 6.5 s. Two more changes of the same kind: the transaction hash (a text column that costs a third of a
+lookup) is read only for the row that answers, when the provenance is built, and a file of at most 50 000 rows is
+read with one unbounded as-of query instead of the 1-day / 30-day / unbounded ladder. Measured over HTTP against
+the previous version: −8 to −25 % on LINK/AAVE/COMP point requests, −17 % on a series, −28 % on `/compare`; an
+ETH `raw` request with provenance (one candidate) is ~3 ms slower (it pays the extra read of its hash). An
+in-memory index of the timestamps was measured and not kept: knowing the as-of timestamp in advance does not make
+reading the row cheaper (the cost is decompressing its row group), so it only helps quiet pools.
 
 **Same-timestamp ties** return the first swap of the block, by on-chain order `(block_number, log_index)`. V1/V2
 reached the same swap through the CSV order: on the data of 2026-09-24 both rules pick the same row in each of the
@@ -604,7 +648,12 @@ several market-stress dates (LUNA, the Aug-2024 flash crash, the Mar-2023 USDC d
   number**: without the phase filter, 245/245 responses equal the capture taken before them
   (`v3_golden_base.jsonl`);
 * the phase filter changes 68 of the 245 responses: 42 prices through the peg (at most 0.057 %), 45 C values
-  (at most 0.014), 15 warning messages only; no source level, no `fragility_flag` and no null C changes.
+  (at most 0.014), 15 warning messages only; no source level, no `fragility_flag` and no null C changes;
+* the hierarchy corrections of 2026-09-25 change 17 of the 245 responses: 4 `raw` LINK/UNI prices that were
+  stale level `0a` observations (UNI on 2022-05-12: a 4.4 h old 3.9648 with C = 0.000 becomes a 0b 4.5371 with
+  C = 0.902) and 13 AAVE/COMP `hour`/`day` prices that now come from their level `0b` pool instead of level 1, 2
+  or Chainlink. The smaller corrections (6) then change 66 more: 60 windowed cross-rate prices through the ETH/USD
+  VWMP (0.68 % at the median, 3.4 % at most; no source level changes) and 6 level-3 `coherence_mode` labels.
   `v3_golden.jsonl` pins V3 as configured;
 * `tests/test_v3_oracle.py` recomputes S_stat and the day VWMP in plain Python from the stored rows on the dates
   of the validity audit (S_stat 0.840, 0.872 and 0.944 on 2022-05-12, 2024-08-05 and 2025-06-01, where V1/V2
@@ -628,7 +677,7 @@ curl  http://127.0.0.1:8000/v3/ready
 | `GET /v3/prices/{asset}/at` | point price (V2 schema plus the V3 diagnostics) |
 | `GET /v3/prices/{asset}` | time series (`raw` = one point per distinct swap timestamp of the winning source, or `minute|hour|day`) |
 | `GET /v3/confidence/{asset}/at` | V2 confidence breakdown: the confidence block of the default `/at` response |
-| `GET /v3/compare/{asset}` | DEX vs Chainlink over a range (`/v1/compare`, with the rounds the proxy served) |
+| `GET /v3/compare/{asset}` | DEX vs Chainlink over a range (`/v1/compare`, with the rounds the proxy served; the DEX price comes from levels 0a–2 only, null when none answers, and is peg-neutralized like `/v3/prices`) |
 | `GET /v3/datasets` | per CSV file: rows, dates, version, quality counters, Chainlink phase switches |
 | `GET /v3/datasets/versions/{version}` | the manifest published under a dataset version (every version is kept) |
 | `GET /v3/config`, `GET /v3/ready` | every parameter V3 uses, with `config_sha256`; readiness (503 until the store is built) |
@@ -655,8 +704,9 @@ They are additive: they never change a price, a score or a branch.
 | Code | Severity | When |
 |---|---|---|
 | `future_timestamp` | warning | `timestamp` is after the server time. The response is an explicit NULL: level `4`, `unavailable_reason: "future_timestamp"`, no confidence, never cached. Before this rule, a future date returned the last known price, even as a level `0a` "observed" price with a confidence score when it fell within 30 days of the last swap. |
-| `beyond_data_coverage` | warning | The requested time (or, for `minute`/`hour`/`day`, the end of the VWMP window) is after the last synced data of a folder the price depends on (source files and peg feed). The price is still returned (as-of rule) but is provisional: it can change after the next extraction. A folder's coverage is its latest synced observation. Each asset folder holds its Chainlink feed (1 h heartbeat), so its coverage trails the extraction run by at most about an hour; for the peg feeds (`stablecoins/`, 24 h heartbeat) it can trail by up to a day, which errs on the side of flagging. |
+| `beyond_data_coverage` | warning | The requested time (or, for `minute`/`hour`/`day`, the end of the VWMP window) is after the last synced data of a folder the price depends on (source files and peg feed). The price is still returned (as-of rule) but is provisional: it can change after the next extraction. A folder's coverage is how far its last synced extraction scanned the chain: the latest `extraction_head_utc` of its files (`GET /v3/datasets`), read by the sync from the `extraction_timestamp_utc` / `node_head_block_at_extraction` columns of the last CSV rows (for a swap, lowered to `block_timestamp_utc + (head block - block) x 12 s`). Before 2026-09-25 it was the folder's latest event, which trails the extraction by up to an hour for an asset folder and up to a day for the peg feeds (`stablecoins/`, 24 h heartbeat), and flagged prices that nothing could change. A price that uses the peg and falls after the daily stablecoin extraction (about 14:35 UTC) is still flagged: a deviation round published after it is not known yet. |
 | `fallback_explained` | info | The answer does not come from the first level of the hierarchy (or is level `4`). The message lists each rejected higher-priority candidate with the rule and the measured value. |
+| `oracle_stale` | warning | The price comes from Chainlink (level `3`, which has no confidence index: `C` and the sub-scores are null) and its round was published more than `heartbeat × (1 + v3.oracle_stale_tolerance)` before T, i.e. more than 3 960 s for the five asset feeds (heartbeat 3 600 s as declared by the extraction, `v3.oracle_heartbeat_seconds`; the V1 key `chainlink.heartbeat_seconds_by_asset` = 86 400 is kept for V1/V2 only). A feed publishes at least once per heartbeat, so a newer round should exist: the typical case is a request after the last synced data, before the day's extraction. Since 2022 consecutive rounds were more than 3 960 s apart only 2 to 4 times per feed (congestion of 2022-05-01). |
 | `chainlink_phase_unverified` | warning | A Chainlink feed read for this answer (S_coh, level 3, peg) had its phase switches last checked on-chain before `T` (a switch after that check would be missed), or has no switch table yet (then the rounds of every phase are read, as V2 does). |
 
 `provenance.rejected_candidates` lists every candidate file evaluated and not used, in evaluation order,
@@ -668,8 +718,9 @@ including siblings of the winning level (for example a zombie `0a` pool next to 
  "value": 7032.0, "threshold": 3600.0, "last_observation_utc": "2024-05-31T22:02:35Z"}
 ```
 
-Rules: `zombie_tvl`, `zombie_volume_24h`, `inactive` (no observation for `fenetre_inactivite_jours`),
-`cross_rate_lag`, `eth_leg_unavailable`, `no_observation` (nothing at or before T; for Chainlink, nothing in the
+Rules: `zombie_tvl`, `zombie_volume_24h` (also "no swap in the 24 h before T"), `inactive` (no observation for
+`fenetre_inactivite_jours`), `stale_observation` (a `raw` read older than `v3.raw_max_age_seconds`),
+`cross_rate_lag` (for `hour`/`day`, recorded on the ETH/USD reference file), `eth_leg_unavailable`, `no_observation` (nothing at or before T; for Chainlink, nothing in the
 phase the proxy served), `no_swaps_in_window` (windowed granularities, after R1 expansion), `missing_columns`,
 `dataset_missing`, `dataset_empty` (the CSV has a header and no data row: `eth/crvusd_weth_curve.csv` today, so
 the ETH level 2 cannot answer). The diagnostics go to the top-level `warnings` and, when there is a confidence
@@ -709,6 +760,18 @@ curl -s -D - -o page1.json "http://127.0.0.1:8000/v3/prices/ETH?start=2024-03-01
   copies (35 % of the ETH/USDC rows on 2024-03-01, 37 % over 2024). It also lets each page start exactly
   where the previous one stopped. `/compare` pages never split rounds that share a timestamp.
 * Prefer `hour` (or `minute` over a few hours) when a coarser series is enough: 25 hourly points take ~0.3 s.
+* Ranges and `/compare` read the per-point lookups of all their timestamps in bulk (`app/v3/batch.py`,
+  `v3.batch_ranges`): the as-of row of each candidate file with its 24 h volume, the ETH/USD, Chainlink and peg
+  as-of rows, the swaps of small VWMP windows and the S_stat windows of the smaller series come from one query per
+  file (an ASOF JOIN of all the timestamps) instead of one query per point. The engine is the same, so each point
+  equals `/prices/{asset}/at` at that timestamp: 1 754 points of 13 ranges compared field by field, and a permanent
+  test on real data. Measured against one query per point: `/compare` COMP over a week 4.0 → 1.6 s, AAVE `hour`
+  over 7 days with confidence and provenance 4.0 → 1.6 s, COMP `raw` over 3 days 3.2 → 1.3 s, LINK `hour` with
+  confidence 0.8 → 0.4 s; ETH (S_stat windows of ~100 000 swaps, still one query per point) about unchanged. A file
+  is read in bulk only when that costs less than one query per point (at most 2 000 expected rows per timestamp: daily
+  points on the ETH/USDC pool, ~10 000 swaps apart, stay point by point). For
+  that, the 24 h volume of the zombie rule is summed as exact decimals (10 decimal places), which does not depend
+  on the order of the additions; legacy mode keeps the float sum of V1/V2 and computes ranges point by point.
 
 ### Chainlink aggregator phases
 

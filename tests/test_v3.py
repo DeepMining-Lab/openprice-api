@@ -20,6 +20,7 @@ from app.main import app  # imported first: it calls load_config() at import tim
 from app.v3 import store as store_mod
 from app.v3 import service as service_mod
 from app.v3 import sync as sync_mod
+from app.v3 import batch as batch_mod
 
 UTC = timezone.utc
 T0 = datetime(2024, 1, 1, tzinfo=UTC)
@@ -782,3 +783,412 @@ class TestChainlinkPhases:
         res = [r for r in sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0, 2: 300}, head=900))
                if r.rel == "link/chainlink_link_usd.csv"][0]
         assert res.dups_removed == 1
+
+
+# ---------------------------------------------------------------------------
+# Source hierarchy corrections of 2026-09-25, batched reads and the in-DuckDB VWMP
+# ---------------------------------------------------------------------------
+
+CURVE_REL = "eth/crvusd_weth_curve.csv"
+CURVE_HEADER = ["timestamp", "price_weth_per_crvusd", "volume_crvusd", "block_number", "transaction_hash", "log_index"]
+
+
+def _eth_leg(cfg, minutes: range) -> None:
+    _write(Path(cfg.paths.datasets_root) / ETH_REF_REL, ETH_REF_HEADER,
+           [[_iso(T0 + timedelta(minutes=m)), 2200.0, 100000.0, 5e6, 0.0005] for m in minutes])
+
+
+def _link_chainlink(cfg, price: float = 14.1, at: datetime = T0) -> None:
+    _write(Path(cfg.paths.datasets_root) / "link" / "chainlink_link_usd.csv", CL_HEADER, [[_iso(at), price]])
+
+
+class TestHierarchyCorrections:
+    def test_source_dex_never_answers_from_chainlink(self, v3cfg):
+        _link_chainlink(v3cfg)  # no DEX file at all
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        T = T0 + timedelta(minutes=5)
+        dex, _ = svc.price_at("LINK", T, source="dex")
+        auto, _ = svc.price_at("LINK", T)
+        assert (dex.branch_level, dex.price_usd, dex.unavailable_reason) == ("4", None, "missing_source")
+        assert (auto.branch_level, auto.price_usd) == ("3", 14.1)
+        row = svc.compare("LINK", T0, T0 + timedelta(hours=1), 10).items[0]
+        assert (row.dex_price_usd, row.deviation, row.dex_branch) == (None, None, None)
+        v3cfg.v3.legacy_truncation = True  # V1/V2: source=dex fell back to Chainlink, compared with itself
+        legacy, _ = svc.price_at("LINK", T, source="dex")
+        assert (legacy.branch_level, legacy.price_usd) == ("3", 14.1)
+        row = svc.compare("LINK", T0, T0 + timedelta(hours=1), 10).items[0]
+        assert (row.dex_branch, row.deviation) == ("3", 0.0)
+
+    def test_contradictory_source_branch_pairs_are_refused(self, v3cfg):
+        from fastapi.testclient import TestClient
+        _simple_link(v3cfg)
+        store_mod.reset_store(); service_mod.reset_service()
+        ts = "2024-01-01T00:10:00Z"
+        with TestClient(app) as client:
+            def status(**q):
+                return client.get("/v3/prices/LINK/at", params={"timestamp": ts, **q}).status_code
+            assert status(source="dex", branch="3") == 422
+            assert status(source="chainlink", branch="0a") == 422
+            assert status(branch="4") == 422
+            r = client.get("/v3/prices/LINK", params={"start": "2024-01-01T00:00:00Z", "end": ts, "branch": "4"})
+            assert r.status_code == 422 and "level 4" in r.json()["detail"]
+            assert status(source="chainlink", branch="3") == status(source="dex", branch="0a") == 200
+            v3cfg.v3.legacy_truncation = True
+            assert status(source="dex", branch="3") == status(branch="4") == 200
+        store_mod.reset_store(); service_mod.reset_service()
+
+    def test_raw_read_rejects_an_observation_older_than_the_limit(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        T = T0 + timedelta(hours=3)
+        # 0a LINK/USDC: viable but its last swap is 2 h before T; the cross-rate legs are fresh
+        _write(root / POOL_REL, POOL_HEADER, [[_iso(T - timedelta(hours=2)), 14.0, 50000.0, 2e6, 0.001, 1, "0xa", 0]])
+        _eth_leg(v3cfg, range(181))
+        _write(root / TOKEN_LEG_REL, TOKEN_LEG_HEADER, [[_iso(T - timedelta(minutes=10)), 0.0065, 10.0, 1.5e6, 0.001]])
+        _link_chainlink(v3cfg, at=T - timedelta(minutes=5))
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        r, _ = svc.price_at("LINK", T)
+        assert r.branch_level == "0b" and r.price_usd == pytest.approx(0.0065 * 2200.0)
+        stale = [c for c in r.provenance.rejected_candidates if c.rule == "stale_observation"]
+        assert [(c.level, c.file, c.value, c.threshold) for c in stale] == [("0a", POOL_REL, 7200.0, 3600.0)]
+        v3cfg.v3.raw_max_age_seconds = None  # V1/V2: only the 30-day inactivity rule
+        old, _ = svc.price_at("LINK", T)
+        assert (old.branch_level, old.price_usd) == ("0a", 14.0)
+
+    def test_raw_cross_rate_rejects_a_stale_eth_leg(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        T = T0 + timedelta(hours=3)
+        _eth_leg(v3cfg, range(1))  # ETH/USD observed at T0 only: 3 h before T
+        _write(root / TOKEN_LEG_REL, TOKEN_LEG_HEADER, [[_iso(T0 + timedelta(minutes=1)), 0.0065, 10.0, 1.5e6, 0.001]])
+        _link_chainlink(v3cfg, at=T - timedelta(minutes=5))
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        r, _ = svc.price_at("LINK", T)
+        assert r.branch_level == "3"
+        assert ("0b", ETH_REF_REL, "stale_observation") in [(c.level, c.file, c.rule)
+                                                              for c in r.provenance.rejected_candidates]
+        v3cfg.v3.legacy_truncation = True  # the two legs are 60 s apart: V1/V2 accepted a 3 h old price
+        assert svc.price_at("LINK", T)[0].branch_level == "0b"
+
+    def test_windowed_cross_rate_bounds_the_eth_leg_not_the_last_swap(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        T = T0 + timedelta(hours=3)
+        _eth_leg(v3cfg, range(240))
+        # LINK/WETH: last swap before T is 2 h old, but the hour window [T - 30 min, T + 30 min) has 4 swaps
+        rows = [[_iso(T - timedelta(hours=2)), 0.0060, 10.0, 1.5e6, 0.001]]
+        rows += [[_iso(T + timedelta(minutes=m)), 0.0065, 10.0, 1.5e6, 0.001] for m in (5, 10, 15, 20)]
+        _write(root / TOKEN_LEG_REL, TOKEN_LEG_HEADER, rows)
+        _link_chainlink(v3cfg, at=T - timedelta(minutes=5))
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        r, _ = svc.price_at("LINK", T, granularity="hour")
+        assert (r.branch_level, r.swap_count) == ("0b", 4) and r.price_usd == pytest.approx(0.0065 * 2200.0)
+        assert r.provenance.cross_rate_lag_seconds == 0.0
+        v3cfg.v3.windowed_lag_check = "last_swap"  # V1/V2: rejected, the answer falls to Chainlink
+        old, _ = svc.price_at("LINK", T, granularity="hour")
+        assert old.branch_level == "3"
+        assert ("0b", TOKEN_LEG_REL, "cross_rate_lag") in [(c.level, c.file, c.rule)
+                                                             for c in old.provenance.rejected_candidates]
+
+    def test_windowed_cross_rate_rejects_an_eth_leg_far_from_t(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        T = T0 + timedelta(hours=3)
+        _eth_leg(v3cfg, range(60))  # last ETH/USD observation 2 h before T
+        _write(root / TOKEN_LEG_REL, TOKEN_LEG_HEADER,
+               [[_iso(T + timedelta(minutes=m)), 0.0065, 10.0, 1.5e6, 0.001] for m in (-50, 5, 10)])
+        _link_chainlink(v3cfg, at=T - timedelta(minutes=5))
+        sync_mod.run_sync(v3cfg)
+        r, _ = service_mod.Service(v3cfg).price_at("LINK", T, granularity="hour")
+        lag = [c for c in r.provenance.rejected_candidates if c.rule == "cross_rate_lag"]
+        assert r.branch_level == "3"  # every cross-rate level (0b, 1, 2) meets the same ETH/USD leg
+        assert [(c.level, c.file, c.value) for c in lag] == [(lvl, ETH_REF_REL, 7260.0) for lvl in ("0b", "1", "2")]
+
+    def test_no_swap_in_the_24h_before_t_is_a_zero_volume(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        T = T0 + timedelta(days=3)
+        # 0a pool: a swap 2 days before T, then swaps only after T (inside the hour window)
+        rows = [[_iso(T - timedelta(days=2)), 14.0, 50000.0, 2e6, 0.001, 1, "0x1", 0]]
+        rows += [[_iso(T + timedelta(minutes=m)), 14.5, 50000.0, 2e6, 0.001, 10 + m, f"0x{m + 10}", 0] for m in (5, 10)]
+        _write(root / POOL_REL, POOL_HEADER, rows)
+        _link_chainlink(v3cfg, at=T - timedelta(minutes=5))
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        r, _ = svc.price_at("LINK", T, granularity="hour")
+        vol = [c for c in r.provenance.rejected_candidates if c.rule == "zombie_volume_24h"]
+        assert r.branch_level == "3" and [(c.file, c.value) for c in vol] == [(POOL_REL, 0.0)]
+        assert "no swap in the 24 h before T" in vol[0].message
+        v3cfg.v3.no_swap_is_zero_volume = False  # V1/V2: the volume check was skipped with a warning
+        old, _ = svc.price_at("LINK", T, granularity="hour")
+        assert (old.branch_level, old.price_usd) == ("0a", 14.5)
+        assert "volume_sum_empty" in [w.code for w in old.warnings]
+
+    def test_raw_range_probes_the_source_within_the_synced_data(self, v3cfg):
+        _simple_link(v3cfg)  # 20 swaps, one per minute from T0; Chainlink round at T0
+        # probed at `end`, the pool is 2 h 40 min stale and the series would follow the single Chainlink round
+        page = service_mod.Service(v3cfg).price_range("LINK", T0, T0 + timedelta(hours=3), 100)
+        assert [p.timestamp for p in page.items] == [T0 + timedelta(minutes=m) for m in range(20)]
+
+
+class TestBatchedReads:
+    def test_probe_equals_the_separate_reads(self, v3cfg):
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        same = T0 + timedelta(hours=1)
+        rows = [[_iso(T0), 10.0, 100.0, 2e6, 0.001, 1, "0xa", 0],
+                [_iso(same), 11.0, None, 2e6, 0.001, 2, "0xb", 3],
+                [_iso(same), 12.0, 7.5, 2e6, 0.001, 2, "0xc", 1],
+                [_iso(same), 13.0, 2.5, 2e6, 0.001, 2, "0xd", 2],
+                [_iso(T0 + timedelta(days=3)), 14.0, 1.0, 2e6, 0.001, 3, "0xe", 0]]
+        _write(p, POOL_HEADER, rows)
+        st = _build(v3cfg)
+        cols = ["px_usd", "tx_hash", "log_index", "block_number"]
+        for t in (T0 - timedelta(seconds=1), T0, same, same + timedelta(hours=23), T0 + timedelta(days=2),
+                  T0 + timedelta(days=3), T0 + timedelta(days=90)):
+            pr = st.probe(POOL_REL, t, cols, "vol_usd")
+            row = st.as_of(POOL_REL, t, cols)
+            assert pr.row == row, t
+            assert pr.vol_24h == st.sum_between(POOL_REL, "vol_usd", t - timedelta(hours=24), t), t
+            assert pr.n_24h == len(st.window(POOL_REL, t - timedelta(hours=24), t + timedelta(microseconds=1), ["ts"]))
+            if pr.n_same_ts is not None:
+                assert pr.n_same_ts == st.count_at(POOL_REL, row["ts"]), t
+        assert st.probe(POOL_REL, same, cols, "vol_usd").row["px_usd"] == 12.0  # first swap of the block
+
+    @pytest.mark.parametrize("prices,volumes", [
+        ([10.0, 11.0, 11.0, 12.0, 11.0, 50.0], [1.0, 2.0, None, 3.0, 4.0, 5.0]),   # MAD filter drops 50
+        ([10.0, 10.0, 10.0, 10.0], [5.0, 1.0, 2.0, 3.0]),                          # MAD = 0
+        ([10.0, 12.0], [1.0, 1.0]),                                                # n < 3, cumulative == half
+        ([10.0, 11.0, 12.0, 13.0], [0.0, 0.0, 0.0, 0.0]),                          # total = 0: upper median
+        ([10.0, 11.0, 12.0, 13.0, 11.5], [4.0, -9.0, 1.0, 2.0, 1.0]),               # total < 0
+        ([10.0, 11.0, 12.0, 13.0, 11.5], [4.0, -1.0, 1.0, 2.0, 1.0]),               # negative volume
+        ([12.0, 12.0, 11.0, 13.0, 12.0], [None, None, None, None, None]),          # no volume: 1.0 each
+        ([None, 12.0, 11.0, 13.0], [1.0, 2.0, 3.0, 4.0]),                          # a row without a price
+        ([None, None], [1.0, 2.0]),                                                # no price at all
+    ])
+    def test_sql_vwmp_equals_the_python_formulas(self, v3cfg, prices, volumes):
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        _write(p, POOL_HEADER, [[_iso(T0 + timedelta(seconds=i)), px, v, 2e6, 0.001, 100 + i, f"0x{i:x}", 0]
+                                for i, (px, v) in enumerate(zip(prices, volumes))])
+        st = _build(v3cfg)
+        eng = service_mod.Service(v3cfg, st).engine
+        ds, end = st.dataset(POOL_REL), T0 + timedelta(minutes=1)
+        py = eng.window_stats_python(ds, "px_usd", "vol_usd", T0, end)
+        sql = st.window_vwmp(POOL_REL, "px_usd", "vol_usd", T0, end, v3cfg.thresholds.sigma_mad)
+        assert sql is None or sql == py  # None: too close to call in SQL, the engine then uses the Python result
+        assert eng._window_stats(ds, "px_usd", "vol_usd", T0, end) == py
+        v3cfg.v3.legacy_truncation = True  # legacy: the window cut to its oldest rows first
+        cut = st.window_vwmp(POOL_REL, "px_usd", "vol_usd", T0, end, v3cfg.thresholds.sigma_mad, limit=3)
+        assert cut is None or cut.n_raw == min(3, len(prices))
+
+    def test_sql_vwmp_of_an_inverse_price(self, v3cfg):
+        p = Path(v3cfg.paths.datasets_root) / CURVE_REL
+        inv = [0.0004, 0.0005, 0.0, 0.00045, 0.00044, None]
+        vols = [1000.0, 1500.0, 700.0, 2000.0, 300.0, 900.0]
+        _write(p, CURVE_HEADER, [[_iso(T0 + timedelta(seconds=i)), x, vols[i], 100 + i, f"0x{i:x}", 0]
+                                 for i, x in enumerate(inv)])
+        st = _build(v3cfg)
+        eng = service_mod.Service(v3cfg, st).engine
+        ds, end = st.dataset(CURVE_REL), T0 + timedelta(minutes=1)
+        col, vol = ds.col("price_inverse_eth"), ds.col("volume_usd") or ds.col("volume_token")
+        py = eng.window_stats_python(ds, col, vol, T0, end, inverse=True)
+        assert (py.n_raw, py.n_valid) == (6, 4)
+        assert st.window_vwmp(CURVE_REL, col, vol, T0, end, v3cfg.thresholds.sigma_mad, inverse=True) == py
+        # a cumulative volume exactly at half the total: SQL declines, the engine returns the Python result
+        _write(p, CURVE_HEADER, [[_iso(T0 + timedelta(seconds=i)), x, 1000.0 + i, 100 + i, f"0x{i:x}", 0]
+                                 for i, x in enumerate(inv)])
+        st = _build(v3cfg)
+        eng = service_mod.Service(v3cfg, st).engine
+        ds = st.dataset(CURVE_REL)
+        assert st.window_vwmp(CURVE_REL, col, vol, T0, end, v3cfg.thresholds.sigma_mad, inverse=True) is None
+        assert eng._window_stats(ds, col, vol, T0, end, inverse=True) == eng.window_stats_python(ds, col, vol, T0, end,
+                                                                                                 inverse=True)
+
+
+class TestOracleStale:
+    def test_a_chainlink_price_older_than_the_heartbeat_is_flagged(self, v3cfg):
+        _link_chainlink(v3cfg, price=14.1, at=T0)  # no DEX file: every answer is level 3
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+
+        def stale(t):
+            r, _ = svc.price_at("LINK", t)
+            assert r.branch_level == "3" and r.price_usd == 14.1 and r.confidence.C is None
+            return [w for w in r.warnings if w.code == "oracle_stale"], r
+
+        assert stale(T0 + timedelta(seconds=3960))[0] == []   # heartbeat 3 600 s + 10 %
+        warns, r = stale(T0 + timedelta(seconds=3961))
+        assert len(warns) == 1 and "3,600 s (heartbeat)" in warns[0].message and "limit 3,960 s" in warns[0].message
+        assert "oracle_stale" in [w.code for w in r.confidence.warnings]
+        assert "oracle_stale" in service_mod.V3_DIAGNOSTIC_CODES  # additive: stripped by the parity tools
+        v3cfg.v3.oracle_heartbeat_seconds = {**v3cfg.v3.oracle_heartbeat_seconds, "LINK": 86400}
+        assert stale(T0 + timedelta(hours=5))[0] == []
+
+    def test_a_dex_price_is_never_flagged(self, v3cfg):
+        _simple_link(v3cfg)  # Chainlink round at T0, DEX swaps every minute
+        r, _ = service_mod.Service(v3cfg).price_at("LINK", T0 + timedelta(minutes=19))
+        assert r.branch_level == "0a" and "oracle_stale" not in [w.code for w in r.warnings]
+
+
+class TestSmallCorrections:
+    def test_windowed_cross_rate_uses_the_eth_usd_vwmp_of_the_same_window(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        T = T0 + timedelta(hours=3)
+        # ETH/USD: 2200 all hour long, except one swap at 2300 exactly at T (the point read)
+        eth = [[_iso(T + timedelta(minutes=m)), 2200.0, 100000.0, 5e6, 0.0005] for m in range(-40, 40) if m != 0]
+        eth.append([_iso(T), 2300.0, 100000.0, 5e6, 0.0005])
+        _write(root / ETH_REF_REL, ETH_REF_HEADER, sorted(eth))
+        _write(root / TOKEN_LEG_REL, TOKEN_LEG_HEADER,
+               [[_iso(T + timedelta(minutes=m)), 0.0065, 10.0, 1.5e6, 0.001] for m in (-20, -5, 5, 20)])
+        _link_chainlink(v3cfg, at=T - timedelta(minutes=5))
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        r, _ = svc.price_at("LINK", T, granularity="hour")
+        assert r.branch_level == "0b" and r.price_usd == pytest.approx(0.0065 * 2200.0)
+        assert r.provenance.calculation_path[1].startswith("ETH/USD VWMP(") and r.provenance.cross_rate_lag_seconds == 0.0
+        assert r.provenance.eth_usd_leg_event is None  # no single ETH/USD swap behind the price
+        v3cfg.v3.windowed_eth_leg = "point"  # V1/V2: one swap, the point read at T
+        old, _ = svc.price_at("LINK", T, granularity="hour")
+        assert old.price_usd == pytest.approx(0.0065 * 2300.0) and old.provenance.eth_usd_leg_event is not None
+
+    def test_level_3_has_no_coherence_mode(self, v3cfg):
+        _link_chainlink(v3cfg)
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        r, _ = svc.price_at("LINK", T0 + timedelta(minutes=5))
+        assert r.branch_level == "3" and r.confidence.C is None and r.confidence.coherence_mode is None
+        v3cfg.v3.v2_oracle_coherence_label = True
+        assert svc.price_at("LINK", T0 + timedelta(minutes=5))[0].confidence.coherence_mode == "oracle_only_staleness"
+
+    def test_compare_uses_the_peg_neutralized_price(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        header = POOL_HEADER + ["quote_token_symbol"]
+        _write(root / POOL_REL, header, [r + ["USDC"] for r in _pool_rows(20)])
+        _write(root / "stablecoins" / "chainlink_usdc_usd.csv", CL_HEADER, [[_iso(T0 - timedelta(hours=1)), 0.99]])
+        _link_chainlink(v3cfg, price=14.0, at=T0 + timedelta(minutes=10))
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        row = svc.compare("LINK", T0, T0 + timedelta(hours=1), 10).items[0]
+        point, _ = svc.price_at("LINK", T0 + timedelta(minutes=10))
+        assert (row.quote_currency, row.quote_currency_peg) == ("USDC", 0.99)
+        assert row.dex_price_usd == pytest.approx(row.dex_price_raw_in_quote * 0.99) == pytest.approx(point.price_usd)
+        assert row.deviation == pytest.approx(abs(row.dex_price_usd - 14.0) / 14.0)
+        v3cfg.v3.legacy_truncation = True  # V1/V2: the raw price
+        old = svc.compare("LINK", T0, T0 + timedelta(hours=1), 10).items[0]
+        assert old.dex_price_usd == old.dex_price_raw_in_quote and old.quote_currency_peg is None
+
+
+class TestExtractionHead:
+    def test_coverage_is_how_far_the_extraction_went_not_the_last_event(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        extra = ["extraction_timestamp_utc", "node_head_block_at_extraction"]
+        # LINK/USDC: swaps every minute up to T0 + 19 min (block 1019); the extractor ran at T0 + 25 min with its node
+        # at block 1024, i.e. 5 blocks (60 s) after the last swap: the pool is covered up to T0 + 20 min.
+        _write(root / POOL_REL, POOL_HEADER + ["quote_token_symbol", "block_timestamp_utc"] + extra,
+               [r + ["USDC", r[0], _iso(T0 + timedelta(minutes=25)), 1024] for r in _pool_rows(20)])
+        # USDC/USD peg: last round 10 h before T0, but extracted at T0 + 1 h (a 24 h heartbeat feed)
+        _write(root / "stablecoins" / "chainlink_usdc_usd.csv", CL_HEADER + extra,
+               [[_iso(T0 - timedelta(hours=10)), 1.0, _iso(T0 + timedelta(hours=1)), 5000]])
+        _link_chainlink(v3cfg, at=T0)
+        sync_mod.run_sync(v3cfg)
+        heads = {rel: d.get("extraction_head_utc")
+                 for rel, d in sync_mod.load_manifest(v3cfg.v3.parquet_path)["datasets"].items()}
+        assert heads[POOL_REL] == (T0 + timedelta(minutes=20)).isoformat()
+        assert heads["stablecoins/chainlink_usdc_usd.csv"] == (T0 + timedelta(hours=1)).isoformat()
+        assert heads["link/chainlink_link_usd.csv"] is None  # no extraction columns: last observation is the coverage
+        svc = service_mod.Service(v3cfg)
+
+        def codes(t):
+            r, _ = svc.price_at("LINK", t)
+            assert r.branch_level == "0a" and r.quote_currency_peg == 1.0
+            return [w.code for w in r.warnings]
+
+        # after the last swap and the last peg round, but within what the extraction scanned: not provisional
+        assert "beyond_data_coverage" not in codes(T0 + timedelta(minutes=19, seconds=30))
+        assert "beyond_data_coverage" in codes(T0 + timedelta(minutes=21))
+
+    def test_manifests_without_extraction_heads_are_completed(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        _write(root / POOL_REL, POOL_HEADER + ["block_timestamp_utc", "extraction_timestamp_utc",
+                                               "node_head_block_at_extraction"],
+               [r + [r[0], _iso(T0 + timedelta(minutes=30)), 1019] for r in _pool_rows(20)])
+        sync_mod.run_sync(v3cfg)
+        mp = sync_mod.manifest_path(v3cfg.v3.parquet_path)
+        m = json.loads(mp.read_text())
+        version = m["version"]
+        del m["datasets"][POOL_REL]["extraction_head_utc"]
+        mp.write_text(json.dumps(m))
+        assert [r.action for r in sync_mod.run_sync(v3cfg) if r.rel == POOL_REL] == ["unchanged"]
+        m = sync_mod.load_manifest(v3cfg.v3.parquet_path)
+        assert m["datasets"][POOL_REL]["extraction_head_utc"] == (T0 + timedelta(minutes=19)).isoformat()
+        assert m["version"] == version  # no data change: same dataset version, the response cache stays valid
+
+
+class TestBatchedRanges:
+    def _market(self, cfg) -> None:
+        """Two days: LINK/USDC every 10 min with a 30 h silence, LINK/WETH and ETH/USD every 5 min, hourly Chainlink."""
+        root = Path(cfg.paths.datasets_root)
+        pool = [[_iso(T0 + timedelta(minutes=10 * i)), 14.0 + (i % 9) * 0.01, 3000.0 + i, 2e6, 0.001, 1000 + i,
+                 f"0x{i:064x}", i % 3] for i in range(288) if not 60 <= i < 240]
+        _write(root / POOL_REL, POOL_HEADER, pool)
+        _write(root / TOKEN_LEG_REL, TOKEN_LEG_HEADER,
+               [[_iso(T0 + timedelta(minutes=5 * i)), 0.0064 + (i % 5) * 1e-5, 10.0, 1.5e6, 0.001] for i in range(576)])
+        _write(root / ETH_REF_REL, ETH_REF_HEADER,
+               [[_iso(T0 + timedelta(minutes=5 * i)), 2200.0 + (i % 7), 100000.0, 5e6, 0.0005] for i in range(576)])
+        _write(root / "link" / "chainlink_link_usd.csv", CL_HEADER,
+               [[_iso(T0 + timedelta(hours=h)), 14.0 + h * 0.01] for h in range(48)])
+        sync_mod.run_sync(cfg)
+
+    def test_bulk_lookups_give_the_same_responses_as_one_query_per_point(self, v3cfg):
+        self._market(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        end = T0 + timedelta(hours=47)
+        calls = [lambda: svc.price_range("LINK", T0, end, 1000, granularity=g, include_confidence=True,
+                                         include_provenance=True) for g in ("raw", "minute", "hour", "day")]
+        calls.append(lambda: svc.compare("LINK", T0, end, 1000))
+        for call in calls:
+            v3cfg.v3.batch_ranges = False
+            one_by_one = call()
+            v3cfg.v3.batch_ranges = True
+            bulk = call()
+            assert bulk.next_start == one_by_one.next_start  # (the 2-point day series stays point by point)
+            assert [p.model_dump(mode="json") for p in bulk.items] == [p.model_dump(mode="json") for p in one_by_one.items]
+
+    def test_ranges_use_the_bulk_store_outside_legacy_mode(self, v3cfg):
+        self._market(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        stamps = [T0 + timedelta(hours=h) for h in range(10)]
+        assert isinstance(svc._for_points(stamps).store, batch_mod.BatchStore)
+        assert svc._for_points(stamps[:3]) is svc  # a few points: one query each
+        v3cfg.v3.legacy_truncation = True
+        assert svc._for_points(stamps) is svc      # legacy mode replays V2 point by point
+
+    def test_the_24h_volume_is_an_exact_sum(self, v3cfg):
+        # 0.1 + 0.2 + ... in floating point depends on the order of the additions; the decimal sum does not
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        vols = [0.1, 0.2, 0.3, 1e7, 0.7, 1e-6, 3.3]
+        _write(p, POOL_HEADER, [[_iso(T0 + timedelta(minutes=i)), 14.0, v, 2e6, 0.001, i, f"0x{i:x}", 0]
+                                for i, v in enumerate(vols)])
+        st = _build(v3cfg)
+        T = T0 + timedelta(minutes=10)
+        from decimal import Decimal
+        exact = float(sum(Decimal(repr(v)).quantize(Decimal("1e-10")) for v in vols))
+        assert st.probe(POOL_REL, T, ["px_usd"], "vol_usd").vol_24h == exact
+        bulk = batch_mod.BatchStore(st, [T, T + timedelta(minutes=1)])
+        assert bulk.probe(POOL_REL, T, ["px_usd"], "vol_usd").vol_24h == exact
+
+
+class TestBatchedQuietPools:
+    def test_a_declined_bulk_read_is_never_taken_for_an_empty_file(self, v3cfg, monkeypatch):
+        # a quiet pool (last swap 40 days before the points): 30-day bulk look-back finds nothing, the whole-file
+        # bulk read is declined as too costly -> the Store must answer, not "no observation"
+        p = Path(v3cfg.paths.datasets_root) / POOL_REL
+        _write(p, POOL_HEADER, [[_iso(T0 - timedelta(days=40, minutes=i)), 14.0, 5.0, 2e6, 0.001, 50 - i, f"0x{i:x}", 0]
+                                for i in range(50)])
+        st = _build(v3cfg)
+        monkeypatch.setattr(batch_mod, "_SMALL_DATASET_ROWS", 0)   # as if the file were large
+        monkeypatch.setattr(batch_mod, "_MAX_ROWS_PER_POINT", 1)   # and every bulk read too costly
+        points = [T0 + timedelta(hours=h) for h in range(10)]
+        bulk = batch_mod.BatchStore(st, points)
+        for t in points:
+            assert bulk.probe(POOL_REL, t, ["px_usd"], "vol_usd") == st.probe(POOL_REL, t, ["px_usd"], "vol_usd")
+            assert bulk.as_of(POOL_REL, t, ["px_usd"]) == st.as_of(POOL_REL, t, ["px_usd"])
+        assert st.probe(POOL_REL, points[0], ["px_usd"], "vol_usd").row is not None

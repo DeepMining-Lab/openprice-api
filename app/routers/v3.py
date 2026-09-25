@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 
 from app.config import get_config
 from app.routers.prices import _validate_asset, _validate_branch, _validate_granularity, _validate_source
-from app.schemas import ComparePoint, ConfidenceV2Detail, PriceV3Response
+from app.schemas import ComparePointV3, ConfidenceV2Detail, PriceV3Response
 from app.v3 import sync as sync_mod
 from app.v3.service import Service, get_service
 
@@ -29,6 +29,23 @@ def _service() -> Service:
     if not svc.store.datasets():
         raise HTTPException(status_code=503, detail="V3 store is empty: run `python -m app.v3.sync` first.")
     return svc
+
+
+def _check_source_branch(source: str, branch: str) -> None:
+    """Refuse the pairs no source can satisfy (``v3.strict_source_filter``; V1/V2 and legacy mode accept them and answer
+    from Chainlink, or with an explicit null for branch=4)."""
+    cfg = get_config()
+    if not cfg.v3.strict_source_filter or cfg.v3.legacy_truncation:
+        return
+    if branch == "4":
+        raise HTTPException(status_code=422, detail="branch=4 cannot be requested: level 4 is the explicit null "
+                                                    "returned when no source answers. Use branch=auto.")
+    if source == "dex" and branch == "3":
+        raise HTTPException(status_code=422, detail="source=dex excludes level 3 (Chainlink). Use source=auto or "
+                                                    "source=chainlink with branch=3.")
+    if source == "chainlink" and branch not in ("auto", "3"):
+        raise HTTPException(status_code=422, detail=f"source=chainlink only has level 3; branch={branch} is a DEX "
+                                                    "level. Use source=auto or source=dex.")
 
 
 def _headers(response: Response, svc: Service, t0: float, cache: str | None = None) -> None:
@@ -79,7 +96,11 @@ _H_PAGE = {
         "served from an indexed Parquet store. Differences from V2: the S_stat 7-day window "
         "and the windowed VWMP read are no longer truncated to 10 000 rows, 110 duplicated "
         "swap events of the ETH/USDC pool are ignored, and Chainlink is read only from the aggregator "
-        "phase its proxy served at T.\n\n"
+        "phase its proxy served at T. Source hierarchy corrections: `source=dex` never answers from "
+        "Chainlink (and `source`/`branch` pairs that cannot both hold, or `branch=4`, return 422); a raw "
+        "price is never built from an observation more than `v3.raw_max_age_seconds` (1 h) before T; an "
+        "hour/day cross-rate bounds the ETH/USD leg's distance to T rather than the token pool's last swap "
+        "before T; a pool without any swap in the 24 h before T fails the 24 h volume rule.\n\n"
         "Additive diagnostics (never change a number):\n"
         "- a `timestamp` after the server time returns level 4 with `unavailable_reason: future_timestamp`;\n"
         "- `beyond_data_coverage` warns that the price depends on data after the last sync (provisional);\n"
@@ -109,6 +130,7 @@ def price_at_v3(
     branch = _validate_branch(branch)
     source = _validate_source(source)
     granularity = _validate_granularity(granularity)
+    _check_source_branch(source, branch)
     if timestamp.tzinfo is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
     svc = _service()
@@ -175,6 +197,7 @@ def datasets_v3():
             "rows": d["n_rows"],
             "first_observation_utc": d["min_ts"],
             "last_observation_utc": d["max_ts"],
+            "extraction_head_utc": d.get("extraction_head_utc"),
             "file_version": d.get("file_version"),
             "csv_bytes_read": d["csv_offset"],
             "csv_lines_read": d.get("csv_lines"),
@@ -249,6 +272,7 @@ def price_range_v3(
     branch = _validate_branch(branch)
     source = _validate_source(source)
     granularity = _validate_granularity(granularity)
+    _check_source_branch(source, branch)
     if start.tzinfo is None:
         start = start.replace(tzinfo=timezone.utc)
     if end.tzinfo is None:
@@ -265,10 +289,15 @@ def price_range_v3(
 
 @router.get(
     "/compare/{asset}",
-    response_model=list[ComparePoint],
+    response_model=list[ComparePointV3],
     summary="Compare DEX price vs Chainlink oracle over a date range (V3)",
     description=(
-        "One row per Chainlink round in [start, end), as `/v1/compare`. Not cached (no `X-Cache`). "
+        "One row per Chainlink round in [start, end), as `/v1/compare`. The DEX price comes from levels "
+        "0a, 0b, 1 or 2 only (null when none answers; V1/V2 fell back to Chainlink itself, deviation 0). "
+        "`dex_price_usd` is the price `/v3/prices` returns: peg-neutralized when the quote is a stablecoin "
+        "(the price S_coh compares with Chainlink); `dex_price_raw_in_quote`, `quote_currency` and "
+        "`quote_currency_peg` give the raw price and the peg used (V1/V2 compared the raw price). "
+        "Not cached (no `X-Cache`). "
         "When the result is cut at `limit`, `X-Truncated: true` and `X-Next-Start` give the `start` "
         "of the next page."
     ),

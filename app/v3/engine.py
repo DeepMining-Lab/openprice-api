@@ -12,7 +12,20 @@ same branch order, same warnings and provenance. Only the data access changed:
   LIMIT, V1/V2 behaviour) is removed. ``v3.legacy_truncation: true`` restores it so
   the engine can be proven identical to V2;
 * a Chainlink fallback (level 3) reads only the rounds of the aggregator phase the proxy
-  served at T (``v3.chainlink_active_phase_only``; not in legacy mode).
+  served at T (``v3.chainlink_active_phase_only``; not in legacy mode);
+* an hour/day cross-rate multiplies by the ETH/USD VWMP over the token leg's window, not by a single
+  swap (``windowed_eth_leg``; not in legacy mode);
+* four corrections of the V1/V2 hierarchy (2026-09-25; each has its ``v3`` key, none applies in
+  legacy mode): ``source=dex`` never answers from Chainlink (``strict_source_filter``); an hour/day
+  cross-rate bounds the lag between the ETH/USD point read and T instead of the lag between that read
+  and the token pool's last swap before T (``windowed_lag_check``); a raw DEX price is never built
+  from an observation older than ``raw_max_age_seconds`` before T; no swap in the 24 h before T is a
+  24 h volume of 0 for the zombie rule (``no_swap_is_zero_volume``).
+
+Data access is batched: one query per candidate gives its as-of row, the rows sharing that
+timestamp and its 24 h volume (``Store.probe``), and the MAD filter + VWMP of a window run inside
+DuckDB (``Store.window_vwmp``, the Python formulas of V1/V2 being the fallback). Both return exactly
+what the V1/V2 code computes.
 
 Every candidate file that the hierarchy evaluates and does not use is recorded with the
 rule that rejected it (``get_price_at(..., trace=[...])``). This is bookkeeping only: the
@@ -38,7 +51,7 @@ from app.services.price_service import (
     _level_4,
     _windowed_status,
 )
-from app.v3.store import DatasetInfo, Store
+from app.v3.store import DatasetInfo, Probe, Store, WindowStats
 
 _BLOCK_TS_CANDIDATES = ("block_timestamp_utc", "block_timestamp", "block_time")
 _ROW_CANON = (
@@ -49,11 +62,13 @@ _ROW_CANON = (
 
 def _row_cols(ds: DatasetInfo) -> list[str]:
     """Parquet columns fetched with an as-of row (superset of what V1/V2 selected), plus the on-chain identity
-    of the row for the provenance (transaction and log index of a swap, phase and round of a Chainlink answer)."""
+    of the row for the provenance (log index of a swap, phase and round of a Chainlink answer) and its row number.
+    The transaction hash is not read here: a text column costs a third of the lookup, and only the row that
+    answers needs it (``Store.tx_hash_of``, when the provenance is built)."""
     cols = [c for c in (ds.col(k) for k in _ROW_CANON) if c]
     if any(b in ds.raw_columns for b in _BLOCK_TS_CANDIDATES):
         cols.append("block_ts")
-    cols += [c for c in ("tx_hash", "log_index", "phase", "agg_round") if c in ds.columns]
+    cols += [c for c in ("log_index", "phase", "agg_round", "rn") if c in ds.columns]
     return cols
 
 
@@ -73,6 +88,18 @@ class _Ctx:
 
 def _hms(t: datetime) -> str:
     return t.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _hours(seconds: float) -> str:
+    return f"{seconds / 3600:,.1f} h"
+
+
+# Key of an as-of row read by Store.probe that carries the number of rows sharing its timestamp.
+N_SAME_TS = "_n_same_ts"
+# Key set on the ETH/USD row of an hour/day cross-rate whose ETH/USD leg is a VWMP (the row still gives its S_liq).
+ETH_LEG_AGGREGATED = "_eth_leg_aggregated"
+# Expected swaps in a window above which the MAD filter + VWMP run inside DuckDB (measured break-even ~1 000-2 000).
+_SQL_VWMP_MIN_ROWS = 2000
 
 
 def phase_note(ds: DatasetInfo, phase: int) -> str:
@@ -107,6 +134,93 @@ class Engine:
     def _limit(self) -> int | None:
         return self.cfg.api.max_limit if self.cfg.v3.legacy_truncation else None
 
+    # ------------------------------------------------- corrections of 2026-09-25
+    # Each one is off in legacy mode, which replays V1/V2 exactly.
+    def strict_source(self) -> bool:
+        return self.cfg.v3.strict_source_filter and not self.cfg.v3.legacy_truncation
+
+    def _windowed_lag_check(self) -> str:
+        return "last_swap" if self.cfg.v3.legacy_truncation else self.cfg.v3.windowed_lag_check
+
+    def max_age(self) -> float | None:
+        return None if self.cfg.v3.legacy_truncation else self.cfg.v3.raw_max_age_seconds
+
+    def _no_swap_is_zero_volume(self) -> bool:
+        return self.cfg.v3.no_swap_is_zero_volume and not self.cfg.v3.legacy_truncation
+
+    def _windowed_eth_leg(self) -> str:
+        return "point" if self.cfg.v3.legacy_truncation else self.cfg.v3.windowed_eth_leg
+
+    def _eth_leg_vwmp(self, eth_file: str | None, start: datetime, end: datetime) -> WindowStats | None:
+        """ETH/USD leg of an hour/day cross-rate as a VWMP over the token leg's window (``windowed_eth_leg: vwmp``):
+        the MAD filter and VWMP of the ETH/USD reference file that gave the point read. None: keep the point read
+        (V1/V2 rule, or no ETH/USD swap in the window)."""
+        if self._windowed_eth_leg() != "vwmp" or not eth_file:
+            return None
+        ds = self.store.dataset(eth_file)
+        price_col = ds.col("price_usd") if ds else None
+        if not price_col:
+            return None
+        st = self._window_stats(ds, price_col, ds.col("volume_usd"), start, end)
+        return st if st.n_valid and st.vwmp is not None else None
+
+    def _stale(self, ctx: _Ctx, level: str, file: str, observed: datetime | None, timestamp: datetime,
+               what: str = "last observation") -> bool:
+        """Record and reject an observation older than ``raw_max_age_seconds`` before T (raw DEX reads)."""
+        limit = self.max_age()
+        if limit is None or observed is None:
+            return False
+        age = (timestamp - observed).total_seconds()
+        if age <= limit:
+            return False
+        ctx.reject(level, file, "stale_observation", f"{what} {_hours(age)} before T (limit {_hours(limit)})",
+                   age, float(limit), observed)
+        return True
+
+    # ------------------------------------------------------------ batched reads
+    def _probe(self, ds: DatasetInfo, timestamp: datetime) -> Probe:
+        """As-of row of a candidate plus what its zombie check needs, in one query."""
+        pr = self.store.probe(ds.rel, timestamp, _row_cols(ds), ds.col("volume_usd"))
+        if pr.row is not None and pr.n_same_ts is not None:
+            pr.row[N_SAME_TS] = pr.n_same_ts
+        return pr
+
+    def _window_stats(self, ds: DatasetInfo, price_col: str, vol_col: str | None, start: datetime, end: datetime,
+                      inverse: bool = False) -> WindowStats:
+        """MAD filter + VWMP of one window. Both implementations return the same numbers; DuckDB is faster only on
+        large windows (it has a fixed cost of ~8 ms), so the expected row count of the window, from the dataset's
+        average density, picks one. The Python functions of V1/V2 also serve when the SQL result could depend on the
+        order of the float additions (``Store.window_vwmp`` returns None)."""
+        span = (ds.max_ts - ds.min_ts).total_seconds() if ds.min_ts and ds.max_ts else 0.0
+        expected = ds.n_rows * (end - start).total_seconds() / span if span > 0 else 0.0
+        if expected >= _SQL_VWMP_MIN_ROWS:
+            sigma = self.cfg.thresholds.sigma_mad
+            st = self.store.window_vwmp(ds.rel, price_col, vol_col, start, end, sigma, self._limit(), inverse)
+            if st is not None:
+                return st
+        return self.window_stats_python(ds, price_col, vol_col, start, end, inverse)
+
+    def window_stats_python(self, ds: DatasetInfo, price_col: str, vol_col: str | None, start: datetime,
+                            end: datetime, inverse: bool = False) -> WindowStats:
+        """The V1/V2 computation on the materialised swaps (reference implementation of ``Store.window_vwmp``)."""
+        cols = [price_col] + ([vol_col] if vol_col else [])
+        rows = self.store.window(ds.rel, start, end, cols, self._limit())
+        if inverse:
+            valid = [r for r in rows if r.get(price_col) is not None and float(r[price_col]) != 0]
+            prices = [1.0 / float(r[price_col]) for r in valid]
+        else:
+            valid = [r for r in rows if r.get(price_col) is not None]
+            prices = [float(r[price_col]) for r in valid]
+        volumes = ([float(r[vol_col]) if r.get(vol_col) is not None else 1.0 for r in valid]
+                   if vol_col else [1.0] * len(prices))
+        if not prices:
+            return WindowStats(len(rows), 0, 0, 0, None)
+        pc, vc, excluded = _filter_mad_outliers(prices, volumes, self.cfg.thresholds.sigma_mad)
+        fallback = not pc
+        if fallback:
+            pc, vc = prices, volumes
+        return WindowStats(len(rows), len(prices), len(pc), excluded, _compute_vwmp(pc, vc), fallback)
+
     def _extract_block_ref(self, ds: DatasetInfo, row: dict[str, Any]) -> tuple[int | None, datetime | None, list[Warning]]:
         bn_col = ds.col("block_number")
         has_bts = any(c in ds.raw_columns for c in _BLOCK_TS_CANDIDATES)
@@ -129,8 +243,10 @@ class Engine:
     # ------------------------------------------------------------- zombie check
     def _is_zombie(
         self, ds: DatasetInfo, row: dict[str, Any], timestamp: datetime, eth_usd_price: float | None = None,
+        probe: Probe | None = None,
     ) -> tuple[bool, list[Warning], list[tuple[str, str, float, float]]]:
-        """(is_zombie, warnings, failed rules as (rule, message, value, threshold))."""
+        """(is_zombie, warnings, failed rules as (rule, message, value, threshold)). ``probe`` carries the 24 h
+        volume already read with the as-of row."""
         cfg = self.cfg
         warnings: list[Warning] = []
         reasons: list[tuple[str, str, float, float]] = []
@@ -161,11 +277,17 @@ class Engine:
                                     message="TVL viability check could not be evaluated for this source file."))
 
         if vol_col and ts_col:
-            window_start = timestamp - timedelta(hours=24)
-            vol_24h = self.store.sum_between(ds.rel, vol_col, window_start, timestamp)
-            if vol_24h is not None and vol_24h < cfg.thresholds.seuil_vol_min_usd_24h:
+            if probe is not None:
+                vol_24h, n_24h = probe.vol_24h, probe.n_24h
+            else:
+                window_start = timestamp - timedelta(hours=24)
+                vol_24h, n_24h = self.store.sum_between(ds.rel, vol_col, window_start, timestamp), None
+            thr = float(cfg.thresholds.seuil_vol_min_usd_24h)
+            if vol_24h is None and n_24h == 0 and self._no_swap_is_zero_volume():
                 is_zombie = True
-                thr = float(cfg.thresholds.seuil_vol_min_usd_24h)
+                reasons.append(("zombie_volume_24h", f"no swap in the 24 h before T (0 USD < {thr:,.0f} USD)", 0.0, thr))
+            elif vol_24h is not None and vol_24h < cfg.thresholds.seuil_vol_min_usd_24h:
+                is_zombie = True
                 reasons.append(("zombie_volume_24h", f"24 h volume {vol_24h:,.0f} USD < {thr:,.0f} USD", vol_24h, thr))
             elif vol_24h is None:
                 warnings.append(Warning(code="volume_sum_empty",
@@ -260,14 +382,17 @@ class Engine:
                 continue
             if self._empty(ctx, level, ds):
                 continue
-            row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
+            pr = self._probe(ds, timestamp)
+            row = pr.row
             if row is None or row.get(price_col) is None:
                 ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
-            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp)
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, probe=pr)
             active = self._recently_active(row, timestamp)
             if zombie or not active:
                 self._reject_row(ctx, level, ds, row, timestamp, z_why, inactive=not active)
+                continue
+            if self._stale(ctx, level, ds.rel, row["ts"], timestamp):
                 continue
             tvl_col = ds.col("tvl_usd")
             try:
@@ -302,6 +427,8 @@ class Engine:
         if eth_price is None:
             self._reject_eth_leg(ctx, level, asset)
             return None
+        if self._stale(ctx, level, eth_file, eth_ts, timestamp, "ETH/USD leg observed"):
+            return None
         for path in token_paths:
             ds = self._ds(path)
             ts_col, price_col = (ds.col("timestamp"), ds.col("price_token_eth")) if ds else (None, None)
@@ -310,7 +437,8 @@ class Engine:
                 continue
             if self._empty(ctx, level, ds):
                 continue
-            row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
+            pr = self._probe(ds, timestamp)
+            row = pr.row
             if row is None or row.get(price_col) is None:
                 ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
@@ -322,9 +450,11 @@ class Engine:
             if lag > self.cfg.thresholds.cross_rate_max_lag_seconds:
                 self._reject_lag(ctx, level, ds, token_ts, eth_ts, lag)
                 continue
-            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_price)
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_price, probe=pr)
             if zombie:
                 self._reject_row(ctx, level, ds, row, timestamp, z_why)
+                continue
+            if self._stale(ctx, level, ds.rel, token_ts, timestamp, "token leg observed"):
                 continue
             token_eth_price = float(row[price_col])
             price_usd = token_eth_price * eth_price
@@ -360,30 +490,24 @@ class Engine:
         return None
 
     # -------------------------------------------------------- windowed builders
-    def _window_vwmp(self, ds, price_col, vol_col, timestamp, granularity, transform=None):
-        """Yield (step_idx, window_s, half, w_start, w_end, rows) for each R1 step with data."""
-        cols = [price_col] + ([vol_col] if vol_col else [])
+    def _window_vwmp(self, ds, price_col, vol_col, timestamp, granularity, inverse=False):
+        """Yield (step_idx, window_s, half, w_start, w_end, stats) for each R1 step."""
         for step_idx, window_s in enumerate(_WINDOW_STEPS[granularity]):
             half = window_s / 2.0
             w_start = timestamp - timedelta(seconds=half)
             w_end = timestamp + timedelta(seconds=half)
-            rows = self.store.window(ds.rel, w_start, w_end, cols, self._limit())
-            yield step_idx, window_s, half, w_start, w_end, rows
+            yield step_idx, window_s, half, w_start, w_end, self._window_stats(ds, price_col, vol_col, w_start,
+                                                                               w_end, inverse)
 
-    def _clean(self, prices, volumes, warns_list, message_full: bool, sigma: float):
-        """MAD filter + fallback exactly as V1/V2. Returns (prices, volumes, excluded, mad_fallback)."""
-        prices_clean, volumes_clean, excluded = _filter_mad_outliers(prices, volumes, sigma)
-        mad_fallback = False
-        if excluded > 0:
-            msg = (f"{excluded} swap(s) excluded by MAD filter (sigma_mad={sigma})." if message_full
-                   else f"{excluded} swap(s) excluded by MAD filter.")
+    def _clean(self, st: WindowStats, warns_list, message_full: bool, sigma: float) -> None:
+        """The MAD-filter warnings of V1/V2 for a window already filtered (``st``)."""
+        if st.excluded > 0:
+            msg = (f"{st.excluded} swap(s) excluded by MAD filter (sigma_mad={sigma})." if message_full
+                   else f"{st.excluded} swap(s) excluded by MAD filter.")
             warns_list.append(Warning(code="mad_outliers_excluded", message=msg))
-        if not prices_clean:
-            mad_fallback = True
-            prices_clean, volumes_clean = prices, volumes
+        if st.mad_fallback:
             warns_list.append(Warning(code="mad_filter_fallback",
                                       message="All swaps flagged by MAD filter; using unfiltered data."))
-        return prices_clean, volumes_clean, excluded, mad_fallback
 
     def _direct_stable_windowed(self, asset, timestamp, granularity, paths, level, label, ctx) -> PriceResult | None:
         cfg = self.cfg
@@ -396,11 +520,12 @@ class Engine:
                 continue
             if self._empty(ctx, level, ds):
                 continue
-            row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
+            pr = self._probe(ds, timestamp)
+            row = pr.row
             if row is None:
                 ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
-            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp)
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, probe=pr)
             active = self._recently_active(row, timestamp)
             if zombie or not active:
                 self._reject_row(ctx, level, ds, row, timestamp, z_why, inactive=not active)
@@ -415,27 +540,19 @@ class Engine:
 
         for tvl, ds, viability_row, pool_warnings in viable:
             price_col, vol_col = ds.col("price_usd"), ds.col("volume_usd")
-            for step_idx, window_s, half, w_start, w_end, rows in self._window_vwmp(ds, price_col, vol_col, timestamp, granularity):
-                if not rows:
-                    continue
-                n_raw = len(rows)
-                prices = [float(r[price_col]) for r in rows if r.get(price_col) is not None]
-                volumes = (
-                    [float(r[vol_col]) if r.get(vol_col) is not None else 1.0 for r in rows if r.get(price_col) is not None]
-                    if vol_col else [1.0] * len(prices)
-                )
-                if not prices:
+            for step_idx, window_s, half, w_start, w_end, st in self._window_vwmp(ds, price_col, vol_col, timestamp, granularity):
+                if not st.n_valid:
                     continue
                 warns: list[Warning] = list(pool_warnings)
-                pc, vc, excluded, mad_fallback = self._clean(prices, volumes, warns, True, cfg.thresholds.sigma_mad)
-                if len(pc) < cfg.thresholds.min_swaps_for_stat_score:
+                self._clean(st, warns, True, cfg.thresholds.sigma_mad)
+                if st.kept < cfg.thresholds.min_swaps_for_stat_score:
                     warns.append(Warning(
                         code="low_swap_count",
-                        message=(f"Only {len(pc)} clean swap(s) in window "
+                        message=(f"Only {st.kept} clean swap(s) in window "
                                  f"(recommended min: {cfg.thresholds.min_swaps_for_stat_score})."),
                         severity="info",
                     ))
-                price_vwmp = _compute_vwmp(pc, vc)
+                price_vwmp = st.vwmp
                 if price_vwmp is None:
                     continue
                 warns.append(Warning(code="block_metadata_aggregated",
@@ -446,18 +563,18 @@ class Engine:
                     timestamp_observed=timestamp,
                     branch_level=level,
                     branch_label=label,
-                    data_status=_windowed_status(step_idx, mad_fallback),
+                    data_status=_windowed_status(step_idx, st.mad_fallback),
                     files_used=[ds.rel],
-                    calculation_path=[f"VWMP({len(pc)} swaps, window ±{half:.0f}s)", "Direct stablecoin VWMP"],
+                    calculation_path=[f"VWMP({st.kept} swaps, window ±{half:.0f}s)", "Direct stablecoin VWMP"],
                     detected_columns={ds.csv_name: ds.raw_columns},
                     source_row=viability_row,
                     source_schema=ds.schema,
                     warnings=warns,
                     granularity=granularity,
-                    n_raw=n_raw,
-                    swap_count=len(pc),
+                    n_raw=st.n_raw,
+                    swap_count=st.kept,
                     window_seconds=float(window_s),
-                    excluded_swaps=excluded,
+                    excluded_swaps=st.excluded,
                     initial_window_seconds=float(_WINDOW_STEPS[granularity][0]),
                     window_start_utc=w_start,
                     window_end_utc=w_end,
@@ -475,6 +592,16 @@ class Engine:
         if eth_price is None:
             self._reject_eth_leg(ctx, level, asset)
             return None
+        last_swap_rule = self._windowed_lag_check() == "last_swap"
+        if not last_swap_rule and eth_ts is not None:
+            # The token leg is a VWMP centred on T: the lag that matters is the ETH/USD point read's distance to T.
+            eth_lag = abs((timestamp - eth_ts).total_seconds())
+            limit = cfg.thresholds.cross_rate_max_lag_seconds
+            if eth_lag > limit:
+                ctx.reject(level, eth_file, "cross_rate_lag",
+                           f"ETH/USD leg {_hms(eth_ts)} is {eth_lag:,.0f} s from T (limit {limit:,} s)",
+                           eth_lag, float(limit), eth_ts)
+                return None
         for path in token_paths:
             ds = self._ds(path)
             ts_col, price_col = (ds.col("timestamp"), ds.col("price_token_eth")) if ds else (None, None)
@@ -483,42 +610,45 @@ class Engine:
                 continue
             if self._empty(ctx, level, ds):
                 continue
-            viability_row = self.store.as_of(ds.rel, timestamp, _row_cols(ds))
+            pr = self._probe(ds, timestamp)
+            viability_row = pr.row
             if viability_row is None:
                 ctx.reject(level, ds.rel, "no_observation", "no observation at or before T")
                 continue
-            zombie, z_warns, z_why = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_price)
+            zombie, z_warns, z_why = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_price, probe=pr)
             if zombie:
                 self._reject_row(ctx, level, ds, viability_row, timestamp, z_why)
                 continue
-            if (eth_ts is not None and viability_row.get(ts_col) is not None
+            if (last_swap_rule and eth_ts is not None and viability_row.get(ts_col) is not None
                     and hasattr(viability_row[ts_col], "timestamp")):
                 lag = abs((viability_row[ts_col] - eth_ts).total_seconds())
                 if lag > cfg.thresholds.cross_rate_max_lag_seconds:
                     self._reject_lag(ctx, level, ds, viability_row[ts_col], eth_ts, lag)
                     continue
             vol_col = ds.col("volume_usd") or ds.col("volume_token")
-            for step_idx, window_s, half, w_start, w_end, rows in self._window_vwmp(ds, price_col, vol_col, timestamp, granularity):
-                if not rows:
-                    continue
-                n_raw = len(rows)
-                prices_eth = [float(r[price_col]) for r in rows if r.get(price_col) is not None]
-                volumes = (
-                    [float(r[vol_col]) if r.get(vol_col) is not None else 1.0 for r in rows if r.get(price_col) is not None]
-                    if vol_col else [1.0] * len(prices_eth)
-                )
-                if not prices_eth:
+            for step_idx, window_s, half, w_start, w_end, st in self._window_vwmp(ds, price_col, vol_col, timestamp, granularity):
+                if not st.n_valid:
                     continue
                 warns: list[Warning] = list(z_warns)
-                pc, vc, excluded, mad_fallback = self._clean(prices_eth, volumes, warns, False, cfg.thresholds.sigma_mad)
-                if len(pc) < cfg.thresholds.min_swaps_for_stat_score:
+                self._clean(st, warns, False, cfg.thresholds.sigma_mad)
+                if st.kept < cfg.thresholds.min_swaps_for_stat_score:
                     warns.append(Warning(code="low_swap_count",
-                                         message=f"Only {len(pc)} clean swap(s) in window.", severity="info"))
-                token_eth_vwmp = _compute_vwmp(pc, vc)
+                                         message=f"Only {st.kept} clean swap(s) in window.", severity="info"))
+                token_eth_vwmp = st.vwmp
                 if token_eth_vwmp is None:
                     continue
-                price_usd = token_eth_vwmp * eth_price
-                eth_lag = abs((timestamp - eth_ts).total_seconds()) if eth_ts is not None else None
+                eth_st = self._eth_leg_vwmp(eth_file, w_start, w_end)
+                if eth_st is not None:
+                    # Both legs aggregate the same window: the ETH/USD leg is timed at T like the token leg.
+                    eth_leg, eth_leg_ts, eth_lag = eth_st.vwmp, timestamp, 0.0
+                    eth_line = (f"ETH/USD VWMP({eth_st.kept} swaps, ±{half:.0f}s"
+                                + (f", {eth_st.excluded} excluded by MAD" if eth_st.excluded else "") + f"): {eth_file}")
+                    leg_row = {**eth_row, ETH_LEG_AGGREGATED: True}  # no single ETH/USD event behind the price
+                else:
+                    eth_leg, eth_leg_ts, leg_row = eth_price, eth_ts, eth_row
+                    eth_lag = abs((timestamp - eth_ts).total_seconds()) if eth_ts is not None else None
+                    eth_line = f"ETH/USD point read: {eth_file}"
+                price_usd = token_eth_vwmp * eth_leg
                 files = [ds.rel]
                 if eth_file:
                     files.append(eth_file)
@@ -530,27 +660,27 @@ class Engine:
                     timestamp_observed=timestamp,
                     branch_level=level,
                     branch_label=label,
-                    data_status=_windowed_status(step_idx, mad_fallback),
+                    data_status=_windowed_status(step_idx, st.mad_fallback),
                     files_used=files,
                     calculation_path=[
-                        f"{asset}/ETH VWMP({len(pc)} swaps, ±{half:.0f}s): {ds.rel}",
-                        f"ETH/USD point read: {eth_file}",
-                        f"{asset}/USD = {asset}/ETH VWMP × ETH/USD",
+                        f"{asset}/ETH VWMP({st.kept} swaps, ±{half:.0f}s): {ds.rel}",
+                        eth_line,
+                        f"{asset}/USD = {asset}/ETH VWMP × ETH/USD" + (" VWMP" if eth_st is not None else ""),
                     ],
                     token_leg_timestamp=timestamp,
-                    eth_usd_leg_timestamp=eth_ts,
+                    eth_usd_leg_timestamp=eth_leg_ts,
                     cross_rate_lag_seconds=eth_lag,
                     detected_columns={ds.csv_name: ds.raw_columns},
                     source_row=viability_row,
                     source_schema=ds.schema,
-                    eth_source_row=eth_row,
+                    eth_source_row=leg_row,
                     eth_source_schema=eth_schema,
                     warnings=warns,
                     granularity=granularity,
-                    n_raw=n_raw,
-                    swap_count=len(pc),
+                    n_raw=st.n_raw,
+                    swap_count=st.kept,
                     window_seconds=float(window_s),
-                    excluded_swaps=excluded,
+                    excluded_swaps=st.excluded,
                     initial_window_seconds=float(_WINDOW_STEPS[granularity][0]),
                     window_start_utc=w_start,
                     window_end_utc=w_end,
@@ -570,14 +700,17 @@ class Engine:
                 continue
             if self._empty(ctx, "2", ds):
                 continue
-            row = self.store.as_of(rel, timestamp, _row_cols(ds))
+            pr = self._probe(ds, timestamp)
+            row = pr.row
             if row is None or row.get(inv_col) is None or float(row[inv_col]) == 0:
                 ctx.reject("2", rel, "no_observation", "no observation at or before T")
                 continue
             eth_usd = 1.0 / float(row[inv_col])
-            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_usd)
+            zombie, z_warns, z_why = self._is_zombie(ds, row, timestamp, eth_usd_price=eth_usd, probe=pr)
             if zombie:
                 self._reject_row(ctx, "2", ds, row, timestamp, z_why)
+                continue
+            if self._stale(ctx, "2", rel, row["ts"], timestamp):
                 continue
             bn, bts, bwarns = self._extract_block_ref(ds, row)
             return PriceResult(
@@ -611,7 +744,8 @@ class Engine:
                 continue
             if self._empty(ctx, "2", ds):
                 continue
-            viability_row = self.store.as_of(rel, timestamp, _row_cols(ds))
+            pr = self._probe(ds, timestamp)
+            viability_row = pr.row
             if viability_row is None:
                 ctx.reject("2", rel, "no_observation", "no observation at or before T")
                 continue
@@ -619,24 +753,19 @@ class Engine:
                 1.0 / float(viability_row[inv_col])
                 if viability_row.get(inv_col) and float(viability_row[inv_col]) != 0 else None
             )
-            zombie, z_warns, z_why = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_usd_viability)
+            zombie, z_warns, z_why = self._is_zombie(ds, viability_row, timestamp, eth_usd_price=eth_usd_viability,
+                                                     probe=pr)
             if zombie:
                 self._reject_row(ctx, "2", ds, viability_row, timestamp, z_why)
                 continue
             vol_col = ds.col("volume_usd") or ds.col("volume_token")
-            for step_idx, window_s, half, w_start, w_end, rows in self._window_vwmp(ds, inv_col, vol_col, timestamp, granularity):
-                n_raw = len(rows)
-                valid = [r for r in rows if r.get(inv_col) is not None and float(r[inv_col]) != 0]
-                if not valid:
+            for step_idx, window_s, half, w_start, w_end, st in self._window_vwmp(ds, inv_col, vol_col, timestamp,
+                                                                                 granularity, inverse=True):
+                if not st.n_valid:
                     continue
-                prices = [1.0 / float(r[inv_col]) for r in valid]
-                volumes = (
-                    [float(r[vol_col]) if r.get(vol_col) is not None else 1.0 for r in valid]
-                    if vol_col else [1.0] * len(prices)
-                )
                 warns: list[Warning] = list(z_warns)
-                pc, vc, excluded, mad_fallback = self._clean(prices, volumes, warns, False, cfg.thresholds.sigma_mad)
-                price_vwmp = _compute_vwmp(pc, vc)
+                self._clean(st, warns, False, cfg.thresholds.sigma_mad)
+                price_vwmp = st.vwmp
                 if price_vwmp is None:
                     continue
                 warns.append(Warning(code="block_metadata_aggregated",
@@ -647,10 +776,10 @@ class Engine:
                     timestamp_observed=timestamp,
                     branch_level="2",
                     branch_label="alternative_amm",
-                    data_status=_windowed_status(step_idx, mad_fallback),
+                    data_status=_windowed_status(step_idx, st.mad_fallback),
                     files_used=[rel],
                     calculation_path=[
-                        f"Curve VWMP({len(pc)} swaps, ±{half:.0f}s)",
+                        f"Curve VWMP({st.kept} swaps, ±{half:.0f}s)",
                         "ETH/USD = 1 / VWMP(price_weth_per_crvusd)",
                     ],
                     detected_columns={ds.csv_name: ds.raw_columns},
@@ -658,10 +787,10 @@ class Engine:
                     source_schema=ds.schema,
                     warnings=warns,
                     granularity=granularity,
-                    n_raw=n_raw,
-                    swap_count=len(pc),
+                    n_raw=st.n_raw,
+                    swap_count=st.kept,
                     window_seconds=float(window_s),
-                    excluded_swaps=excluded,
+                    excluded_swaps=st.excluded,
                     initial_window_seconds=float(_WINDOW_STEPS[granularity][0]),
                     window_start_utc=w_start,
                     window_end_utc=w_end,
@@ -763,8 +892,13 @@ class Engine:
             if res is not None:
                 return res
 
-        # Level 3 (Chainlink) stays a point read whatever the granularity.
-        if branch in ("auto", "3") or source == "chainlink":
+        # Level 3 (Chainlink) stays a point read whatever the granularity. V1/V2 also reached it with source=dex (and
+        # with source=chainlink whatever the branch); the strict filter keeps source=dex on the DEX levels.
+        if self.strict_source():
+            chainlink = source in ("auto", "chainlink") and branch in ("auto", "3")
+        else:
+            chainlink = branch in ("auto", "3") or source == "chainlink"
+        if chainlink:
             res = self._chainlink(asset, timestamp, ctx)
             if res:
                 return res

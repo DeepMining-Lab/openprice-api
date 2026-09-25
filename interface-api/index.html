@@ -929,6 +929,11 @@ function init() {
     b.addEventListener('click', () => selectVersion(b.dataset.ver));
   });
 
+  // Source / branch pairs refused by V3
+  document.getElementById('inp-source').addEventListener('change', syncSourceBranch);
+  document.getElementById('inp-branch').addEventListener('change', syncSourceBranch);
+  syncSourceBranch();
+
   // Language buttons
   document.querySelectorAll('#lang-group .pill-btn').forEach(b => {
     b.addEventListener('click', () => selectLang(b.dataset.lang));
@@ -1061,6 +1066,22 @@ function selectGran(g) {
 function selectVersion(v) {
   selectedVersion = v;
   document.querySelectorAll('#ver-group .pill-btn').forEach(b => b.classList.toggle('active', b.dataset.ver === v));
+  syncSourceBranch();
+}
+
+// V3 refuses (HTTP 422) the source/branch pairs no source can satisfy: level 3 is Chainlink, levels 0a/0b/1/2 are
+// DEX levels. V1/V2 accept them and answer from Chainlink. With V3 selected, the options that would form such a pair
+// are disabled, and a branch that became impossible goes back to auto.
+const V3_EXCLUDED_BRANCHES = { dex: ['3'], chainlink: ['0a', '0b', '1', '2'] };
+
+function syncSourceBranch() {
+  const src = document.getElementById('inp-source');
+  const br  = document.getElementById('inp-branch');
+  const refused = (source, branch) =>
+    selectedVersion === 'v3' && (V3_EXCLUDED_BRANCHES[source] || []).includes(branch);
+  if (refused(src.value, br.value)) br.value = 'auto';
+  for (const o of br.options)  o.disabled = refused(src.value, o.value);
+  for (const o of src.options) o.disabled = refused(o.value, br.value);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

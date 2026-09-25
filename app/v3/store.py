@@ -22,7 +22,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,8 +34,11 @@ from app.v3 import sync as sync_mod
 from app.v3.chainlink_phases import PhaseTable
 from app.v3.sync import CANON_TO_PQ
 
-# Look-back ladder for as-of lookups: cheap bounded scans first, unbounded last.
+# Look-back ladder for as-of lookups: cheap bounded scans first, unbounded last. A dataset of at most
+# _SMALL_DATASET_ROWS rows (about one row group) is read with the unbounded query directly: it costs the same as
+# one bounded step, and a quiet pool would otherwise take all three.
 _LOOKBACKS = ("1 day", "30 days", None)
+_SMALL_DATASET_ROWS = 50_000
 
 
 @dataclass
@@ -56,6 +59,7 @@ class DatasetInfo:
     file_version: str | None = None
     chainlink: dict[str, Any] = field(default_factory=dict)   # proxy, switches, verified_ts, status
     phases: PhaseTable | None = None                          # None: no switch table for this feed
+    extraction_head: datetime | None = None                   # chain time the last extraction of the file reached
 
     def has(self, canonical: str) -> bool:
         return canonical in self.schema.mapping
@@ -71,6 +75,37 @@ class DatasetInfo:
 
 def _parse_ts(v: str | None) -> datetime | None:
     return datetime.fromisoformat(v) if v else None
+
+
+@dataclass
+class Probe:
+    """What the viability checks of one candidate need, read in a single query (see ``Store.probe``)."""
+    row: dict[str, Any] | None   # as-of row at T (``Store.as_of``)
+    n_same_ts: int | None        # rows sharing the as-of row's timestamp; None when not counted
+    n_24h: int                   # rows with T - 24 h <= ts <= T
+    vol_24h: float | None        # SUM(volume) over the same rows; None when there is no non-null value
+
+
+@dataclass
+class WindowStats:
+    """MAD filter + VWMP of one window, as ``price_service._filter_mad_outliers`` / ``_compute_vwmp`` compute them."""
+    n_raw: int             # rows in the window
+    n_valid: int           # rows with a usable price
+    kept: int              # prices the VWMP is computed on (0 only when n_valid is 0)
+    excluded: int          # prices flagged by the MAD filter
+    vwmp: float | None
+    mad_fallback: bool = False  # every price was flagged: all are used (V1/V2 rule)
+
+
+# A 24 h volume is summed as exact decimals (10 decimal places; every stored volume is below 1e8 USD), so the result
+# does not depend on the order of the additions: a range computed in bulk (app.v3.batch) gets the same bits as a
+# point. Legacy mode keeps the float sum of V1/V2.
+VOLUME_DECIMAL = "TRY_CAST({col} AS DECIMAL(38, 10))"
+
+
+# Beyond this relative distance between a cumulative volume and half the total, the summation order cannot change
+# which price the VWMP picks (rounding error <= n * 1.1e-16 of the total absolute volume).
+_VWMP_AMBIGUITY = 1e-9
 
 
 class Store:
@@ -104,12 +139,15 @@ class Store:
             return False
         manifest = sync_mod.load_manifest(self.root)
         if not force and manifest.get("version") == self.version:
-            # Same data; only the Chainlink phase check (verified_ts, status) can have moved.
+            # Same data; only the Chainlink phase check (verified_ts, status) and the extraction heads can have moved.
             with self._lock:
                 for rel, d in manifest["datasets"].items():
-                    if rel in self._datasets and d.get("chainlink"):
-                        self._datasets[rel].chainlink = d["chainlink"]
-                        self._datasets[rel].phases = _phase_table(d["chainlink"])
+                    if rel in self._datasets:
+                        self._datasets[rel].extraction_head = _parse_ts(d.get("extraction_head_utc"))
+                        if d.get("chainlink"):
+                            self._datasets[rel].chainlink = d["chainlink"]
+                            self._datasets[rel].phases = _phase_table(d["chainlink"])
+                self._coverage = _coverage(self._datasets)
                 self._manifest_mtime = mtime
             return False
         with self._lock:
@@ -132,13 +170,10 @@ class Store:
                     files=files, n_rows=d["n_rows"], min_ts=_parse_ts(d["min_ts"]), max_ts=_parse_ts(d["max_ts"]),
                     view=view, schema=schema, columns=columns, file_version=d.get("file_version"),
                     chainlink=chainlink, phases=_phase_table(chainlink),
+                    extraction_head=_parse_ts(d.get("extraction_head_utc")),
                 )
             self._datasets = datasets
-            self._coverage = {}
-            for d in datasets.values():
-                folder = d.rel.split("/")[0]
-                if d.max_ts is not None and (folder not in self._coverage or d.max_ts > self._coverage[folder]):
-                    self._coverage[folder] = d.max_ts
+            self._coverage = _coverage(datasets)
             self._quote_cache = {}
             self._manifest_mtime = mtime
             self.version = manifest.get("version")
@@ -168,12 +203,10 @@ class Store:
         return self._datasets
 
     def coverage(self, rel: str) -> datetime | None:
-        """Latest synced observation of the dataset's folder (one extraction container per folder).
-
-        A lower bound of the time up to which the extractor has scanned the chain: each asset folder
-        holds its Chainlink feed (1 h heartbeat; 24 h for the stablecoin peg feeds), whereas a quiet
-        pool's own last row can be days old even when the extraction is up to date.
-        """
+        """Chain time up to which the dataset's folder has been extracted and synced (one extraction container per
+        folder): the latest extraction head of its files (``extraction_head_utc`` of the manifest), or its latest
+        observation when no extraction head is recorded. A quiet pool or a peg feed (24 h heartbeat) can have its last
+        event hours before the extraction ran; the head says the extractor saw nothing newer up to that time."""
         return self._coverage.get(rel.split("/")[0])
 
     @property
@@ -220,24 +253,132 @@ class Store:
         d = self._datasets.get(rel)
         if d is None or not d.files or d.min_ts is None or t < d.min_ts:
             return None
-        select = ", ".join(dict.fromkeys(["ts", *cols]))
+        return self._as_of_ladder(d, t, list(dict.fromkeys(["ts", *cols])), self._lookbacks(d, _LOOKBACKS), phase)
+
+    @staticmethod
+    def _lookbacks(d: DatasetInfo, ladder: tuple) -> tuple:
+        return (None,) if d.n_rows <= _SMALL_DATASET_ROWS else ladder
+
+    def _as_of_ladder(self, d: DatasetInfo, t: datetime, select: list[str], lookbacks: tuple,
+                      phase: int | None = None) -> dict[str, Any] | None:
         where, args_extra, order = "", [], f"ts DESC, {self._tie_order(d)}"
         if phase is not None:
             where, args_extra, order = " AND phase = ?", [phase], "ts DESC, agg_round DESC NULLS LAST, rn ASC"
+        cols = ", ".join(select)
         cur = self._cursor()
-        for lb in _LOOKBACKS:
+        for lb in lookbacks:
             if lb is None:
-                sql = f"SELECT {select} FROM {d.view} WHERE ts <= ?{where} ORDER BY {order} LIMIT 1"
+                sql = f"SELECT {cols} FROM {d.view} WHERE ts <= ?{where} ORDER BY {order} LIMIT 1"
                 args: list[Any] = [t, *args_extra]
             else:
-                sql = (f"SELECT {select} FROM {d.view} WHERE ts <= ? AND ts > ?::TIMESTAMPTZ - INTERVAL '{lb}'{where} "
+                sql = (f"SELECT {cols} FROM {d.view} WHERE ts <= ? AND ts > ?::TIMESTAMPTZ - INTERVAL '{lb}'{where} "
                        f"ORDER BY {order} LIMIT 1")
                 args = [t, t, *args_extra]
             row = cur.execute(sql, args).fetchone()
             if row is not None:
-                names = [c.split(" AS ")[-1] for c in select.split(", ")]
-                return dict(zip(names, row))
+                return dict(zip(select, row))
         return None
+
+    def probe(self, rel: str, t: datetime, cols: list[str], vol_col: str | None) -> Probe:
+        """The as-of row at ``t`` (same rule as ``as_of``), the number of rows sharing its timestamp, and the rows and
+        SUM(``vol_col``) over ``[t - 24 h, t]`` (both inclusive, like ``sum_between``; an exact decimal sum outside
+        legacy mode, see ``VOLUME_DECIMAL``), from one scan of the last 24 hours. When that window is empty the as-of
+        row comes from the longer look-backs of ``as_of``."""
+        d = self._datasets.get(rel)
+        if d is None or not d.files or d.min_ts is None or t < d.min_ts:
+            return Probe(None, None, 0, None)
+        select = list(dict.fromkeys(["ts", *cols]))
+        tie = self._tie_order(d)
+        keys = [k.split()[0] for k in tie.split(", ")]
+        needed = ", ".join(dict.fromkeys([*select, *keys, *([vol_col] if vol_col else [])]))
+        if not vol_col:
+            vol = "CAST(NULL AS DOUBLE)"
+        elif self.legacy:
+            vol = f"sum({vol_col})"
+        else:
+            vol = f"CAST(sum({VOLUME_DECIMAL.format(col=vol_col)}) AS DOUBLE)"
+        sql = f"""
+            WITH w AS MATERIALIZED (SELECT {needed} FROM {d.view} WHERE ts >= ? AND ts <= ?),
+            top AS (SELECT {', '.join(select)} FROM w ORDER BY ts DESC, {tie} LIMIT 1),
+            agg AS (SELECT count(*) AS n24, {vol} AS vol24, max(ts) AS mx FROM w)
+            SELECT agg.n24, agg.vol24, (SELECT count(*) FROM w WHERE ts = agg.mx), top.*
+            FROM agg LEFT JOIN top ON TRUE
+        """
+        n24, vol24, n_same, *values = self._cursor().execute(sql, [t - timedelta(hours=24), t]).fetchone()
+        vol24 = float(vol24) if vol24 is not None else None
+        if not n24:
+            return Probe(self._as_of_ladder(d, t, select, self._lookbacks(d, _LOOKBACKS[1:])), None, 0, vol24)
+        return Probe(dict(zip(select, values)), int(n_same), int(n24), vol24)
+
+    def window_vwmp(self, rel: str, price_col: str, vol_col: str | None, start: datetime, end: datetime,
+                    sigma: float, limit: int | None = None, inverse: bool = False) -> WindowStats | None:
+        """MAD filter and VWMP of ``start <= ts < end`` inside DuckDB, without materialising the swaps in Python.
+
+        Same definitions as ``price_service``: rows without a price are dropped (``inverse``: price = 1 / col, rows
+        with 0 dropped too), a missing volume counts 1.0, the MAD filter is skipped under 3 prices or when MAD = 0 and
+        keeps ``0.6745 * |p - median| / MAD <= sigma``, and the VWMP is the first price, in price order and then
+        window order, whose cumulative volume reaches half the total (the upper median of the kept prices when the
+        total is <= 0; the highest price when no cumulative volume reaches half). With ``limit`` the window is first
+        cut to its oldest ``limit`` rows (legacy). Returns None when a cumulative volume is so close to half the total
+        that the order of the float additions could matter: the caller then computes it in Python.
+        """
+        d = self._datasets.get(rel)
+        if d is None or not d.files:
+            return WindowStats(0, 0, 0, 0, None)
+        order = self._window_order(d)
+        vol = vol_col if vol_col else "CAST(NULL AS DOUBLE)"
+        src = f"SELECT {', '.join(dict.fromkeys([*order.split(', '), price_col]))}, {vol} AS v0 FROM {d.view} " \
+              f"WHERE ts >= ? AND ts < ?"
+        if limit is not None:
+            src += f" ORDER BY ts, rn LIMIT {int(limit)}"
+        valid = f"{price_col} IS NOT NULL" + (f" AND {price_col} <> 0" if inverse else "")
+        price = f"1.0::DOUBLE / {price_col}" if inverse else price_col
+        sql = f"""
+            WITH w0 AS MATERIALIZED (SELECT *, row_number() OVER (ORDER BY {order}) AS i FROM ({src})),
+            f AS MATERIALIZED (SELECT i, {price} AS p, coalesce(v0, 1.0::DOUBLE) AS v FROM w0 WHERE {valid}),
+            n AS (SELECT count(*) AS n FROM f),
+            med AS (SELECT p AS med FROM (SELECT p, row_number() OVER (ORDER BY p) AS r FROM f)
+                    WHERE r = (SELECT n // 2 + 1 FROM n)),
+            dv AS MATERIALIZED (SELECT i, p, v, abs(p - (SELECT med FROM med)) AS dd FROM f),
+            mad AS (SELECT dd AS mad FROM (SELECT dd, row_number() OVER (ORDER BY dd) AS r FROM dv)
+                    WHERE r = (SELECT n // 2 + 1 FROM n)),
+            k AS MATERIALIZED (SELECT i, p, v FROM dv WHERE (SELECT n FROM n) < 3 OR (SELECT mad FROM mad) = 0
+                               OR 0.6745::DOUBLE * dd / (SELECT mad FROM mad) <= ?::DOUBLE),
+            tot AS (SELECT count(*) AS nk, sum(v) AS total, sum(abs(v)) AS scale FROM k),
+            c AS MATERIALIZED (SELECT p, i, sum(v) OVER (ORDER BY p, i ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
+                               AS cum FROM k)
+            SELECT (SELECT count(*) FROM w0), (SELECT n FROM n), tot.nk, tot.total, tot.scale,
+                   (SELECT p FROM c WHERE cum >= tot.total / 2 ORDER BY p, i LIMIT 1),
+                   (SELECT min(abs(cum - tot.total / 2)) FROM c),
+                   (SELECT p FROM (SELECT p, row_number() OVER (ORDER BY p, i) AS r FROM k) WHERE r = tot.nk // 2 + 1),
+                   (SELECT max(p) FROM k), (SELECT any_value(p) FROM k)
+            FROM tot
+        """
+        n_raw, n_valid, kept, total, scale, crossing, gap, upper_median, highest, only = \
+            self._cursor().execute(sql, [start, end, sigma]).fetchone()
+        n_raw, n_valid, kept = int(n_raw), int(n_valid), int(kept)
+        if n_valid == 0:
+            return WindowStats(n_raw, 0, 0, 0, None)
+        if kept == 0:
+            return None  # never happens (the median itself is kept); the Python path handles it like V1/V2
+        if kept == 1:
+            return WindowStats(n_raw, n_valid, 1, n_valid - 1, float(only))
+        tol = _VWMP_AMBIGUITY * float(scale)
+        if scale == 0:
+            return WindowStats(n_raw, n_valid, kept, n_valid - kept, float(upper_median))  # all volumes 0: total is 0
+        if abs(float(total)) <= tol or (gap is not None and float(gap) <= tol):
+            return None
+        if total <= 0:
+            return WindowStats(n_raw, n_valid, kept, n_valid - kept, float(upper_median))
+        return WindowStats(n_raw, n_valid, kept, n_valid - kept, float(crossing if crossing is not None else highest))
+
+    def tx_hash_of(self, rel: str, ts: datetime, rn: int) -> str | None:
+        """Transaction hash of the row ``rn`` (read only for the row that answers; see ``engine._row_cols``)."""
+        d = self._datasets.get(rel)
+        if d is None or not d.files or "tx_hash" not in d.columns:
+            return None
+        row = self._cursor().execute(f"SELECT tx_hash FROM {d.view} WHERE ts = ? AND rn = ?", [ts, rn]).fetchone()
+        return row[0] if row else None
 
     def count_at(self, rel: str, t: datetime, phase: int | None = None) -> int:
         """Rows sharing the timestamp ``t`` (in ``phase`` when given)."""
@@ -337,6 +478,16 @@ class Store:
             val = row[0] if row and row[0] is not None else None
         self._quote_cache[rel] = val
         return val
+
+
+def _coverage(datasets: dict[str, DatasetInfo]) -> dict[str, datetime]:
+    out: dict[str, datetime] = {}
+    for d in datasets.values():
+        folder = d.rel.split("/")[0]
+        for t in (d.max_ts, d.extraction_head):
+            if t is not None and (folder not in out or t > out[folder]):
+                out[folder] = t
+    return out
 
 
 def _phase_table(chainlink: dict[str, Any]) -> PhaseTable | None:

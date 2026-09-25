@@ -181,3 +181,12 @@ class ComparePoint(BaseModel):
     deviation: float | None
     dex_branch: str | None = None
     warnings: list[Warning] = []
+
+
+class ComparePointV3(ComparePoint):
+    """A /v3/compare row. ``dex_price_usd`` is the price /v3/prices returns: peg-neutralized when the quote is a
+    stablecoin with a peg feed, the price S_coh compares with Chainlink. The raw price in the quote currency and the
+    peg used are given next to it."""
+    dex_price_raw_in_quote: float | None = None
+    quote_currency: str | None = None
+    quote_currency_peg: float | None = None

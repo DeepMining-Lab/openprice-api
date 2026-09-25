@@ -2,7 +2,7 @@
 
   python tests/golden/compare_v3.py --legacy   # parity proof: V3 replays V1/V2 (truncation, CSV ties, all phases)
   python tests/golden/compare_v3.py            # V3 as shipped: lists what changes compared with V2
-  python tests/golden/compare_v3.py --v3 --golden tests/golden/v3_golden_base.jsonl --no-phase-filter
+  python tests/golden/compare_v3.py --v3 --golden tests/golden/v3_golden_base.jsonl --no-phase-filter --no-hierarchy-fixes
                                                # V3 against its own capture of 2026-09-24 (before the validity fixes)
 
 Exit code 0 only if every non-excused record is identical (floats: rel 1e-9).
@@ -51,14 +51,28 @@ def diff(a, b, path=""):
         yield (path, a, b)
 
 
+def set_hierarchy_fixes(cfg, on: bool) -> None:
+    """The corrections of 2026-09-25 (source hierarchy, hour/day ETH/USD leg, level-3 label) as configured (on) or
+    as V1/V2 (off)."""
+    if not on:
+        cfg.v3.strict_source_filter = False
+        cfg.v3.windowed_lag_check = "last_swap"
+        cfg.v3.raw_max_age_seconds = None
+        cfg.v3.no_swap_is_zero_volume = False
+        cfg.v3.windowed_eth_leg = "point"
+        cfg.v3.v2_oracle_coherence_label = True
+
+
 def compare(legacy: bool, limit: int | None = None, golden: str | None = None, v3_golden: bool = False,
-            phase_filter: bool | None = None):
+            phase_filter: bool | None = None, hierarchy_fixes: bool = True):
     """Run every golden record through V3. Returns (counts, differing_fields, bad) with
     bad = [(record_id, [(path, golden_value, v3_value), ...])] for non-excused differences.
-    ``phase_filter`` sets ``v3.chainlink_active_phase_only`` (legacy mode never filters)."""
+    ``phase_filter`` sets ``v3.chainlink_active_phase_only``; ``hierarchy_fixes=False`` turns the source hierarchy
+    corrections of 2026-09-25 off (legacy mode applies neither)."""
     cfg = get_config(); cfg.v3.legacy_truncation = legacy
     if phase_filter is not None:
         cfg.v3.chainlink_active_phase_only = phase_filter
+    set_hierarchy_fixes(cfg, hierarchy_fixes)
     svc = get_service()
     golden = golden or os.path.join(os.path.dirname(os.path.abspath(__file__)), "v2_golden.jsonl")
     recs = [json.loads(l) for l in open(golden) if l.strip()]
@@ -84,13 +98,17 @@ def main():
     ap.add_argument("--golden", help="golden file (default: v2_golden.jsonl)")
     ap.add_argument("--v3", action="store_true", help="the golden file is a V3 capture (capture_v3.py)")
     ap.add_argument("--no-phase-filter", action="store_true", help="v3.chainlink_active_phase_only = false")
+    ap.add_argument("--no-hierarchy-fixes", action="store_true",
+                    help="corrections of 2026-09-25 off, as V1/V2 (strict_source_filter, windowed_lag_check, "
+                         "raw_max_age_seconds, no_swap_is_zero_volume, windowed_eth_leg, v2_oracle_coherence_label)")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--show", type=int, default=12)
     args = ap.parse_args()
     counts, fields, bad = compare(args.legacy, args.limit, args.golden, args.v3,
-                                  False if args.no_phase_filter else None)
+                                  False if args.no_phase_filter else None, not args.no_hierarchy_fixes)
     mode = "LEGACY (parity proof)" if args.legacy else "FIXED (as shipped)"
     if args.no_phase_filter: mode += ", no Chainlink phase filter"
+    if args.no_hierarchy_fixes: mode += ", V1/V2 source hierarchy"
     print(f"mode={mode}: {counts['total']} golden records | identical={counts['identical']} | "
           f"dup-zone diffs={counts['dup_zone']} | other diffs={counts['other']} | skipped={counts['skipped']}")
     if fields:

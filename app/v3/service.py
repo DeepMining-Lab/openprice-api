@@ -18,7 +18,8 @@ On top of the V2 response, V3 adds diagnostics that never change a number (addit
 ``V3_DIAGNOSTIC_CODES``): a timestamp in the future is answered as an explicit NULL, a price that
 depends on data not yet synced is flagged as provisional, a fallback to a lower source level says
 which candidates were rejected and why (``provenance.rejected_candidates``), a Chainlink read whose
-phase table was not checked up to T is flagged. The provenance also names the on-chain event behind
+phase table was not checked up to T is flagged, and so is a Chainlink price (level 3, which has no confidence
+index) whose round is older than the feed's heartbeat allows (``oracle_stale``). The provenance also names the on-chain event behind
 a point price (``source_event``, ``eth_usd_leg_event``) and the data version that answered
 (``dataset_version``, ``dataset_files``); ``confidence.parameters`` lists every parameter used.
 Range endpoints report truncation and the start of the next page; ``raw`` series have one point per
@@ -40,12 +41,13 @@ from typing import Any
 from app import registry
 from app.config import AppConfig, get_config
 from app.routers.prices_v2 import _compute_s_liq
-from app.schemas import (ComparePoint, ConfidenceV2Detail, PriceV3Response, ProvenanceV3, RejectedCandidate,
+from app.schemas import (ComparePointV3, ConfidenceV2Detail, PriceV3Response, ProvenanceV3, RejectedCandidate,
                          SourceEventV3, Warning)
 from app.services import confidence_v2_service as v2
 from app.services.price_service import PriceResult, _level_4
 from app.services.provenance_service import build_provenance
-from app.v3.engine import Engine, no_round_message
+from app.v3.batch import BatchStore
+from app.v3.engine import ETH_LEG_AGGREGATED, N_SAME_TS, Engine, no_round_message
 from app.v3.store import Store, get_store
 
 
@@ -163,13 +165,14 @@ def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppC
 # ---------------------------------------------------------------------------
 
 V3_DIAGNOSTIC_CODES = frozenset({"future_timestamp", "beyond_data_coverage", "fallback_explained",
-                                 "chainlink_phase_unverified"})
+                                 "chainlink_phase_unverified", "oracle_stale"})
 # Additive V3 fields: provenance blocks and confidence parameters that V2 does not have.
 V3_PROVENANCE_FIELDS = ("rejected_candidates", "source_event", "eth_usd_leg_event", "dataset_version", "dataset_files")
 V3_PARAMETER_KEYS = ("coh_delta_tol_used", "seuil_TVL_min_usd", "tvl_score_mode", "tvl_log_min_usd", "tvl_log_ref_usd",
                      "min_swaps_for_stat_score", "s_stat_floor")
 
 _LEVEL_RANK = {"0a": 0, "0b": 1, "1": 2, "2": 3, "3": 4, "4": 5}
+_BATCH_MIN_POINTS = 8  # below this, one query per point costs no more than a bulk query
 
 
 def _iso(t: datetime) -> str:
@@ -330,7 +333,9 @@ class Service:
             fragility_flag=flag,
             subscores={"S_stat": s_stat, "S_liq": s_liq, "S_coh": s_coh},
             S_peg=s_peg,
-            coherence_mode="oracle_only_staleness" if result.branch_level == "3" else None,
+            # V2 labels level 3 although it computes no S_coh there (no confidence index for an oracle price).
+            coherence_mode="oracle_only_staleness" if result.branch_level == "3" and (
+                cfg.v3.v2_oracle_coherence_label or cfg.v3.legacy_truncation) else None,
             weights=weights,
             parameters={
                 "peg_tol": cfg.confidence_v2.peg.tol,
@@ -373,6 +378,24 @@ class Service:
                      "provisional and may change after the next data update."),
         )
 
+    def _oracle_warning(self, asset: str, timestamp: datetime, result: PriceResult) -> Warning | None:
+        """Flag a level-3 (Chainlink) price whose round is older than heartbeat x (1 + v3.oracle_stale_tolerance)
+        before T: the feed publishes at least once per heartbeat, so a newer round should exist."""
+        observed = result.timestamp_observed
+        heartbeat = self.cfg.v3.oracle_heartbeat_seconds.get(asset)
+        if result.branch_level != "3" or observed is None or not heartbeat:
+            return None
+        limit = heartbeat * (1 + self.cfg.v3.oracle_stale_tolerance)
+        age = (timestamp - observed).total_seconds()
+        if age <= limit:
+            return None
+        return Warning(
+            code="oracle_stale",
+            message=(f"The Chainlink round used was published at {_iso(observed)}, {age / 3600:,.1f} h before T. The "
+                     f"{asset}/USD feed publishes at least every {heartbeat:,.0f} s (heartbeat), so this oracle price is "
+                     f"stale (limit {limit:,.0f} s: heartbeat + {self.cfg.v3.oracle_stale_tolerance:.0%})."),
+        )
+
     def _phase_warning(self, timestamp: datetime, rels: list[str]) -> Warning | None:
         """Flag a Chainlink read at T whose phase switches were not checked on-chain up to T."""
         late, missing = [], []
@@ -406,11 +429,14 @@ class Service:
         if phase is not None and self.store.phase_filtering(rel):
             rule, n = "latest_round_of_active_phase", self.store.count_at(rel, ts, phase)
         else:
-            n = self.store.count_at(rel, ts)
+            n = row[N_SAME_TS] if row.get(N_SAME_TS) is not None else self.store.count_at(rel, ts)
             rule = ("first_swap_of_block" if row.get("log_index") is not None and not self.store.legacy
                     else "first_csv_row")
+        tx_hash = row.get("tx_hash")
+        if tx_hash is None and row.get("rn") is not None and "transaction_hash" in ds.raw_columns:
+            tx_hash = self.store.tx_hash_of(rel, ts, row["rn"])
         return SourceEventV3(
-            file=rel, timestamp=ts, tx_hash=row.get("tx_hash"), log_index=row.get("log_index"),
+            file=rel, timestamp=ts, tx_hash=tx_hash, log_index=row.get("log_index"),
             block_number=row.get("block_number"), phase=phase, aggregator_round=row.get("agg_round"),
             rows_at_same_timestamp=n, tie_break_rule=rule,
         )
@@ -452,6 +478,7 @@ class Service:
         # is one (they qualify the scores too: provisional data, why C is null after a fallback).
         chainlink_read = [r for r in [*result.files_used, cl_rel, peg_rel] if r]
         diagnostics = [w for w in (*(extra or []), self._coverage_warning(timestamp, result, peg_rel),
+                                   self._oracle_warning(asset, timestamp, result),
                                    fallback_warning(result, rejected),
                                    self._phase_warning(timestamp, chainlink_read) if result.price_usd is not None
                                    else None) if w is not None]
@@ -466,7 +493,8 @@ class Service:
                 source_event=self._event(result.files_used[0] if result.files_used else None,
                                          result.source_row) if result.granularity == "raw" else None,
                 eth_usd_leg_event=self._event(result.files_used[1], result.eth_source_row)
-                if result.eth_source_row is not None and len(result.files_used) > 1 else None,
+                if result.eth_source_row is not None and len(result.files_used) > 1
+                and not result.eth_source_row.get(ETH_LEG_AGGREGATED) else None,
                 dataset_version=self.store.version,
                 dataset_files={r: self.store.dataset(r).file_version for r in files},
             )
@@ -544,12 +572,24 @@ class Service:
         return resp.confidence, cached, resp
 
     # ------------------------------------------------------------------ ranges
+    def _for_points(self, stamps: list[datetime]) -> "Service":
+        """This service with a store that answers the per-point lookups of ``stamps`` in bulk (``BatchStore``), same
+        config and same response cache. Itself for a few points, in legacy mode or with ``v3.batch_ranges: false``."""
+        if len(stamps) < _BATCH_MIN_POINTS or not self.cfg.v3.batch_ranges or self.cfg.v3.legacy_truncation:
+            return self
+        view = copy.copy(self)
+        view.store = BatchStore(self.store, stamps)
+        view.engine = Engine(self.cfg, view.store)
+        return view
+
     def _map(self, fn, items):
-        """Ordered parallel map (DuckDB releases the GIL; cursors are per-thread)."""
+        """Ordered parallel map (DuckDB releases the GIL; cursors are per-thread). With bulk lookups most of the work
+        per point is Python, which threads do not run in parallel: fewer threads (``v3.batch_workers``)."""
         items = list(items)
         if len(items) < 8:
             return [fn(i) for i in items]
-        with ThreadPoolExecutor(max(1, self.cfg.v3.range_workers)) as ex:
+        workers = self.cfg.v3.batch_workers if isinstance(self.store, BatchStore) else self.cfg.v3.range_workers
+        with ThreadPoolExecutor(max(1, workers)) as ex:
             return list(ex.map(fn, items))
 
     def price_range(self, asset: str, start: datetime, end: datetime, limit: int, branch: str = "auto",
@@ -571,22 +611,30 @@ class Service:
             if t <= end:
                 next_start = t
         else:
-            # The winning source is probed at `end`, but never in the future (see price_at).
-            probe = self.engine.get_price_at(asset, min(end, datetime.now(timezone.utc)), branch=branch, source=source)
+            # The winning source is probed at `end`, but never in the future (see price_at) nor after the asset's last
+            # synced data (a raw read then rejects every pool as older than v3.raw_max_age_seconds).
+            at = min(end, datetime.now(timezone.utc))
+            covered = self.store.coverage(f"{asset.lower()}/")
+            if covered is not None and self.engine.max_age() is not None and at > covered:
+                at = max(start, covered)
+            probe = self.engine.get_price_at(asset, at, branch=branch, source=source)
             if probe.branch_level == "4" or not probe.files_used:
                 return Page([])
             stamps = self.store.distinct_ts(probe.files_used[0], start, end, limit + 1)
             if len(stamps) > limit:
                 next_start, stamps = stamps[limit], stamps[:limit]
-        results = self._map(
-            lambda ts: self.price_at(asset, ts, branch, source, granularity, include_confidence, include_provenance),
+        svc = self._for_points(stamps)
+        results = svc._map(
+            lambda ts: svc.price_at(asset, ts, branch, source, granularity, include_confidence, include_provenance),
             stamps,
         )
         return Page([r for r, _ in results], next_start, sum(1 for _, cached in results if cached))
 
     def compare(self, asset: str, start: datetime, end: datetime, limit: int) -> Page:
         """DEX price vs Chainlink at every Chainlink round in [start, end) (V1 ``/compare`` semantics); with the
-        phase filter, only the rounds of the phase the proxy served when they were published."""
+        phase filter, only the rounds of the phase the proxy served when they were published. The DEX price is the
+        one /v3/prices returns, peg-neutralized like the price S_coh compares (V1/V2 and legacy mode: raw price in
+        the quote currency)."""
         self.store.maybe_reload()
         limit = min(limit, self.cfg.api.max_limit)
         cl_paths = registry.get_chainlink_paths(asset)
@@ -606,19 +654,26 @@ class Service:
                 cut -= 1
             rows = rows[:cut] or rows
 
-        def one(row: dict[str, Any]) -> ComparePoint:
+        svc = self._for_points([r["ts"] for r in rows])
+
+        def one(row: dict[str, Any]) -> ComparePointV3:
             ts = row["ts"]
             cl_price = float(row[price_col]) if row.get(price_col) is not None else None
-            dex = self.engine.get_price_at(asset, ts, source="dex")
-            dex_price = dex.price_usd
+            dex = svc.engine.get_price_at(asset, ts, source="dex")
+            raw = dex.price_usd
+            quote, peg = None, None
+            if raw is not None and not self.cfg.v3.legacy_truncation:
+                quote, peg, _, _ = svc._neutralize(dex, ts)
+            dex_price = raw * peg if raw is not None and peg is not None else raw
             deviation = None
             if dex_price is not None and cl_price is not None and cl_price != 0:
                 deviation = abs(dex_price - cl_price) / cl_price
-            return ComparePoint(timestamp=ts, dex_price_usd=dex_price, chainlink_price_usd=cl_price,
-                                deviation=deviation, dex_branch=dex.branch_level if dex_price is not None else None,
-                                warnings=dex.warnings)
+            return ComparePointV3(timestamp=ts, dex_price_usd=dex_price, chainlink_price_usd=cl_price,
+                                  deviation=deviation, dex_branch=dex.branch_level if dex_price is not None else None,
+                                  warnings=dex.warnings, dex_price_raw_in_quote=raw, quote_currency=quote,
+                                  quote_currency_peg=peg)
 
-        return Page(self._map(one, rows), next_start)
+        return Page(svc._map(one, rows), next_start)
 
 
 _service: Service | None = None

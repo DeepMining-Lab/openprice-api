@@ -20,6 +20,9 @@ containers). This module derives a query-friendly copy under ``v3.parquet_root``
   other cells that could not be converted (kept as NULL), duplicates removed;
 * for Chainlink feeds, the proxy phase switches are read from the chain (see
   ``app.v3.chainlink_phases``) when ``$<v3.rpc_url_env>`` is set;
+* the extraction head of every file (how far the extractor had scanned the chain on its last run, read from the
+  ``extraction_timestamp_utc`` / ``node_head_block_at_extraction`` columns of the last rows) is kept in the manifest:
+  it is the data coverage the API reports (``beyond_data_coverage``);
 * ``manifest.json`` is swapped atomically and every published version is also kept in
   ``history/<version>.json.gz``; ``sync_log.jsonl`` records each rebuild, append and phase
   switch with its reason. The API reloads the manifest when it changes.
@@ -39,7 +42,7 @@ import json
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -274,6 +277,51 @@ def _copy_range(src: Path, dest: Path, start: int, end: int, prefix: bytes = b""
             lines += b.count(b"\n")
             remaining -= len(b)
     return lines
+
+
+_HEAD_TAIL_BYTES = 256 << 10
+_BLOCK_SECONDS = 12  # post-merge slot: (head - block) x 12 s never overstates the time elapsed (missed slots)
+
+
+def _ts(v: str | None) -> datetime | None:
+    try:
+        t = datetime.fromisoformat(v.strip()) if v and v.strip() else None
+    except ValueError:
+        return None
+    return t.replace(tzinfo=timezone.utc) if t is not None and t.tzinfo is None else t
+
+
+def extraction_head(path: Path, end: int, names: list[str]) -> str | None:
+    """Chain time up to which the extractor had scanned when it wrote the last rows of ``[0, end)``: for each of the
+    last rows, its ``extraction_timestamp_utc``, lowered to ``block_timestamp_utc + (node_head_block_at_extraction -
+    block_number) x 12 s`` when the row is a swap; the latest over those rows (the file is in event order, so the last
+    rows come from the last run). None when the file has no extraction columns."""
+    col = {n: i for i, n in enumerate(names)}
+    if "extraction_timestamp_utc" not in col or end <= 0:
+        return None
+    start = max(0, end - _HEAD_TAIL_BYTES)
+    with path.open("rb") as f:
+        f.seek(start)
+        lines = f.read(end - start).decode("utf-8", errors="replace").splitlines()
+    if start > 0:
+        lines = lines[1:]  # partial first line
+    best: datetime | None = None
+    for row in csv.reader(lines[-500:]):
+        if len(row) != len(names):
+            continue
+        head = _ts(row[col["extraction_timestamp_utc"]])
+        if head is None:
+            continue
+        try:
+            block = int(row[col["block_number"]]) if "block_number" in col else None
+            node = int(row[col["node_head_block_at_extraction"]]) if "node_head_block_at_extraction" in col else None
+        except ValueError:
+            block = node = None
+        block_ts = _ts(row[col["block_timestamp_utc"]]) if "block_timestamp_utc" in col else None
+        if block is not None and node is not None and block_ts is not None and node >= block:
+            head = min(head, block_ts + timedelta(seconds=(node - block) * _BLOCK_SECONDS))
+        best = head if best is None or head > best else best
+    return best.isoformat() if best else None
 
 
 def _canonical_select(schema: csv_adapter.SchemaInfo, rn_base: int) -> tuple[str, list[str]]:
@@ -618,6 +666,7 @@ def sync_dataset(
         "max_ts": hi.isoformat() if hi else None,
         "segments": segments,
         "last_change": {"at": _now(), "action": "rebuild" if full else "append", "reason": reason},
+        "extraction_head_utc": extraction_head(csv_path, end, names) or (prev or {}).get("extraction_head_utc"),
     }
     if chainlink:
         state["chainlink"] = chainlink
@@ -722,6 +771,16 @@ def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: boo
                 state, res = prev, SyncResult(rel, "error", notes=[f"sync failed, previous state kept: "
                                                                    f"{type(e).__name__}: {first}"])
             results.append(res)
+            if state is not None and "extraction_head_utc" not in state:
+                # Manifests written before the extraction head was recorded: read it once from the CSV tail.
+                try:
+                    names = _header_names(_read_header_line(cfg.paths.datasets_path / rel))
+                    state = {**state, "extraction_head_utc": extraction_head(cfg.paths.datasets_path / rel,
+                                                                             state["csv_offset"], names)}
+                    datasets[rel] = state
+                    changed = True
+                except OSError:
+                    pass
             if state is not None and res.action in ("append", "rebuild", "verified"):
                 datasets[rel] = state
                 changed = True

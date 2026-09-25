@@ -211,14 +211,64 @@ class V3Config(BaseModel):
     legacy_truncation: bool = False
     # Chainlink: read only the rounds of the aggregator phase that the proxy served at T (app.v3.chainlink_phases).
     chainlink_active_phase_only: bool = True
+    # Corrections of the V1/V2 source hierarchy (2026-09-25); legacy mode ignores all four.
+    # source=dex never answers from Chainlink; contradictory source/branch pairs and branch=4 are refused (422).
+    strict_source_filter: bool = True
+    # hour/day cross-rate: "eth_leg" bounds the lag between the ETH/USD point read and T by
+    # thresholds.cross_rate_max_lag_seconds; "last_swap" (V1/V2) compares the ETH/USD leg with the token pool's last
+    # swap before T, which rejects pools that do have swaps in the window.
+    windowed_lag_check: Literal["eth_leg", "last_swap"] = "eth_leg"
+    # raw DEX read: an observation older than this before T is rejected (the pool of a direct read, either leg of
+    # a cross-rate). None = no limit (V1/V2: only the 30-day inactivity rule, plus the lag between the two legs).
+    raw_max_age_seconds: float | None = 3600
+    # zombie rule: no swap in the 24 h before T is a 24 h volume of 0 USD (V1/V2 skipped the volume check).
+    no_swap_is_zero_volume: bool = True
+    # hour/day cross-rate: the ETH/USD leg is the VWMP (MAD-filtered) of the ETH/USD reference pool over the token
+    # leg's window ("vwmp"); V1/V2 multiply by a single swap, the point read at T ("point"). An empty ETH/USD window
+    # falls back to the point read.
+    windowed_eth_leg: Literal["vwmp", "point"] = "vwmp"
+    # V2 labels a level-3 confidence block coherence_mode "oracle_only_staleness" although it computes no S_coh there;
+    # V3 leaves it null unless this is true.
+    v2_oracle_coherence_label: bool = False
+    # Heartbeat of each asset's Chainlink USD feed, as the extraction declares it (column heartbeat_seconds of the CSV
+    # files). chainlink.heartbeat_seconds_by_asset (86 400) is a V1 parameter, kept for V1/V2 reproducibility.
+    oracle_heartbeat_seconds: dict[str, float] = {"ETH": 3600, "LINK": 3600, "UNI": 3600, "AAVE": 3600, "COMP": 3600}
+    # Warning oracle_stale: a level-3 (Chainlink) price whose round is older than heartbeat x (1 + tolerance) before T.
+    # No confidence index is computed for an oracle price; the warning is the only staleness signal.
+    oracle_stale_tolerance: float = 0.1
     # Environment variable holding the Ethereum RPC URL the sync uses to read the proxy phase switches. The URL
     # itself is never written in this file (it can carry an access token). Unset: the phase table is kept as is.
     rpc_url_env: str = "OPENPRICE_RPC_URL"
     cache_size: int = 4096            # LRU entries for point responses (0 disables)
     duckdb_threads: int = 4
     range_workers: int = 8            # threads computing the points of one range request in parallel
+    # Range requests read the per-point lookups (as-of rows, 24 h volumes) of all their timestamps in bulk
+    # (app.v3.batch); false = one query per point, as /prices/{asset}/at. Never used in legacy mode.
+    batch_ranges: bool = True
+    batch_workers: int = 6            # threads per range request with bulk lookups (much of the rest is Python)
     manifest_poll_seconds: float = 5.0
     max_segments_before_compaction: int = 30
+
+    @field_validator("raw_max_age_seconds")
+    @classmethod
+    def _positive_age(cls, v: float | None) -> float | None:
+        if v is not None and v <= 0:
+            raise ValueError("v3.raw_max_age_seconds must be > 0 (or null for no limit)")
+        return v
+
+    @field_validator("oracle_heartbeat_seconds")
+    @classmethod
+    def _positive_heartbeats(cls, v: dict[str, float]) -> dict[str, float]:
+        if any(s <= 0 for s in v.values()):
+            raise ValueError("v3.oracle_heartbeat_seconds values must be > 0")
+        return v
+
+    @field_validator("oracle_stale_tolerance")
+    @classmethod
+    def _non_negative_tolerance(cls, v: float) -> float:
+        if v < 0:
+            raise ValueError("v3.oracle_stale_tolerance must be >= 0")
+        return v
 
     @property
     def parquet_path(self) -> Path:

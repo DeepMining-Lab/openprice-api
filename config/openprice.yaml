@@ -82,9 +82,26 @@ v3:
   parquet_root: "~/openprice/parquet"   # derived data; never inside the datasets directory
   legacy_truncation: false               # true = replay V1/V2 exactly (windows cut to api.max_limit rows, CSV-order ties, all Chainlink phases)
   chainlink_active_phase_only: true      # Chainlink: only the rounds of the aggregator phase the proxy served at T
+  # Corrections of the V1/V2 source hierarchy (ignored in legacy mode):
+  strict_source_filter: true             # source=dex never answers from Chainlink; contradictory source/branch pairs and branch=4 -> 422
+  windowed_lag_check: "eth_leg"          # hour/day cross-rate: |T - ETH/USD leg| <= cross_rate_max_lag_seconds (V1/V2: "last_swap", the token pool's last swap before T)
+  raw_max_age_seconds: 3600              # raw DEX read: observations older than this before T are rejected (null = no limit, V1/V2)
+  no_swap_is_zero_volume: true           # zombie rule: no swap in the 24 h before T = 0 USD volume (V1/V2 skipped the check)
+  windowed_eth_leg: "vwmp"               # hour/day cross-rate: ETH/USD leg = VWMP over the token leg's window (V1/V2: "point", one swap)
+  v2_oracle_coherence_label: false       # level 3: coherence_mode null (V2: "oracle_only_staleness", with no S_coh computed)
+  # Level 3 (Chainlink): no confidence index; warning oracle_stale when the round is older than heartbeat x (1 + tolerance)
+  oracle_heartbeat_seconds:              # as declared by the extraction (heartbeat_seconds column of the Chainlink CSVs)
+    ETH: 3600
+    LINK: 3600
+    UNI: 3600
+    AAVE: 3600
+    COMP: 3600
+  oracle_stale_tolerance: 0.1            # since 2022, consecutive rounds were > 3 960 s apart only 2 to 4 times per feed
   rpc_url_env: "OPENPRICE_RPC_URL"       # env variable with the Ethereum RPC URL; the sync reads the proxy phase switches with it
   cache_size: 4096                       # LRU of point responses, invalidated on every dataset_version change
   duckdb_threads: 4
   range_workers: 8                       # points of one range request computed in parallel
+  batch_ranges: true                     # ranges and /compare read the per-point lookups of all their timestamps in bulk
+  batch_workers: 6                       # threads per range request in that mode (measured: 2 best for lookups only, 8 for ETH windows)
   manifest_poll_seconds: 5
   max_segments_before_compaction: 30
