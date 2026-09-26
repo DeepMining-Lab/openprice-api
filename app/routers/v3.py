@@ -198,6 +198,7 @@ def datasets_v3():
             "first_observation_utc": d["min_ts"],
             "last_observation_utc": d["max_ts"],
             "extraction_head_utc": d.get("extraction_head_utc"),
+            "oracle_complete_until_utc": d.get("oracle_complete_until_utc"),
             "native_copy": d.get("native"),
             "file_version": d.get("file_version"),
             "csv_bytes_read": d["csv_offset"],

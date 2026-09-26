@@ -99,7 +99,7 @@ def _get_with_provenance(real_client, asset: str, ts: str, *, gran: str = "raw")
 #   AAVE 2025-01-15 → 3   (AAVE/USDC TVL=$52k → zombie, AAVE/USDT TVL too low)
 #   COMP 2025-01-15 → 3   (COMP/USDC TVL=$159 → zombie)
 #   UNI  2020-01-01 → 4   (before UNI genesis; first swap 2021-05)
-#   LINK 2020-09-01 → 4   (before Chainlink LINK feed; first round 2021-03-12)
+#   LINK 2020-09-01 → 1   (SushiSwap LINK/ETH cross-rate; Chainlink LINK/USD rounds exist since 2019-12-12)
 # ---------------------------------------------------------------------------
 
 class TestRawBranchSelection:

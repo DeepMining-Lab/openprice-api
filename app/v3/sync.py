@@ -22,7 +22,9 @@ containers). This module derives a query-friendly copy under ``v3.parquet_root``
   ``app.v3.chainlink_phases``) when ``$<v3.rpc_url_env>`` is set;
 * the extraction head of every file (how far the extractor had scanned the chain on its last run, read from the
   ``extraction_timestamp_utc`` / ``node_head_block_at_extraction`` columns of the last rows) is kept in the manifest:
-  it is the data coverage the API reports (``beyond_data_coverage``);
+  it is the data coverage the API reports (``beyond_data_coverage``). A Chainlink file is also compared with the
+  proxy's latest round at the chain head on every run (``oracle_complete_until_utc``): holding that round, it is
+  complete up to the head even when it was extracted hours earlier;
 * every dataset also gets a native DuckDB copy of its segments (``native-<hash>.duckdb``, one table in (ts, rn)
   order, ``v3.native_store``): the API reads it 2 to 3 times faster than the Parquet files. It is derived from the
   segments only, named after them (a new name whenever they change) and written once, atomically; the Parquet
@@ -298,8 +300,9 @@ def _ts(v: str | None) -> datetime | None:
 def extraction_head(path: Path, end: int, names: list[str]) -> str | None:
     """Chain time up to which the extractor had scanned when it wrote the last rows of ``[0, end)``: for each of the
     last rows, its ``extraction_timestamp_utc``, lowered to ``block_timestamp_utc + (node_head_block_at_extraction -
-    block_number) x 12 s`` when the row is a swap; the latest over those rows (the file is in event order, so the last
-    rows come from the last run). None when the file has no extraction columns."""
+    block_number) x 12 s`` when the row is a swap; the latest over the rows of the last run (those with the
+    ``extraction_run_id`` of the last row: a backfill inserts older events from a later run in the middle of the file,
+    and its extraction time says nothing about the end of the file). None when the file has no extraction columns."""
     col = {n: i for i, n in enumerate(names)}
     if "extraction_timestamp_utc" not in col or end <= 0:
         return None
@@ -309,10 +312,12 @@ def extraction_head(path: Path, end: int, names: list[str]) -> str | None:
         lines = f.read(end - start).decode("utf-8", errors="replace").splitlines()
     if start > 0:
         lines = lines[1:]  # partial first line
+    rows = [row for row in csv.reader(lines[-500:]) if len(row) == len(names)]
+    if rows and "extraction_run_id" in col:
+        last_run = rows[-1][col["extraction_run_id"]]
+        rows = [row for row in rows if row[col["extraction_run_id"]] == last_run]
     best: datetime | None = None
-    for row in csv.reader(lines[-500:]):
-        if len(row) != len(names):
-            continue
+    for row in rows:
         head = _ts(row[col["extraction_timestamp_utc"]])
         if head is None:
             continue
@@ -326,6 +331,30 @@ def extraction_head(path: Path, end: int, names: list[str]) -> str | None:
             head = min(head, block_ts + timedelta(seconds=(node - block) * _BLOCK_SECONDS))
         best = head if best is None or head > best else best
     return best.isoformat() if best else None
+
+
+def last_round_id(path: Path, end: int, names: list[str]) -> int | None:
+    """Highest ``global_round_id`` (``phase << 64 | aggregator round``) among the last rows of ``[0, end)`` of a
+    Chainlink file: the latest round the extraction wrote for the most recent phase. None without that column."""
+    col = {n: i for i, n in enumerate(names)}
+    if "global_round_id" not in col or end <= 0:
+        return None
+    start = max(0, end - _HEAD_TAIL_BYTES)
+    with path.open("rb") as f:
+        f.seek(start)
+        lines = f.read(end - start).decode("utf-8", errors="replace").splitlines()
+    if start > 0:
+        lines = lines[1:]  # partial first line
+    best: int | None = None
+    for row in csv.reader(lines[-500:]):
+        if len(row) != len(names):
+            continue
+        try:
+            rid = int(row[col["global_round_id"]])
+        except ValueError:
+            continue
+        best = rid if best is None or rid > best else best
+    return best
 
 
 def _canonical_select(schema: csv_adapter.SchemaInfo, rn_base: int) -> tuple[str, list[str]]:
@@ -817,6 +846,44 @@ def _refresh_phases(cfg: AppConfig, datasets: dict[str, Any], rpc: chainlink_pha
     return changed, log, msgs
 
 
+def _refresh_complete_until(cfg: AppConfig, datasets: dict[str, Any], rpc: chainlink_phases.Rpc | None,
+                            only: str | None) -> list[str]:
+    """Record for every Chainlink feed the chain time up to which its file holds every round
+    (``oracle_complete_until_utc``, see ``chainlink_phases.complete_until``). The API extends the coverage of the
+    feed file to it. Without a node, or when the node fails, the previous value is kept (it stays true)."""
+    targets = [rel for rel, d in datasets.items() if (d.get("chainlink") or {}).get("proxy") and (not only or only in rel)]
+    if not targets or rpc is None:
+        return []
+    calls = rpc.calls
+    try:
+        head = rpc.block_number()
+        head_time = rpc.block_time(head)
+    except chainlink_phases.RpcError as e:
+        return [f"WARNING Chainlink rounds not compared with the chain head ({e})"]
+    msgs, complete = [], 0
+    for rel in targets:
+        d = datasets[rel]
+        path = cfg.paths.datasets_path / rel
+        try:
+            last = last_round_id(path, d["csv_offset"], _header_names(_read_header_line(path)))
+        except OSError:
+            continue
+        if last is None:
+            continue
+        try:
+            until = chainlink_phases.complete_until(rpc, d["chainlink"]["proxy"], last, head, head_time)
+        except chainlink_phases.RpcError as e:
+            msgs.append(f"WARNING {rel}: rounds not compared with the chain head ({e})")
+            continue
+        if until is not None:
+            datasets[rel] = {**d, "oracle_complete_until_utc": until.isoformat()}
+            if until == head_time:
+                complete += 1
+    msgs.append(f"Chainlink files complete up to the chain head for {complete} of {len(targets)} feeds "
+                f"({rpc.calls - calls} RPC calls)")
+    return msgs
+
+
 def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: bool = False,
              dry_run: bool = False, verify: bool = False,
              rpc: chainlink_phases.Rpc | None = None) -> list[SyncResult]:
@@ -868,7 +935,11 @@ def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: boo
                                 "quality_issues": res.issues})
                 # Publish progressively so a crash never loses converted datasets.
                 _write_manifest(root, datasets)
+        if rpc is None and os.environ.get(cfg.v3.rpc_url_env, ""):
+            rpc = chainlink_phases.Rpc(os.environ[cfg.v3.rpc_url_env])
         phases_changed, phase_log, msgs = (False, [], []) if dry_run else _refresh_phases(cfg, datasets, rpc, only)
+        if not dry_run:
+            msgs += _refresh_complete_until(cfg, datasets, rpc, only)
         results.append(SyncResult("chainlink phases", "checked", notes=msgs))
         log.extend(phase_log)
         if cfg.v3.native_store and not dry_run:

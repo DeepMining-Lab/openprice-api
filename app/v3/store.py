@@ -62,6 +62,7 @@ class DatasetInfo:
     chainlink: dict[str, Any] = field(default_factory=dict)   # proxy, switches, verified_ts, status
     phases: PhaseTable | None = None                          # None: no switch table for this feed
     extraction_head: datetime | None = None                   # chain time the last extraction of the file reached
+    oracle_complete_until: datetime | None = None             # Chainlink file: holds every round up to this chain time
     native: str | None = None                                 # native copy the view reads; None: Parquet segments
 
     def has(self, canonical: str) -> bool:
@@ -147,11 +148,13 @@ class Store:
             self._native_of(rel, d) == (self._datasets[rel].native if rel in self._datasets else None)
             for rel, d in manifest["datasets"].items())
         if not force and manifest.get("version") == self.version and same_natives:
-            # Same data; only the Chainlink phase check (verified_ts, status) and the extraction heads can have moved.
+            # Same data; only the Chainlink checks (phases, rounds up to the chain head) and the extraction heads can
+            # have moved.
             with self._lock:
                 for rel, d in manifest["datasets"].items():
                     if rel in self._datasets:
                         self._datasets[rel].extraction_head = _parse_ts(d.get("extraction_head_utc"))
+                        self._datasets[rel].oracle_complete_until = _parse_ts(d.get("oracle_complete_until_utc"))
                         if d.get("chainlink"):
                             self._datasets[rel].chainlink = d["chainlink"]
                             self._datasets[rel].phases = _phase_table(d["chainlink"])
@@ -182,6 +185,7 @@ class Store:
                     view=view, schema=schema, columns=columns, file_version=d.get("file_version"),
                     chainlink=chainlink, phases=_phase_table(chainlink),
                     extraction_head=_parse_ts(d.get("extraction_head_utc")),
+                    oracle_complete_until=_parse_ts(d.get("oracle_complete_until_utc")),
                     native=native if files else None,
                 )
             self._datasets = datasets
@@ -248,8 +252,14 @@ class Store:
         """Chain time up to which the dataset's folder has been extracted and synced (one extraction container per
         folder): the latest extraction head of its files (``extraction_head_utc`` of the manifest), or its latest
         observation when no extraction head is recorded. A quiet pool or a peg feed (24 h heartbeat) can have its last
-        event hours before the extraction ran; the head says the extractor saw nothing newer up to that time."""
-        return self._coverage.get(rel.split("/")[0])
+        event hours before the extraction ran; the head says the extractor saw nothing newer up to that time.
+
+        A Chainlink file can be covered further: the sync checks on-chain that it holds the proxy's latest round
+        (``oracle_complete_until_utc``), so a peg feed extracted once a day stays covered up to the last sync."""
+        cov = self._coverage.get(rel.split("/")[0])
+        d = self._datasets.get(rel)
+        own = d.oracle_complete_until if d is not None else None
+        return own if own is not None and (cov is None or own > cov) else cov
 
     @property
     def legacy(self) -> bool:

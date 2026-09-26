@@ -372,11 +372,12 @@ class TestConfidenceLevel4:
         assert r.status_code == 404, r.text
 
     def test_link_before_sushiswap_returns_404(self, real_client):
-        # SushiSwap launched Aug 2020; Chainlink LINK feed first round 2021-03-12.
-        # Before both → no source at all → price None → confidence 404.
+        # SushiSwap launched Aug 2020, Uniswap V2 in May 2020; the Chainlink LINK/USD rounds start on 2019-12-12
+        # (legacy aggregator of the proxy's phase 2, backfilled on 2026-09-26; before that the file started in 2021).
+        # Before all of them → no source at all → price None → confidence 404.
         r = real_client.get(
             "/v1/confidence/LINK/at",
-            params={"timestamp": "2020-01-01T00:00:00Z"},
+            params={"timestamp": "2019-06-01T00:00:00Z"},
         )
         assert r.status_code == 404, r.text
 

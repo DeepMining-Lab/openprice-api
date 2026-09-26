@@ -11,6 +11,11 @@ from one block to the next, so a binary search over block numbers finds the firs
 ``eth_call`` per phase; the node must serve historical state). The table lives in the V3 manifest, next to the
 Parquet store, and is maintained by ``app.v3.sync``: each run reads ``phaseId()`` once per feed at the chain head
 and searches the switch block only when the phase has changed. The API never calls the node.
+
+Each sync run also compares the latest round of every feed file with the proxy's latest round at the chain head
+(``complete_until``): when the file already holds it, the feed is known complete up to the head, even if it was
+extracted hours earlier. A peg feed with a 24 h heartbeat publishes one or two rounds a day, so its file alone cannot
+say how long no round was published after the last one.
 """
 
 from __future__ import annotations
@@ -18,10 +23,12 @@ from __future__ import annotations
 import bisect
 import json
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
-PHASE_ID_SELECTOR = "0x58303b10"  # keccak256("phaseId()")[:4]
+PHASE_ID_SELECTOR = "0x58303b10"            # keccak256("phaseId()")[:4]
+LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"   # keccak256("latestRoundData()")[:4]
+GET_ROUND_DATA_SELECTOR = "0x9a6fc8f5"      # keccak256("getRoundData(uint80)")[:4]
 
 
 class RpcError(Exception):
@@ -63,6 +70,45 @@ class Rpc:
                 return 0
             raise
         return int(res, 16) if res and res != "0x" else 0
+
+    def _round(self, proxy: str, data: str, block: int) -> tuple[int, datetime] | None:
+        """(global round id, updatedAt) of a ``latestRoundData()`` / ``getRoundData()`` answer at ``block``; None
+        when the round has no data (revert, empty return, updatedAt = 0)."""
+        try:
+            res = self._call("eth_call", [{"to": proxy, "data": data}, hex(block)])
+        except RpcError as e:
+            if "revert" in str(e).lower():
+                return None
+            raise
+        if not res or len(res) < 2 + 5 * 64:
+            return None
+        round_id, updated_at = int(res[2:66], 16), int(res[194:258], 16)
+        return (round_id, datetime.fromtimestamp(updated_at, timezone.utc)) if updated_at else None
+
+    def latest_round(self, proxy: str, block: int) -> tuple[int, datetime] | None:
+        return self._round(proxy, LATEST_ROUND_DATA_SELECTOR, block)
+
+    def round_data(self, proxy: str, round_id: int, block: int) -> tuple[int, datetime] | None:
+        return self._round(proxy, GET_ROUND_DATA_SELECTOR + format(round_id, "064x"), block)
+
+
+def complete_until(rpc: Rpc, proxy: str, last_round_id: int, head: int, head_time: datetime) -> datetime | None:
+    """Chain time up to which a feed file holds every round the proxy published, given the latest round id of the
+    file (``phase << 64 | aggregator round``).
+
+    If the proxy's latest round at ``head`` is that round, nothing newer exists: the file is complete up to
+    ``head_time``. If the proxy has moved on within the same phase, the file is complete up to just before the first
+    round it lacks. After a phase change there is no answer (None). Raises RpcError when the node cannot answer.
+    """
+    latest = rpc.latest_round(proxy, head)
+    if latest is None:
+        return None
+    if latest[0] == last_round_id:
+        return head_time
+    if latest[0] >> 64 == last_round_id >> 64 and latest[0] > last_round_id:
+        first_missing = rpc.round_data(proxy, last_round_id + 1, head)
+        return first_missing[1] - timedelta(seconds=1) if first_missing else None
+    return None
 
 
 def first_block_of_phase(rpc: Rpc, proxy: str, phase: int, lo: int, hi: int) -> int:

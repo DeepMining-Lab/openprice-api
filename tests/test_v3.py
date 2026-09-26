@@ -685,10 +685,12 @@ BLOCK_S = 12
 
 
 class FakeRpc:
-    """Chain where block b is at T0 + 12 s * b and ``phaseId()`` switches at the given first blocks."""
+    """Chain where block b is at T0 + 12 s * b and ``phaseId()`` switches at the given first blocks. ``rounds`` gives,
+    per proxy, its rounds as (global round id, updatedAt), in order."""
 
-    def __init__(self, first_block: dict[int, int], head: int):
+    def __init__(self, first_block: dict[int, int], head: int, rounds: dict[str, list] | None = None):
         self.first_block, self.head, self.calls = first_block, head, 0
+        self.rounds = rounds or {}
 
     def block_number(self) -> int:
         self.calls += 1
@@ -701,6 +703,18 @@ class FakeRpc:
     def phase_id(self, proxy: str, block: int) -> int:
         self.calls += 1
         return max([p for p, b in self.first_block.items() if b <= block], default=0)
+
+    def _published(self, proxy: str, block: int) -> list:
+        return [r for r in self.rounds.get(proxy, []) if r[1] <= T0 + timedelta(seconds=BLOCK_S * block)]
+
+    def latest_round(self, proxy: str, block: int):
+        self.calls += 1
+        published = self._published(proxy, block)
+        return published[-1] if published else None
+
+    def round_data(self, proxy: str, round_id: int, block: int):
+        self.calls += 1
+        return next((r for r in self._published(proxy, block) if r[0] == round_id), None)
 
 
 def _phase_feed(cfg) -> None:
@@ -729,6 +743,17 @@ class TestChainlinkPhases:
         assert rpc.calls < 20  # one new binary search, the known switches are not recomputed
         pt = cp.PhaseTable(table)
         assert [pt.active_phase(T0 + timedelta(seconds=BLOCK_S * b)) for b in (5, 10, 299, 300, 1600)] == [0, 1, 1, 2, 4]
+
+    def test_a_feed_file_is_complete_up_to_the_head_when_it_holds_the_latest_round(self):
+        from app.v3 import chainlink_phases as cp
+        r5, r6 = (1 << 64) | 5, (1 << 64) | 6
+        rpc = FakeRpc({1: 0}, head=900, rounds={PROXY: [(r5, T0 + timedelta(minutes=10)), (r6, T0 + timedelta(minutes=50))]})
+        head_time = rpc.block_time(900)
+        assert cp.complete_until(rpc, PROXY, r6, 900, head_time) == head_time
+        # the file lacks round 6: complete up to just before it
+        assert cp.complete_until(rpc, PROXY, r5, 900, head_time) == T0 + timedelta(minutes=50) - timedelta(seconds=1)
+        rpc.rounds[PROXY].append(((2 << 64) | 1, T0 + timedelta(minutes=55)))
+        assert cp.complete_until(rpc, PROXY, r6, 900, head_time) is None  # the proxy is on a new phase: no answer
 
     def test_level_3_reads_the_phase_served_at_t(self, v3cfg):
         _phase_feed(v3cfg)
@@ -1107,6 +1132,49 @@ class TestExtractionHead:
         # after the last swap and the last peg round, but within what the extraction scanned: not provisional
         assert "beyond_data_coverage" not in codes(T0 + timedelta(minutes=19, seconds=30))
         assert "beyond_data_coverage" in codes(T0 + timedelta(minutes=21))
+
+    def test_a_peg_feed_holding_the_latest_round_is_covered_up_to_the_last_sync(self, v3cfg):
+        root = Path(v3cfg.paths.datasets_root)
+        extra = ["extraction_timestamp_utc", "node_head_block_at_extraction"]
+        _write(root / POOL_REL, POOL_HEADER + ["quote_token_symbol", "block_timestamp_utc"] + extra,
+               [r + ["USDC", r[0], _iso(T0 + timedelta(minutes=25)), 1024] for r in _pool_rows(20)])  # to T0 + 20 min
+        # USDC/USD peg (24 h heartbeat): round 7 at T0 + 1 min, extracted at T0 + 5 min
+        peg_proxy, r7 = "0x00000000000000000000000000000000000000bb", (1 << 64) | 7
+        _write(root / "stablecoins" / "chainlink_usdc_usd.csv",
+               CL_HEADER + ["global_round_id", "phase", "aggregator_round", "feed_proxy_address"] + extra,
+               [[_iso(T0 + timedelta(minutes=1)), 1.0, r7, 1, 7, peg_proxy, _iso(T0 + timedelta(minutes=5)), 1025]])
+        _link_chainlink(v3cfg, at=T0)
+
+        def codes(t):
+            r, _ = service_mod.Service(v3cfg).price_at("LINK", t)
+            assert r.branch_level == "0a" and r.quote_currency_peg == 1.0
+            return [w.code for w in r.warnings]
+
+        sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0}, head=900))  # the node does not know the feed: no claim
+        assert "beyond_data_coverage" in codes(T0 + timedelta(minutes=10))  # peg extracted up to T0 + 5 min only
+        # the proxy's latest round at the head (T0 + 3 h) is the one the file ends with: covered up to T0 + 3 h
+        sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0}, head=900, rounds={peg_proxy: [(r7, T0 + timedelta(minutes=1))]}))
+        m = sync_mod.load_manifest(v3cfg.v3.parquet_path)["datasets"]
+        assert m["stablecoins/chainlink_usdc_usd.csv"]["oracle_complete_until_utc"] == (T0 + timedelta(hours=3)).isoformat()
+        assert "beyond_data_coverage" not in codes(T0 + timedelta(minutes=10))
+        assert "beyond_data_coverage" in codes(T0 + timedelta(minutes=21))  # after the pool's own coverage
+        # a round the file lacks (T0 + 15 min): the peg is covered up to just before it
+        rounds = [(r7, T0 + timedelta(minutes=1)), (r7 + 1, T0 + timedelta(minutes=15))]
+        sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0}, head=900, rounds={peg_proxy: rounds}))
+        assert "beyond_data_coverage" not in codes(T0 + timedelta(minutes=12))
+        assert "beyond_data_coverage" in codes(T0 + timedelta(minutes=16))  # the pool is covered, the peg is not
+
+    def test_a_backfill_in_the_middle_does_not_move_the_extraction_head(self, v3cfg):
+        # USDC/USD peg: two rounds from the daily run "a" (extracted at T0 + 1 h) and, between them, an older round
+        # inserted by a later backfill run "b" (at T0 + 5 h): the file is still extracted up to T0 + 1 h only
+        rows = [[_iso(T0 - timedelta(hours=10)), 1.0, "a", _iso(T0 + timedelta(hours=1))],
+                [_iso(T0 - timedelta(hours=8)), 1.0, "b", _iso(T0 + timedelta(hours=5))],
+                [_iso(T0 - timedelta(hours=6)), 1.0, "a", _iso(T0 + timedelta(hours=1))]]
+        _write(Path(v3cfg.paths.datasets_root) / "stablecoins" / "chainlink_usdc_usd.csv",
+               CL_HEADER + ["extraction_run_id", "extraction_timestamp_utc"], rows)
+        sync_mod.run_sync(v3cfg)
+        m = sync_mod.load_manifest(v3cfg.v3.parquet_path)["datasets"]
+        assert m["stablecoins/chainlink_usdc_usd.csv"]["extraction_head_utc"] == (T0 + timedelta(hours=1)).isoformat()
 
     def test_manifests_without_extraction_heads_are_completed(self, v3cfg):
         root = Path(v3cfg.paths.datasets_root)
