@@ -230,6 +230,11 @@ class V3Config(BaseModel):
     # V2 labels a level-3 confidence block coherence_mode "oracle_only_staleness" although it computes no S_coh there;
     # V3 leaves it null unless this is true.
     v2_oracle_coherence_label: bool = False
+    # Level 4 before the asset's first observation in the data (earliest first row of its source files: Chainlink feed
+    # and every pool the hierarchy reads for it, not the ETH/USD legs): unavailable_reason "pre_genesis", the reason the
+    # specification gives, instead of V1/V2's "missing_source" ("no_observation_in_window" for a forced branch). Legacy
+    # mode ignores it.
+    pre_genesis_reason: bool = True
     # Heartbeat of each asset's Chainlink USD feed, as the extraction declares it (column heartbeat_seconds of the CSV
     # files). chainlink.heartbeat_seconds_by_asset (86 400) is a V1 parameter, kept for V1/V2 reproducibility.
     oracle_heartbeat_seconds: dict[str, float] = {"ETH": 3600, "LINK": 3600, "UNI": 3600, "AAVE": 3600, "COMP": 3600}

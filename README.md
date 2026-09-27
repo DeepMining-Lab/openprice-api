@@ -617,7 +617,8 @@ sync that adds data (every 30 min with `deploy/`).
 
 No other number is meant to differ; V3 only adds the [diagnostics](#diagnostics-added-by-v3) and the
 [range pagination](#ranges-pagination-and-latency) below. `v3.legacy_truncation: true` replays V1/V2 exactly
-((1), (2), (5), (6), CSV-order ties and rounds of every phase), which lets `tests/golden/compare_v3.py --legacy` prove
+((1), (2), (5), (6), CSV-order ties, rounds of every phase and `missing_source` instead of `pre_genesis`), which lets
+`tests/golden/compare_v3.py --legacy` prove
 that V3 reproduces V2 (the only remaining differences are the windows containing the 110 duplicates).
 
 Two optimisations change no number: the viability checks of a candidate (as-of row, rows sharing its timestamp,
@@ -711,6 +712,7 @@ They are additive: they never change a price, a score or a branch.
 | Code | Severity | When |
 |---|---|---|
 | `future_timestamp` | warning | `timestamp` is after the server time. The response is an explicit NULL: level `4`, `unavailable_reason: "future_timestamp"`, no confidence, never cached. Before this rule, a future date returned the last known price, even as a level `0a` "observed" price with a confidence score when it fell within 30 days of the last swap. |
+| `pre_genesis` | info | `timestamp` is before the first observation of every source file of the asset: its Chainlink feed and every pool the hierarchy reads for it (the ETH/USD reference legs of a cross-rate price ETH and do not count). The response is level `4` with `unavailable_reason: "pre_genesis"`, the reason the specification gives for this case, and the message names that first observation (UNI: 2020-09-17T00:21:13Z, `uni/uni_weth_uniswap_v2_03.csv`). V1/V2 answer `missing_source` (`no_observation_in_window` for a forced `branch`); legacy mode or `v3.pre_genesis_reason: false` restores that. The genesis is the start of the data, not the creation of the token: LINK traded before 2019-12-12, its first observation here (a Chainlink round). |
 | `beyond_data_coverage` | warning | The requested time (or, for `minute`/`hour`/`day`, the end of the VWMP window) is after the last synced data of a folder the price depends on (source files and peg feed). The price is still returned (as-of rule) but is provisional: it can change after the next extraction. A folder's coverage is how far its last synced extraction scanned the chain: the latest `extraction_head_utc` of its files (`GET /v3/datasets`), read by the sync from the `extraction_timestamp_utc` / `node_head_block_at_extraction` columns of the last CSV rows (for a swap, lowered to `block_timestamp_utc + (head block - block) x 12 s`). Before 2026-09-25 it was the folder's latest event, which trails the extraction by up to an hour for an asset folder and up to a day for the peg feeds (`stablecoins/`, 24 h heartbeat), and flagged prices that nothing could change. Only the rows of the last extraction run count (same `extraction_run_id` as the last row), so a backfill of older rounds does not move it. A Chainlink file (asset oracle or peg feed) can be covered further: on every run, the sync compares the latest round of the file with the proxy's latest round at the chain head (`oracle_complete_until_utc` in `GET /v3/datasets`). When the file holds that round, the feed is complete up to the head; when the proxy has published newer rounds of the same phase, up to one second before the first one the file lacks. Since 2026-09-26 a price that uses the peg is therefore no longer flagged merely because the stablecoin extraction runs once a day. |
 | `fallback_explained` | info | The answer does not come from the first level of the hierarchy (or is level `4`). The message lists each rejected higher-priority candidate with the rule and the measured value. |
 | `oracle_stale` | warning | The price comes from Chainlink (level `3`, which has no confidence index: `C` and the sub-scores are null) and its round was published more than `heartbeat × (1 + v3.oracle_stale_tolerance)` before T, i.e. more than 3 960 s for the five asset feeds (heartbeat 3 600 s as declared by the extraction, `v3.oracle_heartbeat_seconds`; the V1 key `chainlink.heartbeat_seconds_by_asset` = 86 400 is kept for V1/V2 only). A feed publishes at least once per heartbeat, so a newer round should exist: the typical case is a request after the last synced data, before the day's extraction. Since 2022 consecutive rounds were more than 3 960 s apart only 2 to 4 times per feed (congestion of 2022-05-01). |
@@ -748,6 +750,11 @@ The provenance of a V3 response also carries:
 
 ### Ranges: pagination and latency
 
+* Bounds: a `raw` series and `/compare` cover `start <= t < end` (`end` excluded); a `minute|hour|day` series has
+  the grid points `start + k × step <= end` (both bounds included). So `start = end` gives one grid point but an
+  empty `raw` series. `end` before `start` is a 422 (V1/V2 return an empty list, which reads as "no data"). Any date
+  from year 1 to 9999 is accepted: before the asset's first observation the points are level `4` `pre_genesis`,
+  after the server time `future_timestamp`.
 * `limit` defaults to 1 000 points (hard cap 10 000). One day of ETH swaps is several thousand distinct
   timestamps (4 112 on 2024-03-01), and even `minute` over 24 h is 1 441 points, so a day does not fit in
   one default page.

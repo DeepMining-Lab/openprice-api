@@ -31,6 +31,15 @@ _MAX_ROWS_PER_POINT = 2_000            # a bulk read of more rows than this per 
 _MISSING = object()  # the bulk query has no answer for this timestamp: ask the Store
 
 
+def _shift(t: datetime, delta: timedelta) -> datetime:
+    """``t + delta``, clamped to the first or last representable date. A bound of a bulk read around year 1 or 9999
+    (no file has a row out there) is then the extreme date itself, not an OverflowError."""
+    try:
+        return t + delta
+    except OverflowError:
+        return (datetime.min if delta < timedelta(0) else datetime.max).replace(tzinfo=t.tzinfo)
+
+
 class BatchStore:
     """A ``Store`` that answers ``as_of`` and ``probe`` at a known set of timestamps in bulk."""
 
@@ -118,18 +127,24 @@ class BatchStore:
     def _bulk_as_of(self, rel: str, cols: list[str], phase: int | None, points: list[datetime] | None = None,
                     lookback: timedelta | None = _DAY) -> dict[datetime, Any] | None:
         """As-of row at every timestamp (``Store.as_of`` semantics), found among the rows of ``[first - lookback,
-        last]`` (the whole file when ``lookback`` is None). A timestamp without a row in that range is left out.
-        None: not read in bulk (too many rows per timestamp); every timestamp is left to the Store."""
+        last]`` (the whole file when ``lookback`` is None). A timestamp before the file's first row has no row (None);
+        one without a row in that range is left out. None: not read in bulk (too many rows per timestamp); every
+        timestamp is left to the Store."""
         st, d = self._store, self._store.dataset(rel)
         points = points if points is not None else self._points
         if d is None or not d.files or d.min_ts is None:
             return {t: None for t in points}
+        # Store.as_of: nothing before the file's first row. Answered here, without any date arithmetic.
+        out: dict[datetime, Any] = {t: None for t in points if t < d.min_ts}
+        points = [t for t in points if t >= d.min_ts]
+        if not points:
+            return out
         select = list(dict.fromkeys(["ts", *cols]))
         if phase is not None:
             where, args, tie = " AND phase = ?", [phase], "agg_round DESC NULLS LAST, rn ASC"
         else:
             where, args, tie = "", [], st._tie_order(d)
-        lo, hi = (points[0] - lookback if lookback is not None else d.min_ts), points[-1]
+        lo, hi = (_shift(points[0], -lookback) if lookback is not None else d.min_ts), points[-1]
         if not self._worth_it(d, lo, hi, points):
             return None
         sql = f"""
@@ -141,7 +156,6 @@ class BatchStore:
             SELECT a.t, r.* EXCLUDE (k__) FROM a LEFT JOIN r ON r.ts = a.ats AND r.k__ = 1
         """
         rows = st._cursor().execute(sql, [points, lo, hi, *args, lo, hi, *args]).fetchall()
-        out: dict[datetime, Any] = {}
         for t, *values in rows:
             if values[0] is not None:  # otherwise nothing in the bulk range: the Store's look-back ladder answers
                 out[t] = dict(zip(select, values))
@@ -149,20 +163,27 @@ class BatchStore:
 
     def _bulk_probe(self, rel: str, cols: list[str], vol_col: str | None) -> dict[datetime, Any]:
         """``Store.probe`` at every timestamp: counts and exact decimal volume sums of ``[t - 24 h, t]`` from cumulative
-        sums per timestamp, and the as-of row with the rows sharing its timestamp. A timestamp without any row in its
-        24 h is left to the Store (its as-of row comes from the longer look-backs)."""
+        sums per timestamp, and the as-of row with the rows sharing its timestamp. A timestamp before the file's first
+        row has no row; one without any row in its 24 h is left to the Store (its as-of row comes from the longer
+        look-backs)."""
         st, d = self._store, self._store.dataset(rel)
         if d is None or not d.files or d.min_ts is None:
             return {t: (None, None, 0, None) for t in self._points}
+        # Store.probe: no row before the file's first row. Answered here, without any date arithmetic (a range can
+        # start in year 1: there is no day before it).
+        out: dict[datetime, Any] = {t: (None, None, 0, None) for t in self._points if t < d.min_ts}
+        points = [t for t in self._points if t >= d.min_ts]
+        if not points:
+            return out
         select = list(dict.fromkeys(["ts", *cols]))
         tie = st._tie_order(d)
         keys = [k.split()[0] for k in tie.split(", ")]
         needed = ", ".join(dict.fromkeys([*select, *keys, *([vol_col] if vol_col else [])]))
         dec = VOLUME_DECIMAL.format(col=vol_col) if vol_col else "CAST(NULL AS DECIMAL(38, 10))"
         vol, count_vol = f"sum({dec})", f"count({dec})"
-        lo, hi = self._points[0] - timedelta(hours=24), self._points[-1]
-        if not self._worth_it(d, lo, hi, self._points):
-            return {}  # every timestamp asks the Store
+        lo, hi = _shift(points[0], -timedelta(hours=24)), points[-1]
+        if not self._worth_it(d, lo, hi, points):
+            return out  # every other timestamp asks the Store
         sql = f"""
             WITH pts AS (SELECT unnest(?::TIMESTAMPTZ[]) AS t),
             raw AS MATERIALIZED (SELECT {needed} FROM {d.view} WHERE ts >= ? AND ts <= ?),
@@ -178,8 +199,7 @@ class BatchStore:
                    CAST(coalesce(up.cs, 0) - coalesce(dn.cs, 0) AS DOUBLE), up.c, top.* EXCLUDE (k__)
             FROM up LEFT JOIN dn ON dn.t = up.t LEFT JOIN top ON top.ts = up.ats AND top.k__ = 1
         """
-        rows = st._cursor().execute(sql, [self._points, lo, hi]).fetchall()
-        out: dict[datetime, Any] = {}
+        rows = st._cursor().execute(sql, [points, lo, hi]).fetchall()
         quiet: list[datetime] = []
         for t, n24, n_vol, vol24, n_same, *values in rows:
             if not n24:
@@ -208,7 +228,7 @@ class BatchStore:
     def _prefetch_stats(self, rel: str, col: str, served: bool, window: float) -> dict[str, Any] | None:
         """``col`` over ``[first - S_stat window, last)`` in time order (phase-served Chainlink rounds only if
         ``served``), for ``price_stats``."""
-        lo, hi = self._points[0] - timedelta(seconds=window), self._points[-1]
+        lo, hi = _shift(self._points[0], -timedelta(seconds=window)), self._points[-1]
         rows = self._store.window(rel, lo, hi, [col], served=served)
         return {"lo": lo, "hi": hi, "ts": [r["ts"] for r in rows], "px": [r[col] for r in rows]}
 
@@ -217,7 +237,7 @@ class BatchStore:
         st, d = self._store, self._store.dataset(rel)
         if d is None or not d.files or d.min_ts is None or d.max_ts is None:
             return None
-        lo, hi = self._points[0] - _WINDOW_MARGIN, self._points[-1] + _WINDOW_MARGIN
+        lo, hi = _shift(self._points[0], -_WINDOW_MARGIN), _shift(self._points[-1], _WINDOW_MARGIN)
         span = (d.max_ts - d.min_ts).total_seconds()
         if span > 0 and d.n_rows * (hi - lo).total_seconds() / span > _MAX_PREFETCH_ROWS:
             return None

@@ -89,6 +89,7 @@ v3:
   no_swap_is_zero_volume: true           # zombie rule: no swap in the 24 h before T = 0 USD volume (V1/V2 skipped the check)
   windowed_eth_leg: "vwmp"               # hour/day cross-rate: ETH/USD leg = VWMP over the token leg's window (V1/V2: "point", one swap)
   v2_oracle_coherence_label: false       # level 3: coherence_mode null (V2: "oracle_only_staleness", with no S_coh computed)
+  pre_genesis_reason: true               # level 4 before the asset's first observation in the data: "pre_genesis" (V1/V2: "missing_source")
   # Level 3 (Chainlink): no confidence index; warning oracle_stale when the round is older than heartbeat x (1 + tolerance)
   oracle_heartbeat_seconds:              # as declared by the extraction (heartbeat_seconds column of the Chainlink CSVs)
     ETH: 3600

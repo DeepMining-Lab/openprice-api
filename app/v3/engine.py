@@ -20,7 +20,9 @@ same branch order, same warnings and provenance. Only the data access changed:
   cross-rate bounds the lag between the ETH/USD point read and T instead of the lag between that read
   and the token pool's last swap before T (``windowed_lag_check``); a raw DEX price is never built
   from an observation older than ``raw_max_age_seconds`` before T; no swap in the 24 h before T is a
-  24 h volume of 0 for the zombie rule (``no_swap_is_zero_volume``).
+  24 h volume of 0 for the zombie rule (``no_swap_is_zero_volume``);
+* a level 4 before the asset's first observation in the data gives the reason ``pre_genesis`` of the
+  specification, not ``missing_source`` (``pre_genesis_reason``; not in legacy mode). Only the label changes.
 
 Data access is batched: one query per candidate gives its as-of row, the rows sharing that
 timestamp and its 24 h volume (``Store.probe``), and the MAD filter + VWMP of a window run inside
@@ -34,6 +36,7 @@ selection logic, its order and its thresholds are exactly those of V1/V2.
 
 from __future__ import annotations
 
+from dataclasses import replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -150,6 +153,32 @@ class Engine:
 
     def _windowed_eth_leg(self) -> str:
         return "point" if self.cfg.v3.legacy_truncation else self.cfg.v3.windowed_eth_leg
+
+    def _pre_genesis_reason(self) -> bool:
+        return self.cfg.v3.pre_genesis_reason and not self.cfg.v3.legacy_truncation
+
+    def first_observation(self, asset: str) -> tuple[datetime, str] | None:
+        """(time, file) of the asset's first observation in the data: the earliest first row of its source files, i.e.
+        its Chainlink feed and every pool the hierarchy reads for it, not the ETH/USD reference legs of a cross-rate
+        (they price ETH, not the asset). None when none of them has a row."""
+        firsts: list[tuple[datetime, str]] = []
+        for role, rel in registry.all_relative_paths(asset):
+            ds = None if role.endswith("eth_usd_reference") else self.store.dataset(rel)
+            if ds is not None and ds.min_ts is not None:
+                firsts.append((ds.min_ts, rel))
+        return min(firsts, default=None)
+
+    def _pre_genesis(self, asset: str, timestamp: datetime, result: PriceResult) -> PriceResult:
+        """A level 4 before the asset's first observation: reason ``pre_genesis`` (the specification's reason for this
+        case) and a warning naming that observation. Only the label changes; the hierarchy already ran."""
+        first = self.first_observation(asset)
+        if first is None or timestamp >= first[0]:
+            return result
+        at, rel = first
+        warning = Warning(code="pre_genesis", severity="info",
+                          message=f"T is before the first observation of every {asset} source in the data: the "
+                                  f"earliest is {_hms(at)} ({rel}). No price can exist before it.")
+        return replace(result, unavailable_reason="pre_genesis", warnings=[*result.warnings, warning])
 
     def _eth_leg_vwmp(self, eth_file: str | None, start: datetime, end: datetime) -> WindowStats | None:
         """ETH/USD leg of an hour/day cross-rate as a VWMP over the token leg's window (``windowed_eth_leg: vwmp``):
@@ -848,10 +877,13 @@ class Engine:
         """
         ctx = _Ctx()
         try:
-            return self._hierarchy(asset, timestamp, branch, source, granularity, ctx)
+            result = self._hierarchy(asset, timestamp, branch, source, granularity, ctx)
         finally:
             if trace is not None:
                 trace.extend(ctx.rejected)
+        if result.branch_level == "4" and self._pre_genesis_reason():
+            result = self._pre_genesis(asset, timestamp, result)
+        return result
 
     def _hierarchy(self, asset: str, timestamp: datetime, branch: str, source: str, granularity: str,
                    ctx: _Ctx) -> PriceResult:

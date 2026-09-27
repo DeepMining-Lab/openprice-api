@@ -48,6 +48,14 @@ def _check_source_branch(source: str, branch: str) -> None:
                                                     "level. Use source=auto or source=dex.")
 
 
+def _check_range(start: datetime, end: datetime) -> None:
+    """A range whose end is before its start holds no point: 422, not an empty list that reads as "no data"
+    (V1/V2 return an empty list)."""
+    if end < start:
+        raise HTTPException(status_code=422, detail=f"end ({end.isoformat()}) is before start ({start.isoformat()}): "
+                                                    "the range holds no point.")
+
+
 def _headers(response: Response, svc: Service, t0: float, cache: str | None = None) -> None:
     response.headers["X-Dataset-Version"] = str(svc.store.version)
     if cache is not None:
@@ -103,6 +111,8 @@ _H_PAGE = {
         "before T; a pool without any swap in the 24 h before T fails the 24 h volume rule.\n\n"
         "Additive diagnostics (never change a number):\n"
         "- a `timestamp` after the server time returns level 4 with `unavailable_reason: future_timestamp`;\n"
+        "- a `timestamp` before the first observation of every source of the asset returns level 4 with "
+        "`unavailable_reason: pre_genesis` (V1/V2: `missing_source`);\n"
         "- `beyond_data_coverage` warns that the price depends on data after the last sync (provisional);\n"
         "- `fallback_explained` says why higher-priority sources were rejected; the full list is in "
         "`provenance.rejected_candidates`;\n"
@@ -247,8 +257,9 @@ def ready():
     summary="Price time series over a date range (V3)",
     description=(
         "`granularity=raw` returns one point per distinct swap timestamp of the winning source "
-        "(rows sharing a timestamp have the same as-of answer); `minute|hour|day` compute one VWMP "
-        "point per step from `start`. Confidence and provenance are off by default. Points are "
+        "(rows sharing a timestamp have the same as-of answer) with `start <= t < end`; `minute|hour|day` "
+        "compute one VWMP point per step from `start`, `start + k × step <= end` (both bounds included). "
+        "`end` before `start` is a 422. Confidence and provenance are off by default. Points are "
         "computed in parallel on the fast engine; at most `limit` points (max 10 000). When the "
         "result is cut at `limit`, `X-Truncated: true` and `X-Next-Start` give the `start` of the "
         "next page (also as a `Link: rel=\"next\"` header)."
@@ -279,6 +290,7 @@ def price_range_v3(
         start = start.replace(tzinfo=timezone.utc)
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
+    _check_range(start, end)
     svc = _service()
     page = svc.price_range(asset, start, end, limit, branch, source, granularity, include_confidence,
                            include_provenance)
@@ -294,7 +306,8 @@ def price_range_v3(
     response_model=list[ComparePointV3],
     summary="Compare DEX price vs Chainlink oracle over a date range (V3)",
     description=(
-        "One row per Chainlink round in [start, end), as `/v1/compare`. The DEX price comes from levels "
+        "One row per Chainlink round in [start, end), as `/v1/compare` (`end` before `start` is a 422). "
+        "The DEX price comes from levels "
         "0a, 0b, 1 or 2 only (null when none answers; V1/V2 fell back to Chainlink itself, deviation 0). "
         "`dex_price_usd` is the price `/v3/prices` returns: peg-neutralized when the quote is a stablecoin "
         "(the price S_coh compares with Chainlink); `dex_price_raw_in_quote`, `quote_currency` and "
@@ -320,6 +333,7 @@ def compare_v3(
         start = start.replace(tzinfo=timezone.utc)
     if end.tzinfo is None:
         end = end.replace(tzinfo=timezone.utc)
+    _check_range(start, end)
     svc = _service()
     page = svc.compare(asset, start, end, limit)
     _page_headers(request, response, page.next_start)

@@ -165,7 +165,7 @@ def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppC
 # ---------------------------------------------------------------------------
 
 V3_DIAGNOSTIC_CODES = frozenset({"future_timestamp", "beyond_data_coverage", "fallback_explained",
-                                 "chainlink_phase_unverified", "oracle_stale"})
+                                 "chainlink_phase_unverified", "oracle_stale", "pre_genesis"})
 # Additive V3 fields: provenance blocks and confidence parameters that V2 does not have.
 V3_PROVENANCE_FIELDS = ("rejected_candidates", "source_event", "eth_usd_leg_event", "dataset_version", "dataset_files")
 V3_PARAMETER_KEYS = ("coh_delta_tol_used", "seuil_TVL_min_usd", "tvl_score_mode", "tvl_log_min_usd", "tvl_log_ref_usd",
@@ -602,14 +602,15 @@ class Service:
         limit = min(limit, self.cfg.api.max_limit)
         next_start: datetime | None = None
         if granularity != "raw":
+            # Grid start + k x step, both bounds included. The next point is computed only when it is <= end, so a
+            # grid ending near the last representable date (9999-12-31) never steps past it.
             step = timedelta(seconds={"minute": 60, "hour": 3600, "day": 86400}[granularity])
             stamps: list[datetime] = []
-            t = start
-            while t <= end and len(stamps) < limit:
+            t: datetime | None = start if start <= end else None
+            while t is not None and len(stamps) < limit:
                 stamps.append(t)
-                t += step
-            if t <= end:
-                next_start = t
+                t = t + step if end - t >= step else None
+            next_start = t  # cut at `limit`: the grid point after the last one returned
         else:
             # The winning source is probed at `end`, but never in the future (see price_at) nor after the asset's last
             # synced data (a raw read then rejects every pool as older than v3.raw_max_age_seconds).

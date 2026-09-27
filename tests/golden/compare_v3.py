@@ -52,8 +52,8 @@ def diff(a, b, path=""):
 
 
 def set_hierarchy_fixes(cfg, on: bool) -> None:
-    """The corrections of 2026-09-25 (source hierarchy, hour/day ETH/USD leg, level-3 label) as configured (on) or
-    as V1/V2 (off)."""
+    """The corrections of 2026-09-25 (source hierarchy, hour/day ETH/USD leg, level-3 label) and the level-4 reason
+    pre_genesis (2026-09-26) as configured (on) or as V1/V2 (off)."""
     if not on:
         cfg.v3.strict_source_filter = False
         cfg.v3.windowed_lag_check = "last_swap"
@@ -61,6 +61,7 @@ def set_hierarchy_fixes(cfg, on: bool) -> None:
         cfg.v3.no_swap_is_zero_volume = False
         cfg.v3.windowed_eth_leg = "point"
         cfg.v3.v2_oracle_coherence_label = True
+        cfg.v3.pre_genesis_reason = False
 
 
 def compare(legacy: bool, limit: int | None = None, golden: str | None = None, v3_golden: bool = False,

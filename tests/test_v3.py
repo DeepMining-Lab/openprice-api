@@ -500,6 +500,70 @@ class TestRanges:
             assert nf.status_code == 404 and "future_timestamp" in nf.json()["detail"]
         store_mod.reset_store(); service_mod.reset_service()
 
+    def test_extreme_dates_answer_instead_of_failing(self, v3cfg):
+        self._dup_pool(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        first, last = datetime.min.replace(tzinfo=UTC), datetime.max.replace(tzinfo=UTC)
+        # year 1: 25 hourly points read in bulk; the day before the first one does not exist
+        page = svc.price_range("LINK", first, first + timedelta(days=1), 100, granularity="hour")
+        assert len(page.items) == 25 and page.next_start is None
+        assert {p.unavailable_reason for p in page.items} == {"pre_genesis"}
+        assert svc.price_range("LINK", first, first + timedelta(days=1), 100).items == []  # raw
+        assert svc.compare("LINK", first, first + timedelta(days=1), 100).items == []
+        # year 9999: the grid stops at `end` without stepping past the last representable date
+        page = svc.price_range("LINK", datetime(9999, 12, 30, tzinfo=UTC), datetime(9999, 12, 31, 23, tzinfo=UTC), 100,
+                               granularity="day")
+        assert [p.timestamp.day for p in page.items] == [30, 31] and page.next_start is None
+        assert {p.unavailable_reason for p in page.items} == {"future_timestamp"}
+        assert len(svc.price_range("LINK", last - timedelta(minutes=59), last, 100, granularity="hour").items) == 1
+        page = svc.price_range("LINK", datetime(9999, 12, 31, tzinfo=UTC), last, 5, granularity="hour")
+        assert len(page.items) == 5 and page.next_start == datetime(9999, 12, 31, 5, tzinfo=UTC)
+
+    def test_bulk_reads_around_the_extreme_dates_equal_the_store(self, v3cfg):
+        self._dup_pool(v3cfg)  # first row at T0
+        st = store_mod.Store(v3cfg)
+        first, last = datetime.min.replace(tzinfo=UTC), datetime.max.replace(tzinfo=UTC)
+        points = [first, first + timedelta(hours=1), T0 - timedelta(seconds=1), T0, T0 + timedelta(minutes=3), last]
+        bulk = batch_mod.BatchStore(st, points)
+        cols = ["px_usd", "block_number", "log_index", "rn"]
+        for t in points:
+            assert bulk.probe(POOL_REL, t, cols, "vol_usd") == st.probe(POOL_REL, t, cols, "vol_usd"), t
+            assert bulk.as_of(POOL_REL, t, cols) == st.as_of(POOL_REL, t, cols), t
+        window = (T0, T0 + timedelta(minutes=5))
+        assert bulk.window(POOL_REL, *window, cols) == st.window(POOL_REL, *window, cols)  # prefetch bound: last + 12 h
+        assert batch_mod._shift(first, -timedelta(days=7)) == first
+        assert batch_mod._shift(last, timedelta(hours=12)) == last
+        assert batch_mod._shift(T0, -timedelta(hours=24)) == T0 - timedelta(hours=24)
+
+    def test_a_range_across_the_first_row_is_the_same_in_bulk(self, v3cfg):
+        self._dup_pool(v3cfg)  # first swap and first Chainlink round at T0
+        svc = service_mod.Service(v3cfg)
+
+        def call():
+            return svc.price_range("LINK", T0 - timedelta(minutes=10), T0 + timedelta(minutes=5), 100,
+                                   granularity="minute", include_confidence=True, include_provenance=True)
+        v3cfg.v3.batch_ranges = False
+        one_by_one = [p.model_dump(mode="json") for p in call().items]
+        v3cfg.v3.batch_ranges = True
+        bulk = [p.model_dump(mode="json") for p in call().items]
+        assert len(bulk) == 16 and bulk == one_by_one
+        assert bulk[0]["unavailable_reason"] == "pre_genesis" and bulk[-1]["price_usd"] is not None
+
+    def test_end_before_start_is_refused_and_the_bounds_are_documented(self, v3cfg):
+        from fastapi.testclient import TestClient
+        self._dup_pool(v3cfg)
+        store_mod.reset_store(); service_mod.reset_service()
+        with TestClient(app) as client:
+            earlier, later = "2024-01-01T00:00:00Z", "2024-01-01T00:10:00Z"
+            for path in ("/v3/prices/LINK", "/v3/compare/LINK"):
+                r = client.get(path, params={"start": later, "end": earlier})
+                assert r.status_code == 422 and "is before start" in r.json()["detail"], path
+            same = {"start": earlier, "end": earlier}
+            assert len(client.get("/v3/prices/LINK", params={**same, "granularity": "hour"}).json()) == 1  # [start, end]
+            assert client.get("/v3/prices/LINK", params=same).json() == []  # raw: [start, end)
+            assert client.get("/v3/compare/LINK", params=same).json() == []  # [start, end)
+        store_mod.reset_store(); service_mod.reset_service()
+
 
 # ---------------------------------------------------------------------------
 # Validity fixes of 2026-09-24: quality counters, explicit ties, versions, empty files, Chainlink phases
@@ -956,6 +1020,29 @@ class TestHierarchyCorrections:
         # probed at `end`, the pool is 2 h 40 min stale and the series would follow the single Chainlink round
         page = service_mod.Service(v3cfg).price_range("LINK", T0, T0 + timedelta(hours=3), 100)
         assert [p.timestamp for p in page.items] == [T0 + timedelta(minutes=m) for m in range(20)]
+
+    def test_before_the_first_observation_is_pre_genesis(self, v3cfg):
+        _eth_leg(v3cfg, range(60))  # ETH/USD rows from T0: they price ETH, not LINK
+        _link_chainlink(v3cfg, at=T0 + timedelta(days=1))  # first LINK observation
+        sync_mod.run_sync(v3cfg)
+        svc = service_mod.Service(v3cfg)
+        before = T0 + timedelta(hours=2)
+        for gran in ("raw", "hour", "day"):
+            r, _ = svc.price_at("LINK", before, granularity=gran)
+            assert (r.branch_level, r.price_usd, r.unavailable_reason) == ("4", None, "pre_genesis")
+            assert r.warnings[0].code == "pre_genesis" and "2024-01-02T00:00:00Z" in r.warnings[0].message
+        assert svc.price_at("LINK", before, branch="0a")[0].unavailable_reason == "pre_genesis"  # V2: no_observation_in_window
+        page = svc.price_range("LINK", before, before + timedelta(hours=9), 100, granularity="hour")  # bulk lookups
+        assert len(page.items) == 10 and {p.unavailable_reason for p in page.items} == {"pre_genesis"}
+        # after the first observation, no source answering is still missing_source
+        dex, _ = svc.price_at("LINK", T0 + timedelta(days=1, minutes=5), source="dex")
+        assert (dex.branch_level, dex.unavailable_reason) == ("4", "missing_source")
+        stripped = service_mod.strip_v3_diagnostics(r.model_dump(mode="json"))
+        assert "pre_genesis" not in [w["code"] for w in stripped["warnings"]]
+        v3cfg.v3.legacy_truncation = True  # V1/V2
+        assert svc.price_at("LINK", before)[0].unavailable_reason == "missing_source"
+        v3cfg.v3.legacy_truncation, v3cfg.v3.pre_genesis_reason = False, False
+        assert svc.price_at("LINK", before)[0].unavailable_reason == "missing_source"
 
 
 class TestBatchedReads:
