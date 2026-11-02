@@ -1191,6 +1191,46 @@ class TestSmallCorrections:
         assert old.dex_price_usd == old.dex_price_raw_in_quote and old.quote_currency_peg is None
 
 
+class TestConfidenceCalibration:
+    def test_tolerance_by_asset_and_threshold_by_granularity(self, v3cfg):
+        _simple_link(v3cfg, n=180)
+        svc = service_mod.Service(v3cfg)
+        T = T0 + timedelta(hours=1, minutes=30)
+        v2_tol = v3cfg.confidence_v2.coh.delta_tol_by_asset.get("LINK", v3cfg.confidence_v2.coh.default_delta_tol)
+        v2_threshold = v3cfg.confidence_v2.fragility.c_threshold
+
+        def conf(gran):
+            return svc.price_at("LINK", T, granularity=gran)[0].confidence
+
+        before = {g: conf(g) for g in ("raw", "hour")}  # nothing configured: the V2 values
+        assert all(0 < c.subscores["S_coh"] < 1 for c in before.values())
+        assert before["raw"].parameters["coh_delta_tol_used"] == v2_tol
+        v3cfg.v3.coh_delta_tol_by_asset = {"LINK": v2_tol / 2}
+        v3cfg.v3.fragility_c_threshold_by_granularity = {"hour": 1.0}
+        for gran, old in before.items():
+            new = conf(gran)
+            assert new.parameters["coh_delta_tol_used"] == v2_tol / 2
+            # S_coh = exp(-(delta / tol)^2): halving the tolerance raises it to the power 4; S_stat and S_liq stay
+            assert new.subscores["S_coh"] == pytest.approx(old.subscores["S_coh"] ** 4, rel=1e-12)
+            assert (new.subscores["S_stat"], new.subscores["S_liq"]) == (old.subscores["S_stat"], old.subscores["S_liq"])
+        hour, raw = conf("hour"), conf("raw")
+        assert (hour.fragility_flag, hour.parameters["fragility_c_threshold"]) == (True, 1.0)
+        assert raw.parameters["fragility_c_threshold"] == v2_threshold  # a granularity not listed keeps V2's
+        assert raw.fragility_flag == (None if v2_threshold is None else raw.C < v2_threshold)
+        v3cfg.v3.legacy_truncation = True  # V1/V2: the V2 calibration
+        legacy = conf("hour")
+        assert legacy.parameters["coh_delta_tol_used"] == v2_tol
+        assert legacy.parameters["fragility_c_threshold"] == v2_threshold
+
+    def test_invalid_calibration_is_refused(self):
+        with pytest.raises(ValueError):
+            V3Config(coh_delta_tol_by_asset={"ETH": 0.0})
+        with pytest.raises(ValueError):
+            V3Config(fragility_c_threshold_by_granularity={"week": 0.5})
+        with pytest.raises(ValueError):
+            V3Config(fragility_c_threshold_by_granularity={"hour": 1.5})
+
+
 class TestExtractionHead:
     def test_coverage_is_how_far_the_extraction_went_not_the_last_event(self, v3cfg):
         root = Path(v3cfg.paths.datasets_root)

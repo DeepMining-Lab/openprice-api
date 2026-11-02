@@ -4,6 +4,8 @@
   python tests/golden/compare_v3.py            # V3 as shipped: lists what changes compared with V2
   python tests/golden/compare_v3.py --v3 --golden tests/golden/v3_golden_base.jsonl --no-phase-filter --no-hierarchy-fixes
                                                # V3 against its own capture of 2026-09-24 (before the validity fixes)
+  python tests/golden/compare_v3.py --v3 --golden tests/golden/v3_golden.jsonl --no-calibration
+                                               # V3 against its capture, V2 confidence calibration (before 2026-10-29)
 
 Exit code 0 only if every non-excused record is identical (floats: rel 1e-9).
 Against V2, records whose window can contain one of the 110 duplicated ETH swaps (removed in the
@@ -64,16 +66,26 @@ def set_hierarchy_fixes(cfg, on: bool) -> None:
         cfg.v3.pre_genesis_reason = False
 
 
+def set_confidence_calibration(cfg, on: bool) -> None:
+    """The confidence calibration of 2026-10-29 (S_coh tolerances by asset, fragility threshold by granularity) as
+    configured (on) or as V2 (off)."""
+    if not on:
+        cfg.v3.coh_delta_tol_by_asset = {}
+        cfg.v3.fragility_c_threshold_by_granularity = {}
+
+
 def compare(legacy: bool, limit: int | None = None, golden: str | None = None, v3_golden: bool = False,
-            phase_filter: bool | None = None, hierarchy_fixes: bool = True):
+            phase_filter: bool | None = None, hierarchy_fixes: bool = True, calibration: bool | None = None):
     """Run every golden record through V3. Returns (counts, differing_fields, bad) with
     bad = [(record_id, [(path, golden_value, v3_value), ...])] for non-excused differences.
     ``phase_filter`` sets ``v3.chainlink_active_phase_only``; ``hierarchy_fixes=False`` turns the source hierarchy
-    corrections of 2026-09-25 off (legacy mode applies neither)."""
+    corrections of 2026-09-25 off (legacy mode applies neither); ``calibration`` sets the confidence calibration of
+    2026-10-29, later than those corrections, so it follows ``hierarchy_fixes`` unless given."""
     cfg = get_config(); cfg.v3.legacy_truncation = legacy
     if phase_filter is not None:
         cfg.v3.chainlink_active_phase_only = phase_filter
     set_hierarchy_fixes(cfg, hierarchy_fixes)
+    set_confidence_calibration(cfg, hierarchy_fixes if calibration is None else calibration)
     svc = get_service()
     golden = golden or os.path.join(os.path.dirname(os.path.abspath(__file__)), "v2_golden.jsonl")
     recs = [json.loads(l) for l in open(golden) if l.strip()]
@@ -102,14 +114,19 @@ def main():
     ap.add_argument("--no-hierarchy-fixes", action="store_true",
                     help="corrections of 2026-09-25 off, as V1/V2 (strict_source_filter, windowed_lag_check, "
                          "raw_max_age_seconds, no_swap_is_zero_volume, windowed_eth_leg, v2_oracle_coherence_label)")
+    ap.add_argument("--no-calibration", action="store_true",
+                    help="confidence calibration of 2026-10-29 off, as V2 (v3.coh_delta_tol_by_asset, "
+                         "v3.fragility_c_threshold_by_granularity); implied by --no-hierarchy-fixes")
     ap.add_argument("--limit", type=int)
     ap.add_argument("--show", type=int, default=12)
     args = ap.parse_args()
     counts, fields, bad = compare(args.legacy, args.limit, args.golden, args.v3,
-                                  False if args.no_phase_filter else None, not args.no_hierarchy_fixes)
+                                  False if args.no_phase_filter else None, not args.no_hierarchy_fixes,
+                                  False if args.no_calibration else None)
     mode = "LEGACY (parity proof)" if args.legacy else "FIXED (as shipped)"
     if args.no_phase_filter: mode += ", no Chainlink phase filter"
     if args.no_hierarchy_fixes: mode += ", V1/V2 source hierarchy"
+    if args.no_calibration or args.no_hierarchy_fixes: mode += ", V2 confidence calibration"
     print(f"mode={mode}: {counts['total']} golden records | identical={counts['identical']} | "
           f"dup-zone diffs={counts['dup_zone']} | other diffs={counts['other']} | skipped={counts['skipped']}")
     if fields:

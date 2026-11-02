@@ -235,6 +235,13 @@ class V3Config(BaseModel):
     # specification gives, instead of V1/V2's "missing_source" ("no_observation_in_window" for a forced branch). Legacy
     # mode ignores it.
     pre_genesis_reason: bool = True
+    # Confidence calibration of V3 (user decision 2026-10-29, after the re-evaluation of thesis chapter 9 on V3);
+    # legacy mode ignores both. S_coh tolerance by asset; an asset not listed uses confidence_v2.coh (the V2 values,
+    # calibrated on V1 prices).
+    coh_delta_tol_by_asset: dict[str, float] = {}
+    # fragility_flag = C < the threshold of the request granularity (raw, minute, hour, day); a granularity not
+    # listed uses confidence_v2.fragility.c_threshold.
+    fragility_c_threshold_by_granularity: dict[str, float] = {}
     # Heartbeat of each asset's Chainlink USD feed, as the extraction declares it (column heartbeat_seconds of the CSV
     # files). chainlink.heartbeat_seconds_by_asset (86 400) is a V1 parameter, kept for V1/V2 reproducibility.
     oracle_heartbeat_seconds: dict[str, float] = {"ETH": 3600, "LINK": 3600, "UNI": 3600, "AAVE": 3600, "COMP": 3600}
@@ -265,6 +272,23 @@ class V3Config(BaseModel):
     def _positive_age(cls, v: float | None) -> float | None:
         if v is not None and v <= 0:
             raise ValueError("v3.raw_max_age_seconds must be > 0 (or null for no limit)")
+        return v
+
+    @field_validator("coh_delta_tol_by_asset")
+    @classmethod
+    def _positive_tolerances(cls, v: dict[str, float]) -> dict[str, float]:
+        if any(t <= 0 for t in v.values()):
+            raise ValueError("v3.coh_delta_tol_by_asset values must be > 0")
+        return v
+
+    @field_validator("fragility_c_threshold_by_granularity")
+    @classmethod
+    def _thresholds_by_granularity(cls, v: dict[str, float]) -> dict[str, float]:
+        unknown = set(v) - {"raw", "minute", "hour", "day"}
+        if unknown:
+            raise ValueError(f"v3.fragility_c_threshold_by_granularity: unknown granularity {sorted(unknown)}")
+        if any(not 0 <= t <= 1 for t in v.values()):
+            raise ValueError("v3.fragility_c_threshold_by_granularity values must be in [0, 1]")
         return v
 
     @field_validator("oracle_heartbeat_seconds")

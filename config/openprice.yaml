@@ -90,6 +90,17 @@ v3:
   windowed_eth_leg: "vwmp"               # hour/day cross-rate: ETH/USD leg = VWMP over the token leg's window (V1/V2: "point", one swap)
   v2_oracle_coherence_label: false       # level 3: coherence_mode null (V2: "oracle_only_staleness", with no S_coh computed)
   pre_genesis_reason: true               # level 4 before the asset's first observation in the data: "pre_genesis" (V1/V2: "missing_source")
+  # Confidence calibrated on V3 prices (re-evaluation of thesis chapter 9 on the 6 300 V3 points, 2026-10-29; ignored in legacy mode):
+  coh_delta_tol_by_asset:                # S_coh tolerance: p90 of |neutralized V3 price - CEX| / CEX, DEX branches, 3 granularities (V2: confidence_v2.coh, on V1 prices)
+    ETH: 0.0125
+    LINK: 0.0177
+    UNI: 0.0190
+    AAVE: 0.0184
+    COMP: 0.0227
+  fragility_c_threshold_by_granularity:  # fragility_flag = C < threshold (ROC/Youden, fragile = |error vs CEX| > p80); raw (not evaluated): confidence_v2.fragility.c_threshold
+    day: 0.57
+    hour: 0.81
+    minute: 0.85
   # Level 3 (Chainlink): no confidence index; warning oracle_stale when the round is older than heartbeat x (1 + tolerance)
   oracle_heartbeat_seconds:              # as declared by the extraction (heartbeat_seconds column of the Chainlink CSVs)
     ETH: 3600

@@ -614,10 +614,26 @@ sync that adds data (every 30 min with `deploy/`).
      (V1/V2 compared the raw price in the quote currency).
    * `v2_oracle_coherence_label: false`: a level-3 confidence block has `coherence_mode: null`. V2 labels it
      `oracle_only_staleness` although it computes no S_coh there. An oracle price has no confidence index.
+7. **The confidence index is calibrated on V3 prices** (2026-10-29), after the re-evaluation of thesis chapter 9
+   on V3: 6 300 points (five assets, eight market windows 2021–2025, `day`/`hour`/`minute`) compared with Kraken
+   and Binance. V2's S_coh tolerances are the p90 of |neutralized price − CEX| / CEX measured on V1 prices, and
+   its single `c_threshold` (0.57) was calibrated on an index computed with a 0.5 % tolerance for every asset:
+   on V3, `fragility_flag` caught 17 % of the fragile `hour` points (error above the p80 of the granularity).
+   * `coh_delta_tol_by_asset`: the same p90 rule on the V3 prices, ETH 1.25 %, LINK 1.77 %, UNI 1.90 %,
+     AAVE 1.84 %, COMP 2.27 % (V2: 1.3 / 1.9 / 2.0 / 2.6 / 3.1 %).
+   * `fragility_c_threshold_by_granularity`: one threshold per granularity (ROC/Youden on the same points),
+     `day` 0.57, `hour` 0.81, `minute` 0.85; `raw`, not evaluated, keeps `confidence_v2.fragility.c_threshold`.
+     A single threshold cannot fit: the distance between a VWMP and the Chainlink round at T grows with the
+     window (p90 about 3.2 % for `day`, 1.2 % for `hour`, 0.55 % for `minute`).
+
+   On those points: AUC of C for the fragile points 0.639 / 0.752 / 0.635 (`day` / `hour` / `minute`; `hour`
+   0.734 with the V2 tolerances); `fragility_flag` flags 25 / 31 / 45 % of the points, with a true-positive rate
+   of 0.42 / 0.65 / 0.72 and a false-positive rate of 0.21 / 0.23 / 0.39. S_coh, C and `fragility_flag` move; no
+   price or source level does.
 
 No other number is meant to differ; V3 only adds the [diagnostics](#diagnostics-added-by-v3) and the
 [range pagination](#ranges-pagination-and-latency) below. `v3.legacy_truncation: true` replays V1/V2 exactly
-((1), (2), (5), (6), CSV-order ties, rounds of every phase and `missing_source` instead of `pre_genesis`), which lets
+((1), (2), (5), (6), (7), CSV-order ties, rounds of every phase and `missing_source` instead of `pre_genesis`), which lets
 `tests/golden/compare_v3.py --legacy` prove
 that V3 reproduces V2 (the only remaining differences are the windows containing the 110 duplicates).
 
@@ -662,6 +678,8 @@ several market-stress dates (LUNA, the Aug-2024 flash crash, the Mar-2023 USDC d
   C = 0.902) and 13 AAVE/COMP `hour`/`day` prices that now come from their level `0b` pool instead of level 1, 2
   or Chainlink. The smaller corrections (6) then change 66 more: 60 windowed cross-rate prices through the ETH/USD
   VWMP (0.68 % at the median, 3.4 % at most; no source level changes) and 6 level-3 `coherence_mode` labels.
+  The confidence calibration of 2026-10-29 then changes 230: 224 S_coh and C values and 28 `fragility_flag`
+  values (and the threshold reported in 74 `hour`/`minute`/`day` responses); no price, source level or warning.
   `v3_golden.jsonl` pins V3 as configured;
 * `tests/test_v3_oracle.py` recomputes S_stat and the day VWMP in plain Python from the stored rows on the dates
   of the validity audit (S_stat 0.840, 0.872 and 0.944 on 2022-05-12, 2024-08-05 and 2025-06-01, where V1/V2

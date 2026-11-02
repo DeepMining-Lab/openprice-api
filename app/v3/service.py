@@ -14,6 +14,10 @@ A third correction reads Chainlink (S_coh, the level-3 fallback, the peg feeds, 
 reference of a cross-rate) only from the aggregator phase the proxy served at T
 (``v3.chainlink_active_phase_only``, off in legacy mode). V2 read the rounds of every phase.
 
+The confidence index is recalibrated on V3 prices (off in legacy mode): S_coh tolerances by asset
+(``v3.coh_delta_tol_by_asset``) and a fragility threshold by granularity
+(``v3.fragility_c_threshold_by_granularity``); an asset or granularity not listed keeps the V2 value.
+
 On top of the V2 response, V3 adds diagnostics that never change a number (additive, listed in
 ``V3_DIAGNOSTIC_CODES``): a timestamp in the future is answered as an explicit NULL, a price that
 depends on data not yet synced is flagged as provisional, a fallback to a lower source level says
@@ -137,9 +141,25 @@ def compute_s_coh(store: Store, asset: str, dex_price_neutralized: float, cl_rel
         warnings.append(Warning(code="s_coh_chainlink_zero_price",
                                 message="Chainlink price is zero; S_coh cannot be computed."))
         return None, warnings
-    tol = cfg.confidence_v2.coh.delta_tol_by_asset.get(asset, cfg.confidence_v2.coh.default_delta_tol)
+    tol = coh_delta_tol(cfg, asset)
     delta = abs(dex_price_neutralized - cl_price) / cl_price
     return math.exp(-((delta / tol) ** 2)), warnings
+
+
+def coh_delta_tol(cfg: AppConfig, asset: str) -> float:
+    """S_coh tolerance of an asset: ``v3.coh_delta_tol_by_asset``, else the V2 value (always the V2 value in legacy
+    mode)."""
+    if not cfg.v3.legacy_truncation and asset in cfg.v3.coh_delta_tol_by_asset:
+        return cfg.v3.coh_delta_tol_by_asset[asset]
+    return cfg.confidence_v2.coh.delta_tol_by_asset.get(asset, cfg.confidence_v2.coh.default_delta_tol)
+
+
+def fragility_c_threshold(cfg: AppConfig, granularity: str) -> float | None:
+    """Threshold of fragility_flag for a granularity: ``v3.fragility_c_threshold_by_granularity``, else the V2 value
+    (always the V2 value in legacy mode)."""
+    if not cfg.v3.legacy_truncation and granularity in cfg.v3.fragility_c_threshold_by_granularity:
+        return cfg.v3.fragility_c_threshold_by_granularity[granularity]
+    return cfg.confidence_v2.fragility.c_threshold
 
 
 def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppConfig):
@@ -289,7 +309,7 @@ class Service:
         return quote_currency, peg_value, peg_ts, peg_rel
 
     # -------------------------------------------------------------- confidence
-    def _confidence(self, result: PriceResult, asset: str, timestamp: datetime,
+    def _confidence(self, result: PriceResult, asset: str, timestamp: datetime, granularity: str,
                     peg_value: float | None, price_for_coh: float | None) -> ConfidenceV2Detail:
         cfg = self.cfg
         warnings: list[Warning] = []
@@ -319,7 +339,11 @@ class Service:
         warnings.extend(peg_warns)
 
         c, mode = v2.compose_v2(s_stat, s_liq, s_coh, s_peg, cfg)
-        flag, frag_warns = v2.fragility_flag(c, cfg)
+        c_threshold = fragility_c_threshold(cfg, granularity)
+        if c_threshold is None:  # not calibrated: null + warning, as V2
+            flag, frag_warns = v2.fragility_flag(c, cfg)
+        else:
+            flag, frag_warns = (None if c is None else c < c_threshold), []
         warnings.extend(frag_warns)
 
         w = cfg.confidence_v2.weights
@@ -343,10 +367,9 @@ class Service:
                 "s_stat_window_seconds": cfg.confidence_v2.s_stat.window_seconds,
                 "sigma_mad": t.sigma_mad,
                 "slip_max": t.slip_max,
-                "fragility_c_threshold": cfg.confidence_v2.fragility.c_threshold,
+                "fragility_c_threshold": c_threshold,
                 # V3: the remaining parameters of the scores, as used (V3_PARAMETER_KEYS)
-                "coh_delta_tol_used": cfg.confidence_v2.coh.delta_tol_by_asset.get(
-                    asset, cfg.confidence_v2.coh.default_delta_tol),
+                "coh_delta_tol_used": coh_delta_tol(cfg, asset),
                 "seuil_TVL_min_usd": t.seuil_TVL_min_usd,
                 "tvl_score_mode": cfg.scoring.tvl_score_mode,
                 "tvl_log_min_usd": cfg.scoring.tvl_log_min_usd,
@@ -470,7 +493,7 @@ class Service:
         confidence = None
         cl_rel: str | None = None
         if include_confidence and result.price_usd is not None:
-            confidence = self._confidence(result, asset, timestamp, peg_value, price_for_coh)
+            confidence = self._confidence(result, asset, timestamp, granularity, peg_value, price_for_coh)
             cl_paths = registry.get_chainlink_paths(asset)
             cl_rel = str(cl_paths[0].relative_to(cfg.paths.datasets_path)) if cl_paths else None
 
