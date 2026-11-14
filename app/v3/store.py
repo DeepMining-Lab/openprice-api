@@ -64,6 +64,7 @@ class DatasetInfo:
     extraction_head: datetime | None = None                   # chain time the last extraction of the file reached
     oracle_complete_until: datetime | None = None             # Chainlink file: holds every round up to this chain time
     native: str | None = None                                 # native copy the view reads; None: Parquet segments
+    raw_mapping: dict[str, str] = field(default_factory=dict)  # canonical name -> column name in the CSV
 
     def has(self, canonical: str) -> bool:
         return canonical in self.schema.mapping
@@ -187,6 +188,7 @@ class Store:
                     extraction_head=_parse_ts(d.get("extraction_head_utc")),
                     oracle_complete_until=_parse_ts(d.get("oracle_complete_until_utc")),
                     native=native if files else None,
+                    raw_mapping=dict(d.get("mapping") or {}),
                 )
             self._datasets = datasets
             self._detach_old()

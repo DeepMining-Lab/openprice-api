@@ -423,7 +423,33 @@
     .kv-table { width: 100%; border-collapse: collapse; }
     .kv-table td { padding: .3rem 0; font-size: .79rem; }
     .kv-table td:first-child { color: var(--muted); width: 60%; }
-    .kv-table td:last-child { color: var(--text); font-weight: 600; text-align: right; font-family: monospace; }
+    .kv-table td:last-child { color: var(--text); font-weight: 600; text-align: right; font-family: monospace; overflow-wrap: anywhere; }
+
+    /* Index recomputation (V3 provenance.confidence_inputs) */
+    .recalc-status {
+      padding: .5rem .75rem; border-radius: 7px; font-size: .8rem; font-weight: 600;
+      border-left: 3px solid; margin-bottom: .6rem;
+    }
+    .recalc-ok  { background: color-mix(in srgb, var(--ok) 8%, transparent);   border-color: var(--ok);   color: var(--ok); }
+    .recalc-bad { background: color-mix(in srgb, var(--warn) 8%, transparent); border-color: var(--warn); color: var(--warn); }
+    .recalc-intro { font-size: .76rem; margin-bottom: .25rem; }
+    .sub-label.score-label { text-transform: none; letter-spacing: .02em; font-size: .72rem; }
+    .formula {
+      font-family: monospace; font-size: .74rem; color: var(--text);
+      background: var(--surface2); border-radius: 6px; padding: .45rem .6rem; margin-top: .45rem;
+      white-space: pre-wrap; overflow-wrap: anywhere;
+    }
+    .recalc-foot { display: flex; flex-wrap: wrap; align-items: center; gap: .6rem; margin-top: .9rem; font-size: .72rem; }
+    .recalc-foot code { font-family: monospace; color: var(--accent); }
+    .dl-btn {
+      font: inherit; font-size: .75rem; font-weight: 600; cursor: pointer;
+      padding: .35rem .7rem; border-radius: 7px;
+      border: 1px solid var(--border2); background: var(--surface2); color: var(--text);
+    }
+    .dl-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .rej-list { list-style: none; display: flex; flex-direction: column; gap: .3rem; }
+    .rej-list li { font-size: .76rem; color: var(--text); background: var(--surface2); border-radius: 5px; padding: .3rem .6rem; overflow-wrap: anywhere; }
+    .rej-list .rej-rule { font-family: monospace; color: var(--muted); }
 
     /* Sub-section label */
     .sub-label {
@@ -728,6 +754,41 @@ const I18N = {
     boundPolicy: 'Convention de bornes',
     blockNumber: 'Numéro de bloc',
     blockTs: 'Horodatage du bloc',
+    pv: {
+      event: 'Événement on-chain du prix', ethEvent: 'Jambe ETH/USD (lecture ponctuelle)',
+      file: 'Fichier', time: 'Horodatage', tx: 'Transaction', block: 'Bloc', logIndex: 'Log index',
+      phaseRound: 'Phase / round', sameTs: 'Lignes au même horodatage', tie: 'Règle de départage',
+      rejected: 'Sources écartées', versions: 'Versions (données, paramètres, code)',
+      dataVersion: 'Version des données', config: 'Empreinte des paramètres (config_sha256)',
+      commit: 'Commit du code', dirty: ' (modifications non commitées au démarrage)',
+    },
+    rc: {
+      title: "Recalcul de l'indice",
+      intro: "Recalculé dans votre navigateur à partir du seul enregistrement de provenance (provenance.confidence_inputs), avec les formules de l'API.",
+      status: (c, ok) => ok ? `C recalculé = ${c} : identique à la valeur servie (sous-scores, S_peg et flag de fragilité compris).`
+                            : `C recalculé = ${c} : diffère de la valeur servie.`,
+      reference: 'Référence', kind: { source_pool: 'pool de la source', chainlink_feed: 'flux Chainlink' },
+      window: 'Fenêtre', servedPhases: 'Phases servies par le proxy', nObs: 'Observations',
+      median: 'Médiane', mad: 'MAD', priceTested: 'Prix testé', rule: 'Règle',
+      rules: {
+        mad_z_score: 'z-score MAD', insufficient_data_floor: "plancher : trop peu d'observations",
+        mad_zero: 'dispersion nulle : 1', missing_columns: 'colonnes manquantes', nonpositive_price: 'prix non positif',
+        single_leg: 'une seule jambe', geometric_mean_of_legs: 'moyenne géométrique des deux jambes',
+        token_leg_only: 'jambe token seule', eth_usd_leg_only: 'jambe ETH/USD seule', unavailable: 'indisponible',
+        deviation: 'écart au round Chainlink', no_chainlink_observation: 'aucun round Chainlink',
+        chainlink_zero_price: 'round Chainlink nul', peg_deviation: 'écart du peg au dollar', not_applicable: 'sans objet',
+      },
+      roles: { pool: 'Pool', token_leg: 'Jambe token', eth_usd_leg: 'Jambe ETH/USD' },
+      row: 'Ligne notée (dernier swap ≤ T)', slippage: 'Glissement', legScore: 'S_TVL · S_slip → jambe',
+      combination: 'Combinaison', round: 'Round Chainlink', roundId: 'roundId (getRoundData sur le proxy)',
+      published: 'Publié', answer: 'Réponse', priceCompared: 'Prix comparé', delta: 'Écart δ', deltaTol: 'Tolérance δ_tol',
+      quote: 'Devise de cotation', peg: 'Peg', pegTol: 'Tolérance du peg', pegRound: 'Round du peg',
+      outsideC: 'S_peg est publié à part : il n\'entre pas dans C (mode 3sub).',
+      threshold: 'Seuil de fragilité', fragile: 'fragile', usable: 'exploitable',
+      legWord: 'jambe', binary: (x) => `S_TVL = 1 si TVL ≥ ${x}, sinon 0`,
+      download: "Télécharger l'enregistrement (JSON)",
+      verifyHint: 'Vérifiable hors ligne avec <code>python tools/verify_confidence.py fichier.json</code> (dépôt de l\'API).',
+    },
     kv: {
       seuil_TVL_min_usd: 'TVL minimum (USD)', seuil_vol_min_usd_24h: 'Volume 24h min (USD)',
       fenetre_inactivite_jours: 'Fenêtre inactivité (jours)', sigma_mad: 'σ_MAD (sensibilité S_stat)',
@@ -844,6 +905,41 @@ const I18N = {
     boundPolicy: 'Boundary convention',
     blockNumber: 'Block number',
     blockTs: 'Block timestamp',
+    pv: {
+      event: 'On-chain event behind the price', ethEvent: 'ETH/USD leg (point read)',
+      file: 'File', time: 'Timestamp', tx: 'Transaction', block: 'Block', logIndex: 'Log index',
+      phaseRound: 'Phase / round', sameTs: 'Rows at the same timestamp', tie: 'Tie-break rule',
+      rejected: 'Rejected sources', versions: 'Versions (data, parameters, code)',
+      dataVersion: 'Data version', config: 'Parameter fingerprint (config_sha256)',
+      commit: 'Code commit', dirty: ' (uncommitted changes at start-up)',
+    },
+    rc: {
+      title: 'Index recomputation',
+      intro: 'Recomputed in your browser from the provenance record alone (provenance.confidence_inputs), with the formulas of the API.',
+      status: (c, ok) => ok ? `Recomputed C = ${c}: same as the served value (sub-scores, S_peg and fragility flag included).`
+                            : `Recomputed C = ${c}: differs from the served value.`,
+      reference: 'Reference', kind: { source_pool: 'source pool', chainlink_feed: 'Chainlink feed' },
+      window: 'Window', servedPhases: 'Phases served by the proxy', nObs: 'Observations',
+      median: 'Median', mad: 'MAD', priceTested: 'Price tested', rule: 'Rule',
+      rules: {
+        mad_z_score: 'MAD z-score', insufficient_data_floor: 'floor: too few observations',
+        mad_zero: 'zero dispersion: 1', missing_columns: 'missing columns', nonpositive_price: 'non-positive price',
+        single_leg: 'single leg', geometric_mean_of_legs: 'geometric mean of both legs',
+        token_leg_only: 'token leg only', eth_usd_leg_only: 'ETH/USD leg only', unavailable: 'unavailable',
+        deviation: 'deviation from the Chainlink round', no_chainlink_observation: 'no Chainlink round',
+        chainlink_zero_price: 'zero Chainlink answer', peg_deviation: 'peg deviation from the dollar', not_applicable: 'not applicable',
+      },
+      roles: { pool: 'Pool', token_leg: 'Token leg', eth_usd_leg: 'ETH/USD leg' },
+      row: 'Row scored (latest swap ≤ T)', slippage: 'Slippage', legScore: 'S_TVL · S_slip → leg',
+      combination: 'Combination', round: 'Chainlink round', roundId: 'roundId (getRoundData on the proxy)',
+      published: 'Published', answer: 'Answer', priceCompared: 'Price compared', delta: 'Deviation δ', deltaTol: 'Tolerance δ_tol',
+      quote: 'Quote currency', peg: 'Peg', pegTol: 'Peg tolerance', pegRound: 'Peg round',
+      outsideC: 'S_peg is published apart: it does not enter C (3sub mode).',
+      threshold: 'Fragility threshold', fragile: 'fragile', usable: 'usable',
+      legWord: 'leg', binary: (x) => `S_TVL = 1 if TVL ≥ ${x}, else 0`,
+      download: 'Download the record (JSON)',
+      verifyHint: 'Checkable offline with <code>python tools/verify_confidence.py file.json</code> (API repository).',
+    },
     kv: {
       seuil_TVL_min_usd: 'Minimum TVL (USD)', seuil_vol_min_usd_24h: 'Min 24h volume (USD)',
       fenetre_inactivite_jours: 'Inactivity window (days)', sigma_mad: 'σ_MAD (S_stat sensitivity)',
@@ -1586,8 +1682,12 @@ function renderAccordions(d) {
       ${timings.length ? `<div class="sub-label">${esc(t('legTimestamps'))}</div><table class="kv-table">${timings.join('')}</table>` : ''}
       ${temporal.length ? `<div class="sub-label">${t('granWindow')}</div><table class="kv-table">${temporal.join('')}</table>` : ''}
       ${blockRows.length ? `<div class="sub-label">${esc(t('refBlock'))}</div><table class="kv-table">${blockRows.join('')}</table>` : ''}
+      ${provenanceV3Html(p)}
       ${warningListHtml(p.warnings)}
     `);
+
+    // V3: the inputs of every confidence score, recomputed here from the record alone
+    if (p.confidence_inputs) html += accordion('recalc', esc(t('rc').title), recalcHtml(d));
   }
 
   if (d.confidence) {
@@ -1607,6 +1707,8 @@ function renderAccordions(d) {
   }
 
   document.getElementById('acc-section').innerHTML = html;
+  const dl = document.getElementById('dl-record');
+  if (dl) dl.addEventListener('click', () => downloadRecord(d));
 
   // Wire accordions
   document.querySelectorAll('.acc-head').forEach(h => {
@@ -1629,6 +1731,234 @@ function accordion(id, title, content) {
       <div class="acc-body" id="${id}-body">${content}</div>
     </div>
   `;
+}
+
+// ─── V3 provenance: on-chain events, rejected sources, versions ─────────────
+function kvTable(rows) {
+  const body = rows.filter(r => r && r[1] != null && r[1] !== '')
+    .map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(String(v))}</td></tr>`).join('');
+  return body ? `<table class="kv-table">${body}</table>` : '';
+}
+
+function eventRows(ev) {
+  const pv = t('pv');
+  return kvTable([
+    [pv.file, ev.file], [pv.time, fmtTs(ev.timestamp)], [pv.tx, ev.tx_hash],
+    [pv.block, ev.block_number != null ? ev.block_number.toLocaleString(locale()) : null],
+    [pv.logIndex, ev.log_index],
+    [pv.phaseRound, ev.phase != null ? `${ev.phase} / ${ev.aggregator_round}` : null],
+    [pv.sameTs, ev.rows_at_same_timestamp], [pv.tie, ev.tie_break_rule],
+  ]);
+}
+
+function provenanceV3Html(p) {
+  const pv = t('pv');
+  let html = '';
+  if (p.source_event) html += `<div class="sub-label">${esc(pv.event)}</div>${eventRows(p.source_event)}`;
+  if (p.eth_usd_leg_event) html += `<div class="sub-label">${esc(pv.ethEvent)}</div>${eventRows(p.eth_usd_leg_event)}`;
+  if (p.rejected_candidates && p.rejected_candidates.length) {
+    const items = p.rejected_candidates.map(c =>
+      `<li>${esc(c.level)} · ${esc(c.file)}${esc(colon())}${esc(c.message)} <span class="rej-rule">[${esc(c.rule)}]</span></li>`).join('');
+    html += `<div class="sub-label">${esc(pv.rejected)}</div><ul class="rej-list">${items}</ul>`;
+  }
+  if (p.dataset_version || p.config_sha256 || p.code_commit) {
+    const files = Object.entries(p.dataset_files || {}).map(([f, v]) => [f, v]);
+    html += `<div class="sub-label">${esc(pv.versions)}</div>` + kvTable([
+      [pv.dataVersion, p.dataset_version], [pv.config, p.config_sha256],
+      [pv.commit, p.code_commit ? p.code_commit + (p.code_dirty ? pv.dirty : '') : null],
+      ...files,
+    ]);
+  }
+  return html;
+}
+
+// ─── V3 index recomputation (provenance.confidence_inputs) ──────────────────
+// The formulas of the API (app/v3/service.py, and tools/verify_confidence.py), applied to the record alone.
+function tvlScore(tvl, lq) {
+  if (lq.tvl_score_mode === 'linear_to_threshold') return Math.min(1, tvl / lq.seuil_TVL_min_usd);
+  if (lq.tvl_score_mode === 'binary_threshold') return tvl >= lq.seuil_TVL_min_usd ? 1 : 0;
+  if (lq.tvl_score_mode === 'log_memoire') {
+    const lo = lq.tvl_log_min_usd, ref = lq.tvl_log_ref_usd;
+    if (tvl <= 0 || lo <= 0 || ref <= lo) return 0;
+    return Math.max(0, Math.min(1, Math.log10(tvl / lo) / Math.log10(ref / lo)));
+  }
+  return null;
+}
+
+function recomputeIndex(ci) {
+  const out = { S_stat: null, S_liq: null, S_coh: null, S_peg: null, legs: [] };
+  const st = ci.s_stat;
+  if (st) {
+    if (st.rule === 'mad_zero') out.S_stat = 1;
+    else if (st.rule === 'mad_z_score') {
+      out.z = st.method === 'mad'
+        ? 0.6745 * Math.abs(st.price_tested - st.median) / st.mad
+        : Math.abs(Math.log(st.price_tested) - st.median_log) / st.local_volatility;
+      out.S_stat = Math.exp(-(out.z ** 2) / (2 * st.sigma_mad ** 2));
+    } else out.S_stat = st.floor;
+  }
+  const lq = ci.s_liq;
+  if (lq) {
+    const eth = lq.legs.find(l => l.role === 'eth_usd_leg');
+    lq.legs.forEach((leg, k) => {
+      let tvl = leg.tvl_raw;
+      if (k === 0 && eth && leg.tvl_unit === 'eth' && tvl != null && eth.price != null) tvl = tvl * eth.price;
+      const sTvl = tvl == null ? null : tvlScore(tvl, lq);
+      const sSlip = leg.slippage == null ? null : Math.exp(-Math.abs(leg.slippage) / lq.slip_max);
+      const v = sTvl != null && sSlip != null ? Math.sqrt(sTvl * sSlip) : (sTvl != null ? sTvl : sSlip);
+      out.legs.push({ tvl, sTvl, sSlip, v });
+    });
+    const [a, b] = out.legs.map(l => l.v);
+    out.S_liq = eth ? (a != null && b != null ? Math.sqrt(a * b) : (a != null ? a : (b != null ? b : null)))
+                    : (a != null ? a : null);
+  }
+  const ch = ci.s_coh;
+  if (ch && ch.rule === 'deviation') {
+    const pcl = ch.chainlink_round.answer;
+    out.delta = Math.abs(ch.price_compared - pcl) / pcl;
+    out.S_coh = Math.exp(-((out.delta / ch.delta_tol) ** 2));
+  }
+  const pg = ci.s_peg;
+  if (pg && pg.rule === 'peg_deviation') out.S_peg = Math.exp(-((Math.abs(pg.peg - 1) / pg.peg_tol) ** 2));
+  const comp = ci.composition, w = comp.weights;
+  if (comp.mode === '4sub') {
+    const s = [out.S_stat, out.S_liq, out.S_coh, out.S_peg], ws = [w.w_stat, w.w_liq, w.w_coh, w.w_peg];
+    const total = ws.reduce((x, y) => x + y, 0);
+    out.C = s.includes(null) ? null : s.reduce((acc, x, i) => acc * x ** (ws[i] / total), 1);
+  } else {
+    out.C = [out.S_stat, out.S_liq, out.S_coh].includes(null) ? null
+      : out.S_stat ** w.w_stat * out.S_liq ** w.w_liq * out.S_coh ** w.w_coh;
+  }
+  out.flag = out.C == null || comp.fragility_c_threshold == null ? null : out.C < comp.fragility_c_threshold;
+  return out;
+}
+
+function sameNum(a, b) {
+  if (a == null || b == null || typeof a === 'boolean' || typeof b === 'boolean') return a === b || (a == null && b == null);
+  return a === b || Math.abs(a - b) <= 1e-12 * Math.max(Math.abs(a), Math.abs(b));
+}
+
+function num(v, sig = 6) {
+  if (v == null) return 'n/a';
+  if (v !== 0 && (Math.abs(v) < 1e-4 || Math.abs(v) >= 1e15)) return v.toExponential(sig - 1);
+  return v.toLocaleString(locale(), { maximumSignificantDigits: sig });
+}
+
+function pct(v) {
+  return v == null ? 'n/a' : (v * 100).toLocaleString(locale(), { maximumSignificantDigits: 4 }) + ' %';
+}
+
+function recalcHtml(d) {
+  const ci = d.provenance.confidence_inputs, R = recomputeIndex(ci), rc = t('rc'), conf = d.confidence;
+  const comp = ci.composition;
+  const served = conf
+    ? { S_stat: conf.subscores.S_stat, S_liq: conf.subscores.S_liq, S_coh: conf.subscores.S_coh, S_peg: conf.S_peg,
+        C: conf.C, flag: conf.fragility_flag }
+    : { S_stat: ci.s_stat && ci.s_stat.value, S_liq: ci.s_liq && ci.s_liq.value, S_coh: ci.s_coh && ci.s_coh.value,
+        S_peg: ci.s_peg && ci.s_peg.value, C: comp.C, flag: comp.fragility_flag };
+  const ok = ['S_stat', 'S_liq', 'S_coh', 'S_peg', 'C', 'flag'].every(k => sameNum(R[k], served[k]));
+  const rule = r => rc.rules[r] || r;
+  let html = `<div class="recalc-status ${ok ? 'recalc-ok' : 'recalc-bad'}">${ok ? '✓' : '⚠'} ${esc(rc.status(num(R.C), ok))}</div>`
+           + `<p class="recalc-intro">${esc(rc.intro)}</p>`;
+
+  const st = ci.s_stat;
+  if (st) {
+    let f = '';
+    if (st.rule === 'mad_z_score' && st.method === 'mad')
+      f = `z = ${num(0.6745)} × |${num(st.price_tested, 10)} − ${num(st.median, 10)}| / ${num(st.mad, 10)} = ${num(R.z)}\n`
+        + `S_stat = exp(−z² / (2 × ${num(st.sigma_mad)}²)) = ${num(R.S_stat)}`;
+    else if (st.rule === 'mad_z_score')
+      f = `z = |ln ${num(st.price_tested, 10)} − ${num(st.median_log, 10)}| / ${num(st.local_volatility, 10)} = ${num(R.z)}\n`
+        + `S_stat = exp(−z² / (2 × ${num(st.sigma_mad)}²)) = ${num(R.S_stat)}`;
+    else if (st.rule === 'insufficient_data_floor') f = `n = ${st.n_observations} < ${st.min_observations} → S_stat = ${num(st.floor)}`;
+    else if (st.rule === 'mad_zero') f = 'MAD = 0 → S_stat = 1';
+    else f = `S_stat = ${num(R.S_stat)}`;
+    html += `<div class="sub-label score-label">S_stat</div>` + kvTable([
+      [rc.reference, `${st.reference_file} (${rc.kind[st.reference_kind] || st.reference_kind})`],
+      [rc.window, `${fmtTs(st.window_start_utc)} → ${fmtTs(st.window_end_utc)}`],
+      [rc.servedPhases, st.served_phases ? st.served_phases.map(s => `${s.phase}${colon()}${fmtTs(s.from_utc)} → ${fmtTs(s.to_utc)}`).join('; ') : null],
+      [rc.nObs, st.n_observations.toLocaleString(locale())],
+      [rc.median, st.median != null ? num(st.median, 10) : null], [rc.mad, st.mad != null ? num(st.mad, 10) : null],
+      [`${rc.priceTested} (${st.price_tested_field})`, num(st.price_tested, 10)],
+      [rc.rule, rule(st.rule)],
+    ]) + `<div class="formula">${esc(f)}</div>`;
+  }
+
+  const lq = ci.s_liq;
+  if (lq) {
+    html += `<div class="sub-label score-label">S_liq</div>`;
+    lq.legs.forEach((leg, k) => {
+      const r = leg.row, L = R.legs[k];
+      const tvlTxt = leg.tvl_raw == null ? 'n/a'
+        : `${num(leg.tvl_raw, 10)} ${leg.tvl_unit === 'eth' ? 'ETH' : 'USD'}`
+          + (leg.tvl_unit === 'eth' && leg.eth_usd_price_for_tvl != null ? ` × ${num(leg.eth_usd_price_for_tvl, 10)} = ${num(leg.tvl_usd, 10)} USD` : '');
+      html += kvTable([
+        [rc.roles[leg.role] || leg.role, leg.file],
+        [rc.row, r ? `${fmtTs(r.timestamp)}` + (r.block_number != null ? ` · ${t('pv').block} ${r.block_number} / log ${r.log_index}` : '') : null],
+        [`TVL (${leg.tvl_column || '—'})`, tvlTxt],
+        [`${rc.slippage} (${leg.slippage_column || '—'})`, leg.slippage != null ? num(leg.slippage, 10) : 'n/a'],
+        ...(leg.role === 'eth_usd_leg' && leg.price != null ? [[`ETH/USD (${leg.price_column})`, num(leg.price, 10)]] : []),
+        [rc.legScore, `${num(L.sTvl)} · ${num(L.sSlip)} → ${num(L.v)}`],
+      ]);
+    });
+    const tvlF = lq.tvl_score_mode === 'log_memoire'
+      ? `S_TVL = clamp(log10(TVL / ${num(lq.tvl_log_min_usd)}) / log10(${num(lq.tvl_log_ref_usd)} / ${num(lq.tvl_log_min_usd)}), 0, 1)`
+      : lq.tvl_score_mode === 'linear_to_threshold' ? `S_TVL = min(1, TVL / ${num(lq.seuil_TVL_min_usd)})`
+      : rc.binary(num(lq.seuil_TVL_min_usd));
+    const comb = lq.rule === 'geometric_mean_of_legs'
+      ? `S_liq = √(${num(R.legs[0].v)} × ${num(R.legs[1].v)}) = ${num(R.S_liq)}` : `S_liq = ${num(R.S_liq)}`;
+    html += kvTable([[rc.combination, rule(lq.rule)]])
+          + `<div class="formula">${esc(`${tvlF}\nS_slip = exp(−|slip| / ${num(lq.slip_max)}), ${rc.legWord} = √(S_TVL × S_slip)\n${comb}`)}</div>`;
+  }
+
+  const ch = ci.s_coh;
+  if (ch) {
+    const r = ch.chainlink_round;
+    html += `<div class="sub-label score-label">S_coh</div>` + kvTable([
+      [rc.round, r ? r.file : null],
+      [t('pv').phaseRound, r && r.phase != null ? `${r.phase} / ${r.aggregator_round}` : null],
+      [rc.roundId, r ? r.global_round_id : null],
+      [rc.published, r ? fmtTs(r.timestamp) : null],
+      [rc.answer, r ? num(r.answer, 10) : null],
+      [`${rc.priceCompared} (${ch.price_compared_field})`, num(ch.price_compared, 10)],
+      [rc.delta, pct(ch.delta)], [rc.deltaTol, pct(ch.delta_tol)], [rc.rule, rule(ch.rule)],
+    ]) + (ch.rule === 'deviation'
+      ? `<div class="formula">${esc(`δ = |${num(ch.price_compared, 10)} − ${num(r.answer, 10)}| / ${num(r.answer, 10)} = ${pct(R.delta)}\nS_coh = exp(−(δ / ${pct(ch.delta_tol)})²) = ${num(R.S_coh)}`)}</div>` : '');
+  }
+
+  const pg = ci.s_peg;
+  if (pg) {
+    const r = pg.peg_round;
+    html += `<div class="sub-label score-label">S_peg</div>` + kvTable([
+      [rc.quote, pg.quote_currency],
+      [rc.pegRound, r ? `${r.file} · ${r.phase != null ? r.phase + ' / ' + r.aggregator_round + ' · ' : ''}${fmtTs(r.timestamp)}` : null],
+      [rc.peg, pg.peg != null ? num(pg.peg, 10) : null], [rc.pegTol, pct(pg.peg_tol)], [rc.rule, rule(pg.rule)],
+    ]) + (pg.rule === 'peg_deviation'
+      ? `<div class="formula">${esc(`S_peg = exp(−(|${num(pg.peg, 10)} − 1| / ${num(pg.peg_tol)})²) = ${num(R.S_peg)}` + (comp.mode === '3sub' ? `\n${rc.outsideC}` : ''))}</div>` : '');
+  }
+
+  const w = comp.weights;
+  const cF = comp.mode === '4sub'
+    ? `C = (S_stat^${num(w.w_stat)} × S_liq^${num(w.w_liq)} × S_coh^${num(w.w_coh)} × S_peg^${num(w.w_peg)})^(1 / Σw) = ${num(R.C)}`
+    : `C = ${num(R.S_stat)}^${num(w.w_stat, 10)} × ${num(R.S_liq)}^${num(w.w_liq, 10)} × ${num(R.S_coh)}^${num(w.w_coh, 10)} = ${num(R.C)}`;
+  const flagTxt = R.flag == null ? 'n/a' : (R.flag ? rc.fragile : rc.usable);
+  html += `<div class="sub-label score-label">C</div><div class="formula">${esc(cF + (comp.fragility_c_threshold != null
+            ? `\nC ${R.flag ? '<' : '≥'} ${num(comp.fragility_c_threshold)} (${rc.threshold}) → ${flagTxt}` : ''))}</div>`;
+
+  html += `<div class="recalc-foot"><button type="button" class="dl-btn" id="dl-record">⬇ ${esc(rc.download)}</button>`
+        + `<span>${rc.verifyHint}</span></div>`;
+  return html;
+}
+
+function downloadRecord(d) {
+  const blob = new Blob([JSON.stringify(d, null, 2) + '\n'], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `openprice_${d.asset}_${String(d.timestamp || '').replace(/[:]/g, '-')}_${d.granularity || 'raw'}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

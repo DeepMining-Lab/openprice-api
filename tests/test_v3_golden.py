@@ -132,9 +132,56 @@ def test_bulk_ranges_equal_point_by_point_on_real_data(real_v3):
         lambda: svc.price_range("LINK", datetime(2024, 3, 1, tzinfo=u), datetime(2024, 3, 1, 6, tzinfo=u), 1000,
                                 include_confidence=True, include_provenance=True),
     ]
+    def dumps(items):  # without config_sha256: batch_ranges, switched below, is one of the parameters it covers
+        out = [p.model_dump(mode="json") for p in items]
+        for d in out:
+            (d.get("provenance") or {}).pop("config_sha256", None)
+        return out
+
     for call in calls:
         real_v3.v3.batch_ranges = False
-        one_by_one = [p.model_dump(mode="json") for p in call().items]
+        one_by_one = dumps(call().items)
         real_v3.v3.batch_ranges = True
-        bulk = [p.model_dump(mode="json") for p in call().items]
+        bulk = dumps(call().items)
         assert len(bulk) >= 8 and bulk == one_by_one
+
+
+def test_every_golden_response_recomputes_from_its_provenance(real_v3):
+    """``provenance.confidence_inputs`` on every golden request: tools/verify_confidence.py recomputes S_stat, S_liq,
+    S_coh, S_peg, C and fragility_flag from the record alone and finds the values served, and the S_stat window
+    statistics of the record equal a plain Python median and MAD over the stored rows of the window."""
+    import json
+    from datetime import datetime
+
+    spec = importlib.util.spec_from_file_location("verify_confidence", ROOT / "tools" / "verify_confidence.py")
+    verifier = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(verifier)
+
+    def ts(v: str) -> datetime:
+        return datetime.fromisoformat(v.replace("Z", "+00:00"))
+
+    svc = service_mod.get_service()
+    checked = 0
+    for req in json.load(open(ROOT / "tests" / "golden" / "v2_requests.json")):
+        resp, _ = svc.price_at(req["asset"], ts(req["timestamp"]), granularity=req["granularity"])
+        d = resp.model_dump(mode="json")
+        inputs = d["provenance"]["confidence_inputs"]
+        if inputs is None:
+            assert d["branch_level"] in ("3", "4"), req["id"]
+            continue
+        rep = verifier.Report(req["id"])
+        verifier.verify_record(d, rep)
+        assert rep.checks and rep.ok, (req["id"], [c for c in rep.checks if not c[1]])
+        st = inputs["s_stat"]
+        if st and st["method"] == "mad" and st["rule"] != "missing_columns":
+            ds = svc.store.dataset(st["reference_file"])
+            prices = sorted(svc.store.prices(st["reference_file"], ds.col("price_usd"), ts(st["window_start_utc"]),
+                                             ts(st["window_end_utc"]), st["window_row_limit"],
+                                             served=st["served_phases"] is not None))
+            n = len(prices)
+            assert n == st["n_observations"], req["id"]
+            if n:
+                med = prices[n // 2]
+                assert (med, sorted(abs(p - med) for p in prices)[n // 2]) == (st["median"], st["mad"]), req["id"]
+        checked += 1
+    assert checked >= 200

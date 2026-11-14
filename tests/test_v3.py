@@ -70,6 +70,15 @@ def _pool_rows(n: int, start: datetime = T0, step_s: int = 60, base: float = 14.
              2_000_000.0, 0.001, 1000 + i, f"0x{i:064x}", 0] for i in range(n)]
 
 
+def _dumps(items) -> list[dict]:
+    """JSON of range points, without ``provenance.config_sha256``: the parity tests switch ``v3.batch_ranges``, one of
+    the parameters it fingerprints, between the two runs they compare."""
+    out = [p.model_dump(mode="json") for p in items]
+    for d in out:
+        (d.get("provenance") or {}).pop("config_sha256", None)
+    return out
+
+
 def _build(cfg) -> store_mod.Store:
     sync_mod.run_sync(cfg)
     return store_mod.Store(cfg)
@@ -543,9 +552,9 @@ class TestRanges:
             return svc.price_range("LINK", T0 - timedelta(minutes=10), T0 + timedelta(minutes=5), 100,
                                    granularity="minute", include_confidence=True, include_provenance=True)
         v3cfg.v3.batch_ranges = False
-        one_by_one = [p.model_dump(mode="json") for p in call().items]
+        one_by_one = _dumps(call().items)
         v3cfg.v3.batch_ranges = True
-        bulk = [p.model_dump(mode="json") for p in call().items]
+        bulk = _dumps(call().items)
         assert len(bulk) == 16 and bulk == one_by_one
         assert bulk[0]["unavailable_reason"] == "pre_genesis" and bulk[-1]["price_usd"] is not None
 
@@ -1348,7 +1357,7 @@ class TestBatchedRanges:
             v3cfg.v3.batch_ranges = True
             bulk = call()
             assert bulk.next_start == one_by_one.next_start  # (the 2-point day series stays point by point)
-            assert [p.model_dump(mode="json") for p in bulk.items] == [p.model_dump(mode="json") for p in one_by_one.items]
+            assert _dumps(bulk.items) == _dumps(one_by_one.items)
 
     def test_ranges_use_the_bulk_store_outside_legacy_mode(self, v3cfg):
         self._market(v3cfg)

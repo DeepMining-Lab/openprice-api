@@ -706,7 +706,7 @@ curl  http://127.0.0.1:8000/v3/ready
 | `GET /v3/compare/{asset}` | DEX vs Chainlink over a range (`/v1/compare`, with the rounds the proxy served; the DEX price comes from levels 0a–2 only, null when none answers, and is peg-neutralized like `/v3/prices`) |
 | `GET /v3/datasets` | per CSV file: rows, dates, version, quality counters, Chainlink phase switches |
 | `GET /v3/datasets/versions/{version}` | the manifest published under a dataset version (every version is kept) |
-| `GET /v3/config`, `GET /v3/ready` | every parameter V3 uses, with `config_sha256`; readiness (503 until the store is built) |
+| `GET /v3/config`, `GET /v3/ready` | every parameter V3 uses, with `config_sha256`; readiness (503 until the store is built), with the code commit |
 
 Paths are case-sensitive (`/V3/...` returns 404); asset symbols are not (`eth` = `ETH`).
 
@@ -760,11 +760,75 @@ The provenance of a V3 response also carries:
   `rows_at_same_timestamp` and the `tie_break_rule` applied (`first_swap_of_block`, `latest_round_of_active_phase`,
   or `first_csv_row` in legacy mode); `eth_usd_leg_event` is the ETH/USD point read of a cross-rate;
 * `dataset_version` (as `X-Dataset-Version`) and `dataset_files`, the version of each file read for the answer;
-  `GET /v3/datasets/versions/{version}` resolves it later.
+  `GET /v3/datasets/versions/{version}` resolves it later;
+* `confidence_inputs`: the inputs of every confidence score, enough to recompute the index from the record alone
+  (next section);
+* `config_sha256`: the fingerprint of every parameter V3 read, the one `GET /v3/config` publishes;
+* `code_commit` and `code_dirty`: the Git commit of the API code checked out when the service started, and whether
+  `app/` or `config/` then had uncommitted changes (`true`: the commit does not describe the running code exactly;
+  commit before restarting the service). `GET /v3/ready` shows both.
 
 `confidence.parameters` adds the parameters V2 did not list: `coh_delta_tol_used` (the tolerance of the asset),
 `seuil_TVL_min_usd`, `tvl_score_mode`, `tvl_log_min_usd`, `tvl_log_ref_usd`, `min_swaps_for_stat_score`,
 `s_stat_floor`. The parity tools remove all these additions with `strip_v3_diagnostics` before comparing.
+
+#### Recomputing the confidence index from the provenance
+
+Since 2026-11-14, `provenance.confidence_inputs` records, for each sub-score, the values it was computed from, the
+parameters it used and the rule it applied, so that a third party can recompute S_stat, S_liq, S_coh, S_peg, C and
+`fragility_flag` from the record alone. Before, the response gave the sub-scores and the parameters but not their
+inputs: the median and MAD of S_stat, the Chainlink round of S_coh and the TVL and slippage of S_liq could only be
+found again by re-running the selection on the data. The block is `null` when there is no confidence index (level 3
+or 4, or `include_confidence=false`). Column names are those of the source CSV files.
+
+| Block | What it records |
+|---|---|
+| `s_stat` | reference file (the pool itself for a direct price, the Chainlink feed for a cross-rate) and its columns; window `[T − 7 d, T)` and, for a Chainlink reference, the phases the proxy served in it (`served_phases`); `n_observations`, `median` (`sorted(prices)[n // 2]`), `mad`; the price tested (`price_raw_in_quote`), `z_score`, `sigma_mad`; `rule`: `mad_z_score`, `insufficient_data_floor` (fewer than `min_observations`: the `floor`) or `mad_zero` (value 1) |
+| `s_liq` | one entry per leg (`pool`, or `token_leg` and `eth_usd_leg` for a cross-rate): the row scored, identified by block number and log index (the latest swap at or before T, also for `minute`/`hour`/`day` prices), its TVL as read (`tvl_raw`, `tvl_unit`), the ETH/USD price that converts a TVL in ETH (`eth_usd_price_for_tvl`, the ETH/USD leg's as-of row, not its VWMP), the TVL scored, the slippage and its column, S_TVL, S_slip, the leg value; `rule`: `single_leg`, `geometric_mean_of_legs`, `token_leg_only`, `eth_usd_leg_only` or `unavailable`; the TVL score parameters and `slip_max` |
+| `s_coh` | the Chainlink round (`phase`, `aggregator_round`, `global_round_id`, publication time, `answer`, proxy address), the price compared (`price_neutralized_usd`), `delta`, `delta_tol` |
+| `s_peg` | the round of the quote currency's USD feed, the peg, `peg_tol` |
+| `composition` | `mode`, `weights`, `C`, `fragility_c_threshold`, `fragility_flag` |
+
+`global_round_id` is `phase << 64 | aggregator_round` (a decimal string: 80 bits exceed what JavaScript reads
+exactly), the round id the feed's proxy uses: `getRoundData(global_round_id)` on `proxy_address` returns the round
+on-chain, without the OpenPrice data. The S_coh block of ETH `hour` at 2024-08-05T12:00Z (abridged):
+
+```json
+"s_coh": {"rule": "deviation", "phase_rule": "active_phase_at_t",
+  "chainlink_round": {"file": "eth/chainlink_eth_usd.csv", "proxy_address": "0x5f4ec3df9cbd43714fe2740f5e3616155c5b8419",
+                      "phase": 6, "aggregator_round": 20846, "global_round_id": "110680464442257330542",
+                      "timestamp": "2024-08-05T11:55:47Z", "answer": 2290.1129},
+  "price_compared": 2243.626507979825, "price_compared_field": "price_neutralized_usd",
+  "delta": 0.020298733752460465, "delta_tol": 0.0125, "value": 0.07157231165748451}
+```
+
+Before this block, S_coh = 0.0716 with a 1.25 % tolerance only gave |δ| = 2.03 %, hence a Chainlink price of either
+2 199.0 or 2 290.1. Two points the record makes explicit: S_stat tests the price in the quote currency
+(`price_tested_field: price_raw_in_quote`) while S_coh compares the peg-neutralized price, and the TVL and slippage
+scored come from the as-of row at T, not from the swaps of the VWMP window.
+
+`tools/verify_confidence.py` is the check a third party can run. It reads a response (JSON object, array or JSON
+lines, or `-` for stdin), recomputes every score with the formulas of the API, checks that each score applies the rule
+the record states, and compares the results with the record, the confidence block and the prices and parameters of
+the response. It needs only the Python standard library and none of the API's code. With `--data DIR` (the dataset
+CSV files; needs `duckdb`) it also checks the inputs against the data: the count, median and MAD of the S_stat window,
+each Chainlink round, and each row whose TVL and slippage were scored (values, and that it is the latest one at or
+before T under the tie-break rule the record names).
+
+```bash
+curl -s "http://127.0.0.1:8000/v3/prices/ETH/at?timestamp=2024-08-05T12:00:00Z&granularity=hour" > eth.json
+python tools/verify_confidence.py eth.json                                  # the record alone
+python tools/verify_confidence.py --data ~/openprice/datasets eth.json      # and the CSV files
+# OK  ETH 2024-08-05T12:00:00Z hour: 50/50 checks, C 0.387554747854
+```
+
+On the 245 golden requests, the 233 that have an index recompute exactly (Python gives the same bits; another
+language may differ in the last bits of `exp` and `log`, hence a relative tolerance of 1e-12); the 12 others are
+levels 3 and 4. 22 of them, one per asset and granularity plus two stress dates, also pass `--data` against the CSV
+files (3 min, most of it reading the 13.8 GB ETH/USDC file). The record changes no number: the 245 responses are
+identical to those of the previous code apart from the four new fields. It adds about 1 to 1.5 ms to a point request
+with provenance (serialising the block) and nothing without it. Responses of an earlier API version, including those
+of the re-evaluation of thesis chapter 9 (commit 8e21942), do not have these fields.
 
 ### Ranges: pagination and latency
 
@@ -942,7 +1006,13 @@ It lets you, without writing any `curl`:
   V2 `S_peg`, fragility flag and qualitative level when present);
 - expand a **Provenance** panel showing files used, calculation path, leg
   timestamps, the full temporal-provenance block (window bounds, R1 expansion
-  step, raw/valid/filtered swap counts) and the reference block `b_ref(T)`.
+  step, raw/valid/filtered swap counts) and the reference block `b_ref(T)`; with
+  V3, also the on-chain event behind a point price, the rejected sources and the
+  versions of the data, the parameters (`config_sha256`) and the code;
+- with V3, expand an **Index recomputation** panel: the inputs of each sub-score
+  (`provenance.confidence_inputs`), each formula with its numbers, and C
+  recomputed in the browser from the record alone, compared with the served
+  value. A button downloads the response as JSON, for `tools/verify_confidence.py`.
 
 The API URL field picks its default from where the page is served:
 

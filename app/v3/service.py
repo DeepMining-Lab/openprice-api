@@ -25,7 +25,10 @@ which candidates were rejected and why (``provenance.rejected_candidates``), a C
 phase table was not checked up to T is flagged, and so is a Chainlink price (level 3, which has no confidence
 index) whose round is older than the feed's heartbeat allows (``oracle_stale``). The provenance also names the on-chain event behind
 a point price (``source_event``, ``eth_usd_leg_event``) and the data version that answered
-(``dataset_version``, ``dataset_files``); ``confidence.parameters`` lists every parameter used.
+(``dataset_version``, ``dataset_files``), the parameters and the code (``config_sha256``, ``code_commit``);
+``confidence.parameters`` lists every parameter used, and ``provenance.confidence_inputs`` the inputs of every score,
+recorded by the functions that compute them (``s_stat_with_inputs``, ``s_coh_with_inputs``, ``peg_round_at``; S_liq by
+``app.v3.record``), so that the index can be recomputed from the record alone.
 Range endpoints report truncation and the start of the next page; ``raw`` series have one point per
 distinct timestamp.
 """
@@ -45,11 +48,13 @@ from typing import Any
 from app import registry
 from app.config import AppConfig, get_config
 from app.routers.prices_v2 import _compute_s_liq
-from app.schemas import (ComparePointV3, ConfidenceV2Detail, PriceV3Response, ProvenanceV3, RejectedCandidate,
-                         SourceEventV3, Warning)
+from app.schemas import (ComparePointV3, CompositionV3, ConfidenceInputsV3, ConfidenceV2Detail, PriceV3Response,
+                         ProvenanceV3, RejectedCandidate, SCohInputsV3, SourceEventV3, SPegInputsV3, SStatInputsV3,
+                         Warning)
 from app.services import confidence_v2_service as v2
 from app.services.price_service import PriceResult, _level_4
 from app.services.provenance_service import build_provenance
+from app.v3 import record
 from app.v3.batch import BatchStore
 from app.v3.engine import ETH_LEG_AGGREGATED, N_SAME_TS, Engine, no_round_message
 from app.v3.store import Store, get_store
@@ -59,45 +64,63 @@ from app.v3.store import Store, get_store
 # Sub-scores on the Parquet store
 # ---------------------------------------------------------------------------
 
-def compute_s_stat(store: Store, rel: str, timestamp: datetime, price_at_t: float, cfg: AppConfig):
-    """S_stat over ``confidence_v2.s_stat.window_seconds`` (V2 formula, complete window)."""
+def s_stat_with_inputs(store: Store, rel: str, timestamp: datetime, price_at_t: float, cfg: AppConfig,
+                       reference_kind: str = "source_pool"):
+    """S_stat over ``confidence_v2.s_stat.window_seconds`` (V2 formula, complete window), its warnings and the record
+    of its inputs (``provenance.confidence_inputs.s_stat``)."""
     warnings: list[Warning] = []
     s_cfg = cfg.confidence_v2.s_stat
     ds = store.dataset(rel)
     ts_col = ds.col("timestamp") if ds else None
     price_col = ds.col("price_usd") if ds else None
-    if not ts_col or not price_col:
-        warnings.append(Warning(code="s_stat_missing_columns",
-                                message="Cannot compute S_stat: missing timestamp or price_usd column."))
-        return cfg.thresholds.s_stat_floor, warnings
-
     window_start = timestamp - timedelta(seconds=s_cfg.window_seconds)
     limit = cfg.api.max_limit if cfg.v3.legacy_truncation else None
     min_n = cfg.thresholds.min_swaps_for_stat_score
     sigma = cfg.thresholds.sigma_mad
+    method = ("mad" if not s_cfg.normalize_by_volatility
+              else "log_realized_vol" if s_cfg.volatility_estimator == "realized_vol" else "log_mad")
+    raw = ds.raw_mapping if ds else {}
+    rec: dict[str, Any] = dict(
+        method=method, reference_file=rel, reference_kind=reference_kind,
+        reference_timestamp_column=raw.get("timestamp"), reference_price_column=raw.get("price_usd"),
+        window_start_utc=window_start, window_end_utc=timestamp, window_row_limit=limit, price_tested=price_at_t,
+        sigma_mad=sigma, min_observations=min_n, floor=cfg.thresholds.s_stat_floor,
+    )
+
+    def done(value: float, rule: str, **found):
+        return value, warnings, SStatInputsV3(**rec, **found, rule=rule, value=value)
+
+    if not ts_col or not price_col:
+        warnings.append(Warning(code="s_stat_missing_columns",
+                                message="Cannot compute S_stat: missing timestamp or price_usd column."))
+        return done(cfg.thresholds.s_stat_floor, "missing_columns")
+
     served = store.phase_filtering(rel)  # a Chainlink reference: rounds of the phase served at their time
+    if served:
+        rec["served_phases"] = record.served_phases(ds, window_start, timestamp)
 
     if not s_cfg.normalize_by_volatility:
         n, median_p, mad = store.price_stats(rel, price_col, window_start, timestamp, limit, served=served)
+        stats = dict(n_observations=n, median=median_p, mad=mad)
         if n < min_n:
             warnings.append(Warning(code="s_stat_insufficient_data",
                                     message=f"Only {n} observations in window (min {min_n}); using floor."))
-            return cfg.thresholds.s_stat_floor, warnings
+            return done(cfg.thresholds.s_stat_floor, "insufficient_data_floor", **stats)
         if mad == 0:
-            return 1.0, warnings
+            return done(1.0, "mad_zero", **stats)
         z = 0.6745 * abs(price_at_t - median_p) / mad
-        return math.exp(-(z ** 2) / (2 * sigma ** 2)), warnings
+        return done(math.exp(-(z ** 2) / (2 * sigma ** 2)), "mad_z_score", z_score=z, **stats)
 
     # Volatility-normalized variant (off by default): needs the raw series.
     prices = store.prices(rel, price_col, window_start, timestamp, limit, served=served)
     if len(prices) < min_n:
         warnings.append(Warning(code="s_stat_insufficient_data",
                                 message=f"Only {len(prices)} observations in window (min {min_n}); using floor."))
-        return cfg.thresholds.s_stat_floor, warnings
+        return done(cfg.thresholds.s_stat_floor, "insufficient_data_floor", n_observations=len(prices))
     if price_at_t <= 0 or any(p <= 0 for p in prices):
         warnings.append(Warning(code="s_stat_nonpositive_price",
                                 message="Non-positive price encountered; log-space S_stat cannot be computed."))
-        return cfg.thresholds.s_stat_floor, warnings
+        return done(cfg.thresholds.s_stat_floor, "nonpositive_price", n_observations=len(prices))
     logs = [math.log(p) for p in prices]
     median_log = sorted(logs)[len(logs) // 2]
     if s_cfg.volatility_estimator == "realized_vol":
@@ -108,42 +131,60 @@ def compute_s_stat(store: Store, rel: str, timestamp: datetime, price_at_t: floa
     else:
         abs_devs = sorted(abs(lp - median_log) for lp in logs)
         local_vol = abs_devs[len(abs_devs) // 2] / 0.6745
+    stats = dict(n_observations=len(prices), median_log=median_log, local_volatility=local_vol)
     if local_vol == 0:
-        return 1.0, warnings
+        return done(1.0, "mad_zero", **stats)
     z = abs(math.log(price_at_t) - median_log) / local_vol
-    return math.exp(-(z ** 2) / (2 * sigma ** 2)), warnings
+    return done(math.exp(-(z ** 2) / (2 * sigma ** 2)), "mad_z_score", z_score=z, **stats)
 
 
-def compute_s_coh(store: Store, asset: str, dex_price_neutralized: float, cl_rel: str,
-                  timestamp: datetime, cfg: AppConfig):
+def compute_s_stat(store: Store, rel: str, timestamp: datetime, price_at_t: float, cfg: AppConfig):
+    """S_stat over ``confidence_v2.s_stat.window_seconds`` (V2 formula, complete window) and its warnings."""
+    value, warnings, _ = s_stat_with_inputs(store, rel, timestamp, price_at_t, cfg)
+    return value, warnings
+
+
+def s_coh_with_inputs(store: Store, asset: str, dex_price_neutralized: float, cl_rel: str, timestamp: datetime,
+                      cfg: AppConfig, price_field: str = "price_neutralized_usd"):
+    """S_coh, its warnings and the record of its inputs (``provenance.confidence_inputs.s_coh``)."""
     warnings: list[Warning] = [Warning(
         code="coh_neutralized_peg",
         message="S_coh computed on the peg-neutralized DEX price (V2 behaviour).",
         severity="info",
     )]
+    tol = coh_delta_tol(cfg, asset)
     ds = store.dataset(cl_rel)
     ts_col = ds.col("timestamp") if ds else None
     price_col = ds.col("price_usd") if ds else None
+    phase = store.active_phase(cl_rel, timestamp) if ds else None
+    rec: dict[str, Any] = dict(phase_rule="active_phase_at_t" if phase is not None else "all_phases",
+                               price_compared=dex_price_neutralized, price_compared_field=price_field, delta_tol=tol)
     if not ts_col or not price_col:
         warnings.append(Warning(code="s_coh_chainlink_missing_columns",
                                 message="Cannot compute S_coh: Chainlink file missing columns."))
-        return None, warnings
-    phase = store.active_phase(cl_rel, timestamp)
-    row = store.as_of(cl_rel, timestamp, [price_col], phase=phase)
+        return None, warnings, SCohInputsV3(**rec, rule="missing_columns", value=None)
+    row = store.as_of(cl_rel, timestamp, record.round_cols(ds, price_col), phase=phase)
     if row is None or row.get(price_col) is None:
         message = "No Chainlink observation found at or before timestamp."
         if phase is not None:
             message = f"No Chainlink observation found: {no_round_message(ds, phase)}."
         warnings.append(Warning(code="s_coh_no_chainlink_observation", message=message))
-        return None, warnings
+        return None, warnings, SCohInputsV3(**rec, rule="no_chainlink_observation", value=None)
     cl_price = float(row[price_col])
+    rec["chainlink_round"] = record.round_ref(ds, row, price_col, phase is not None)
     if cl_price == 0:
         warnings.append(Warning(code="s_coh_chainlink_zero_price",
                                 message="Chainlink price is zero; S_coh cannot be computed."))
-        return None, warnings
-    tol = coh_delta_tol(cfg, asset)
+        return None, warnings, SCohInputsV3(**rec, rule="chainlink_zero_price", value=None)
     delta = abs(dex_price_neutralized - cl_price) / cl_price
-    return math.exp(-((delta / tol) ** 2)), warnings
+    value = math.exp(-((delta / tol) ** 2))
+    return value, warnings, SCohInputsV3(**rec, delta=delta, rule="deviation", value=value)
+
+
+def compute_s_coh(store: Store, asset: str, dex_price_neutralized: float, cl_rel: str,
+                  timestamp: datetime, cfg: AppConfig):
+    value, warnings, _ = s_coh_with_inputs(store, asset, dex_price_neutralized, cl_rel, timestamp, cfg)
+    return value, warnings
 
 
 def coh_delta_tol(cfg: AppConfig, asset: str) -> float:
@@ -162,22 +203,30 @@ def fragility_c_threshold(cfg: AppConfig, granularity: str) -> float | None:
     return cfg.confidence_v2.fragility.c_threshold
 
 
-def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppConfig):
-    """(peg_value, observed_ts, relative_path) read as-of T from the Chainlink stablecoin feed."""
+def peg_round_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppConfig):
+    """(peg_value, observed_ts, relative_path, round) read as-of T from the Chainlink stablecoin feed; the round
+    (``ChainlinkRoundV3``) identifies the answer used."""
     peg_path = registry.get_peg_feed_path(quote_currency)
     if peg_path is None:
-        return None, None, None
+        return None, None, None, None
     rel = str(peg_path.relative_to(cfg.paths.datasets_path))
     ds = store.dataset(rel)
     if ds is None:
-        return None, None, None
+        return None, None, None, None
     ts_col, price_col = ds.col("timestamp"), ds.col("price_usd")
     if not ts_col or not price_col:
-        return None, None, None
-    row = store.as_of(rel, timestamp, [price_col], phase=store.active_phase(rel, timestamp))
+        return None, None, None, None
+    phase = store.active_phase(rel, timestamp)
+    row = store.as_of(rel, timestamp, record.round_cols(ds, price_col), phase=phase)
     if row is None or row.get(price_col) is None:
-        return None, None, None
-    return float(row[price_col]), row[ts_col], rel
+        return None, None, None, None
+    return float(row[price_col]), row[ts_col], rel, record.round_ref(ds, row, price_col, phase is not None)
+
+
+def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppConfig):
+    """(peg_value, observed_ts, relative_path) read as-of T from the Chainlink stablecoin feed."""
+    value, ts, rel, _ = peg_round_at(store, quote_currency, timestamp, cfg)
+    return value, ts, rel
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +236,8 @@ def get_peg_at(store: Store, quote_currency: str, timestamp: datetime, cfg: AppC
 V3_DIAGNOSTIC_CODES = frozenset({"future_timestamp", "beyond_data_coverage", "fallback_explained",
                                  "chainlink_phase_unverified", "oracle_stale", "pre_genesis"})
 # Additive V3 fields: provenance blocks and confidence parameters that V2 does not have.
-V3_PROVENANCE_FIELDS = ("rejected_candidates", "source_event", "eth_usd_leg_event", "dataset_version", "dataset_files")
+V3_PROVENANCE_FIELDS = ("rejected_candidates", "source_event", "eth_usd_leg_event", "dataset_version", "dataset_files",
+                        "confidence_inputs", "config_sha256", "code_commit", "code_dirty")
 V3_PARAMETER_KEYS = ("coh_delta_tol_used", "seuil_TVL_min_usd", "tvl_score_mode", "tvl_log_min_usd", "tvl_log_ref_usd",
                      "min_swaps_for_stat_score", "s_stat_floor")
 
@@ -298,19 +348,26 @@ class Service:
         self.cache = _LRU(cfg.v3.cache_size)
 
     # ---------------------------------------------------------- neutralization
-    def _neutralize(self, result: PriceResult, timestamp: datetime):
+    def _neutralize_round(self, result: PriceResult, timestamp: datetime):
+        """(quote_currency, peg_value, peg_ts, peg_rel, peg_round) of the price's quote currency."""
         schema = result.eth_source_schema if result.eth_source_schema is not None else result.source_schema
         if schema is None or result.branch_level in ("3", "4"):
-            return None, None, None, None
+            return None, None, None, None, None
         quote_currency = self.store.quote_symbol(str(schema.path))
         if quote_currency is None:
-            return None, None, None, None
-        peg_value, peg_ts, peg_rel = get_peg_at(self.store, quote_currency, timestamp, self.cfg)
-        return quote_currency, peg_value, peg_ts, peg_rel
+            return None, None, None, None, None
+        peg_value, peg_ts, peg_rel, peg_round = peg_round_at(self.store, quote_currency, timestamp, self.cfg)
+        return quote_currency, peg_value, peg_ts, peg_rel, peg_round
+
+    def _neutralize(self, result: PriceResult, timestamp: datetime):
+        return self._neutralize_round(result, timestamp)[:4]
 
     # -------------------------------------------------------------- confidence
     def _confidence(self, result: PriceResult, asset: str, timestamp: datetime, granularity: str,
-                    peg_value: float | None, price_for_coh: float | None) -> ConfidenceV2Detail:
+                    peg_value: float | None, price_for_coh: float | None,
+                    coh_field: str = "price_neutralized_usd", quote_currency: str | None = None,
+                    peg_round=None) -> tuple[ConfidenceV2Detail, ConfidenceInputsV3 | None]:
+        """The confidence block and the record of its inputs (None for an oracle or missing price: no index)."""
         cfg = self.cfg
         warnings: list[Warning] = []
         cl_paths = registry.get_chainlink_paths(asset)
@@ -318,21 +375,25 @@ class Service:
         cl_exists = cl_rel is not None and self.store.dataset(cl_rel) is not None
 
         s_stat: float | None = None
+        stat_inputs: SStatInputsV3 | None = None
         if result.price_usd is not None and result.branch_level != "3":
             if result.eth_source_row is not None and cl_exists:
-                ref_rel = cl_rel
+                ref_rel, kind = cl_rel, "chainlink_feed"
             else:
-                ref_rel = result.files_used[0] if result.files_used else None
+                ref_rel, kind = (result.files_used[0] if result.files_used else None), "source_pool"
             if ref_rel is not None and self.store.dataset(ref_rel) is not None:
-                s_stat, w = compute_s_stat(self.store, ref_rel, timestamp, result.price_usd, cfg)
+                s_stat, w, stat_inputs = s_stat_with_inputs(self.store, ref_rel, timestamp, result.price_usd, cfg,
+                                                            kind)
                 warnings.extend(w)
 
         s_liq, liq_warns = _compute_s_liq(result, cfg)
         warnings.extend(liq_warns)
 
         s_coh: float | None = None
+        coh_inputs: SCohInputsV3 | None = None
         if result.branch_level != "3" and price_for_coh is not None and cl_exists:
-            s_coh, coh_warns = compute_s_coh(self.store, asset, price_for_coh, cl_rel, timestamp, cfg)
+            s_coh, coh_warns, coh_inputs = s_coh_with_inputs(self.store, asset, price_for_coh, cl_rel, timestamp, cfg,
+                                                             coh_field)
             warnings.extend(coh_warns)
 
         s_peg, peg_warns = v2.compute_s_peg(peg_value, cfg)
@@ -350,8 +411,20 @@ class Service:
         weights = {"w_stat": w.w_stat, "w_liq": w.w_liq, "w_coh": w.w_coh}
         if mode == "4sub":
             weights["w_peg"] = w.w_peg
+        inputs: ConfidenceInputsV3 | None = None
+        if result.branch_level not in ("3", "4"):
+            inputs = ConfidenceInputsV3(
+                s_stat=stat_inputs,
+                s_liq=record.s_liq_inputs(self.store, result, cfg),
+                s_coh=coh_inputs,
+                s_peg=SPegInputsV3(rule="peg_deviation" if peg_value is not None else "not_applicable",
+                                   quote_currency=quote_currency, peg_round=peg_round, peg=peg_value,
+                                   peg_tol=cfg.confidence_v2.peg.tol, value=s_peg),
+                composition=CompositionV3(mode=mode, weights=dict(weights), C=c, fragility_c_threshold=c_threshold,
+                                          fragility_flag=flag),
+            )
         t = cfg.thresholds
-        return ConfidenceV2Detail(
+        detail = ConfidenceV2Detail(
             C=c,
             composition_mode=mode,
             fragility_flag=flag,
@@ -379,6 +452,7 @@ class Service:
             },
             warnings=warnings,
         )
+        return detail, inputs
 
     # ------------------------------------------------------------- diagnostics
     def _coverage_warning(self, timestamp: datetime, result: PriceResult, peg_rel: str | None) -> Warning | None:
@@ -480,7 +554,7 @@ class Service:
                         extra: list[Warning] | None = None) -> PriceV3Response:
         cfg = self.cfg
         rejected = rejected or []
-        quote_currency, peg_value, peg_ts, peg_rel = self._neutralize(result, timestamp)
+        quote_currency, peg_value, peg_ts, peg_rel, peg_round = self._neutralize_round(result, timestamp)
 
         price_raw_in_quote = result.price_usd
         price_neutralized_usd: float | None = None
@@ -489,11 +563,14 @@ class Service:
             price_neutralized_usd = price_raw_in_quote * peg_value
             headline_price = price_neutralized_usd
         price_for_coh = price_neutralized_usd if price_neutralized_usd is not None else price_raw_in_quote
+        coh_field = "price_neutralized_usd" if price_neutralized_usd is not None else "price_raw_in_quote"
 
         confidence = None
+        inputs: ConfidenceInputsV3 | None = None
         cl_rel: str | None = None
         if include_confidence and result.price_usd is not None:
-            confidence = self._confidence(result, asset, timestamp, granularity, peg_value, price_for_coh)
+            confidence, inputs = self._confidence(result, asset, timestamp, granularity, peg_value, price_for_coh,
+                                                  coh_field, quote_currency, peg_round)
             cl_paths = registry.get_chainlink_paths(asset)
             cl_rel = str(cl_paths[0].relative_to(cfg.paths.datasets_path)) if cl_paths else None
 
@@ -520,6 +597,10 @@ class Service:
                 and not result.eth_source_row.get(ETH_LEG_AGGREGATED) else None,
                 dataset_version=self.store.version,
                 dataset_files={r: self.store.dataset(r).file_version for r in files},
+                confidence_inputs=inputs,
+                config_sha256=record.config_sha256(cfg),
+                code_commit=record.CODE_COMMIT,
+                code_dirty=record.CODE_DIRTY,
             )
             prov.parameters = {
                 "seuil_TVL_min_usd": cfg.thresholds.seuil_TVL_min_usd,

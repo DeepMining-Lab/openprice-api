@@ -7,8 +7,6 @@ orders of magnitude faster.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import time
 from datetime import datetime, timezone
 
@@ -17,6 +15,7 @@ from fastapi import APIRouter, HTTPException, Query, Request, Response
 from app.config import get_config
 from app.routers.prices import _validate_asset, _validate_branch, _validate_granularity, _validate_source
 from app.schemas import ComparePointV3, ConfidenceV2Detail, PriceV3Response
+from app.v3 import record
 from app.v3 import sync as sync_mod
 from app.v3.service import Service, get_service
 
@@ -119,8 +118,12 @@ _H_PAGE = {
         "- `chainlink_phase_unverified` warns that a Chainlink phase switch after the last on-chain check "
         "could be missing.\n\n"
         "The provenance names the on-chain event of a point read (`source_event`, `eth_usd_leg_event`: "
-        "transaction and log index of a swap, or phase and round of a Chainlink answer) and the data version "
-        "that answered (`dataset_version`, `dataset_files`)."
+        "transaction and log index of a swap, or phase and round of a Chainlink answer), the data version "
+        "that answered (`dataset_version`, `dataset_files`), the parameters (`config_sha256`, as `/v3/config`) "
+        "and the code (`code_commit`, `code_dirty`). With confidence, `provenance.confidence_inputs` records the "
+        "inputs of every score (S_stat window median and MAD, Chainlink round of S_coh, TVL and slippage of each "
+        "S_liq leg, peg round), the parameters and rule each used, and the composition of C: the index can be "
+        "recomputed from the record alone (`tools/verify_confidence.py`)."
     ),
     tags=["Prices V3"],
     responses={200: {"headers": {**_H_COMMON, "X-Cache": _H_CACHE}}},
@@ -177,17 +180,11 @@ def confidence_at_v3(
 
 @router.get("/config", summary="Effective V3 configuration", tags=["System"])
 def effective_config_v3():
-    """Every parameter V3 reads, as loaded. ``config_sha256`` identifies this set of values (canonical JSON)."""
+    """Every parameter V3 reads, as loaded. ``config_sha256`` identifies this set of values (canonical JSON); every
+    response with provenance carries it (``provenance.config_sha256``)."""
     cfg = get_config()
-    effective = {
-        "api": {"default_limit": cfg.api.default_limit, "max_limit": cfg.api.max_limit},
-        "thresholds": cfg.thresholds.model_dump(),
-        "scoring": cfg.scoring.model_dump(),
-        "confidence_v2": cfg.confidence_v2.model_dump(),
-        "v3": cfg.v3.model_dump(),
-    }
-    digest = hashlib.sha256(json.dumps(effective, sort_keys=True).encode()).hexdigest()
-    return {"config_sha256": digest, **effective}
+    effective = record.effective_config(cfg)
+    return {"config_sha256": record.config_sha256(cfg, effective), **effective}
 
 
 @router.get("/datasets", summary="V3 datasets: rows, quality counters, Chainlink phase switches", tags=["System"])
@@ -248,6 +245,8 @@ def ready():
         "rows": sum(d.n_rows for d in ds.values()),
         "latest_data": max((d.max_ts for d in ds.values() if d.max_ts), default=None),
         "cache": {"hits": svc.cache.hits, "misses": svc.cache.misses},
+        "code_commit": record.CODE_COMMIT,
+        "code_dirty": record.CODE_DIRTY,
     }
 
 
