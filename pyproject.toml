@@ -13,6 +13,7 @@ dependencies = [
     "pydantic>=2.7",
     "pydantic-settings>=2.2",
     "pyyaml>=6.0",
+    "pytz>=2024.1",  # DuckDB needs it to hand a TIMESTAMPTZ value to Python
 ]
 
 [project.optional-dependencies]

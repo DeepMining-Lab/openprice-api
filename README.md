@@ -80,7 +80,11 @@ For each `(asset, T, granularity)`, the pipeline:
 
 1. Selects the best non-zombie pool (same pool-selection logic as the source hierarchy).
 2. Queries all swaps in `[T − Δ/2, T + Δ/2]`.
-3. Applies the MAD outlier filter (which also removes MEV sandwich trades) with `sigma_mad` from config.
+3. Applies the MAD outlier filter with `sigma_mad` from config. The filter removes isolated outliers when the window
+   holds at least three swaps and a majority of organic ones. It does not protect a window dominated by a sandwich
+   attack: see the case of 2 May 2022 (COMP, block 14696909), where the three swaps of the window are those of the
+   attack, the filter keeps the two manipulated ones and discards the only one at the market price, and the price is
+   published with C = 0 and flagged as fragile.
 4. Computes the **VWMP** (Volume-Weighted Median Price):
 
 ```
@@ -789,6 +793,12 @@ or 4, or `include_confidence=false`). Column names are those of the source CSV f
 | `s_peg` | the round of the quote currency's USD feed, the peg, `peg_tol` |
 | `composition` | `mode`, `weights`, `C`, `fragility_c_threshold`, `fragility_flag` |
 
+The OpenAPI description of the service (`GET /openapi.json`, rendered at `/docs`) documents every field of the
+provenance record with its type, its unit, its possible values and an example: schemas `ProvenanceV3`,
+`ConfidenceInputsV3`, `SStatInputsV3`, `SLiqInputsV3`, `SLiqLegV3`, `SCohInputsV3`, `SPegInputsV3`, `CompositionV3`,
+`ChainlinkRoundV3`, `RowRefV3`, `ServedPhaseV3`, `SourceEventV3` and `RejectedCandidate`. Without a running service:
+`python -c "import json; from app.main import app; print(json.dumps(app.openapi()))"`.
+
 `global_round_id` is `phase << 64 | aggregator_round` (a decimal string: 80 bits exceed what JavaScript reads
 exactly), the round id the feed's proxy uses: `getRoundData(global_round_id)` on `proxy_address` returns the round
 on-chain, without the OpenPrice data. The S_coh block of ETH `hour` at 2024-08-05T12:00Z (abridged):
@@ -811,7 +821,7 @@ scored come from the as-of row at T, not from the swaps of the VWMP window.
 lines, or `-` for stdin), recomputes every score with the formulas of the API, checks that each score applies the rule
 the record states, and compares the results with the record, the confidence block and the prices and parameters of
 the response. It needs only the Python standard library and none of the API's code. With `--data DIR` (the dataset
-CSV files; needs `duckdb`) it also checks the inputs against the data: the count, median and MAD of the S_stat window,
+CSV files; needs the `duckdb` and `pytz` packages) it also checks the inputs against the data: the count, median and MAD of the S_stat window,
 each Chainlink round, and each row whose TVL and slippage were scored (values, and that it is the latest one at or
 before T under the tie-break rule the record names).
 
@@ -935,6 +945,18 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv venv .venv --python 3.11
 uv pip install -e ".[dev]"
 ```
+
+`requirements-lock.txt` lists the exact versions the service ran with when the re-evaluation of thesis chapter 9 was
+made (Python 3.11.2, DuckDB 1.5.2, FastAPI 0.136.1, Pydantic 2.13.4). To reproduce that environment:
+
+```bash
+uv venv .venv --python 3.11
+uv pip install -r requirements-lock.txt
+uv pip install -e . --no-deps
+```
+
+`pytz` is a real dependency although the code never imports it: DuckDB needs it to hand a `TIMESTAMPTZ` value to
+Python, and fails with `Required module 'pytz' failed to import` without it.
 
 ## Dataset path
 
@@ -1278,3 +1300,19 @@ The `deviation` field is `|DEX − CL| / CL` and corresponds directly to the `δ
 - **Full provenance**: Every price exposes which files were used, the calculation path, and all active parameters.
 - **Configurable**: All thresholds and weights live in `config/openprice.yaml` and take effect immediately on restart.
 - **Auditable warnings**: Every viability check that cannot be evaluated (missing column) produces a structured warning instead of silently passing or failing.
+
+## License and citation
+
+`SPDX-License-Identifier: MIT` for the code, `SPDX-License-Identifier: CC-BY-4.0` for the documentation and the data
+files.
+
+- **Code** (`app/`, `tools/`, `tests/`, `config/`, `deploy/`, `interface-api/`): MIT License, see [`LICENSE`](LICENSE).
+- **Documentation and data files** (this README, `tests/golden/*.jsonl`, `tests/golden/*.json`): Creative Commons
+  Attribution 4.0 International (CC BY 4.0), see [`LICENSES/CC-BY-4.0.txt`](LICENSES/CC-BY-4.0.txt).
+- **On-chain datasets** read by the API: published separately at <https://fair.deepmining.ch/> under CC BY 4.0
+  (extraction code: <https://github.com/DeepMining-Lab/Open_Price_Infra>).
+
+Versions of this repository up to commit `27e9d66` were distributed under CC BY 4.0 as a whole (`LICENSE.txt`); that
+grant remains valid for those versions.
+
+To cite the software, use [`CITATION.cff`](CITATION.cff) (GitHub shows it as "Cite this repository").

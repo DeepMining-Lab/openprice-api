@@ -240,8 +240,11 @@ def _filter_mad_outliers(
     """Remove price outliers via the modified Z-score (MAD) method.
 
     Returns (kept_prices, kept_volumes, n_excluded).
-    Also filters MEV-like outliers because extreme sandwich prices have
-    z_MAD >> sigma_mad and are caught by the same criterion.
+    It removes isolated outliers when the window holds at least three swaps
+    and a majority of organic ones. It does not protect a window dominated
+    by a sandwich attack: when the manipulated swaps are the majority, the
+    median is a manipulated price and the swap at the market price is the
+    one discarded (COMP, 2 May 2022, block 14696909).
     """
     if len(prices) < 3:
         return prices, volumes, 0

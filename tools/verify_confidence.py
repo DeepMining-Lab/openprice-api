@@ -14,8 +14,8 @@ the API, checks that each score applies the rule the record states (for example 
 window has fewer observations than the minimum), and compares the results with the values the record states, with the
 confidence block of the response, and with the prices and parameters the response lists.
 
-With --data DIR (the dataset CSV files; needs the ``duckdb`` package), it also checks the inputs against the data,
-without the API's code or its derived store: the observation count, median and MAD of the S_stat window; each
+With --data DIR (the dataset CSV files; needs the ``duckdb`` and ``pytz`` packages), it also checks the inputs against
+the data, without the API's code or its derived store: the observation count, median and MAD of the S_stat window; each
 Chainlink round (answer, time, and that it is the latest round at or before T of the phase the record names); and
 each row whose TVL and slippage were scored (values, and that it is the latest swap at or before T, ties broken by the
 rule the record names). The CSV files are read as the API reads them: rows with an unreadable timestamp are ignored

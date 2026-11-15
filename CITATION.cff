@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+type: software
+title: "OpenPrice API"
+abstract: >-
+  API that serves historical prices of crypto-assets reconstructed from on-chain data (Uniswap, SushiSwap, Curve,
+  Chainlink) with a source hierarchy, a confidence index and a provenance record from which a third party can
+  recompute the index.
+authors:
+  - family-names: Augusto
+    given-names: Stéphane
+    affiliation: "HES-SO, HEG Geneva, Deep Mining Lab"
+repository-code: "https://github.com/DeepMining-Lab/openprice-api"
+url: "https://fair.deepmining.ch/"
+license: MIT
+version: "3.1.0"
+date-released: "2026-11-15"
+keywords:
+  - on-chain data
+  - historical prices
+  - decentralized exchanges
+  - confidence index
+  - provenance
+  - reproducibility
