@@ -4,7 +4,7 @@ The validity audit of 2026-09-21/22 found CLAUDE.md announcing ``seuil_TVL_min_u
 ``linear_to_threshold`` score while ``config/openprice.yaml`` used 100 000 USD and ``log_memoire``. This test reads
 every YAML block of README.md and CLAUDE.md that sets ``thresholds``, ``scoring`` or ``confidence_weights``, and every
 ``seuil_TVL_min_usd`` value written in the text, and compares them with the configuration file. CLAUDE.md is not
-versioned (.gitignore): its checks are skipped when the file is absent.
+versioned (.gitignore): its checks are collected only where the file exists, so a clone runs the README checks alone.
 """
 
 from __future__ import annotations
@@ -18,7 +18,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 CONFIG = yaml.safe_load((ROOT / "config" / "openprice.yaml").read_text())
 SECTIONS = ("thresholds", "scoring", "confidence_weights")
-DOCS = ("README.md", "CLAUDE.md")
+DOCS = ("README.md",) + (("CLAUDE.md",) if (ROOT / "CLAUDE.md").exists() else ())
 
 
 def _doc(name: str) -> str:

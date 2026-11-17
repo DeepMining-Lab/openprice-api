@@ -19,7 +19,9 @@ containers). This module derives a query-friendly copy under ``v3.parquet_root``
   unreadable timestamps (repeated headers), unreadable prices (row dropped, as V1/V2 did),
   other cells that could not be converted (kept as NULL), duplicates removed;
 * for Chainlink feeds, the proxy phase switches are read from the chain (see
-  ``app.v3.chainlink_phases``) when ``$<v3.rpc_url_env>`` is set;
+  ``app.v3.chainlink_phases``) when ``$<v3.rpc_url_env>`` is set, or taken from a published phase table
+  (``--phase-table``, checked against its SHA-256) without any node; ``--strict`` makes the run exit with status 2
+  when the switches of a feed could not be obtained;
 * the extraction head of every file (how far the extractor had scanned the chain on its last run, read from the
   ``extraction_timestamp_utc`` / ``node_head_block_at_extraction`` columns of the last rows) is kept in the manifest:
   it is the data coverage the API reports (``beyond_data_coverage``). A Chainlink file is also compared with the
@@ -33,7 +35,8 @@ containers). This module derives a query-friendly copy under ``v3.parquet_root``
   ``history/<version>.json.gz``; ``sync_log.jsonl`` records each rebuild, append and phase
   switch with its reason. The API reloads the manifest when it changes.
 
-Usage:  python -m app.v3.sync [--rebuild] [--verify] [--only SUBSTR]
+Usage:  python -m app.v3.sync [--rebuild] [--verify] [--only SUBSTR] [--strict]
+                [--phase-table FILE --phase-table-sha256 HEX --phase-table-checked-at UTC]
 """
 
 from __future__ import annotations
@@ -46,6 +49,7 @@ import hashlib
 import io
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -814,7 +818,7 @@ def _refresh_phases(cfg: AppConfig, datasets: dict[str, Any], rpc: chainlink_pha
 
     Returns (switches changed, log entries, messages). Without a node the tables are kept as they are.
     """
-    targets = [rel for rel, d in datasets.items() if (d.get("chainlink") or {}).get("proxy") and (not only or only in rel)]
+    targets = _phase_targets(datasets, only)
     if not targets:
         return False, [], []
     if rpc is None:
@@ -823,9 +827,10 @@ def _refresh_phases(cfg: AppConfig, datasets: dict[str, Any], rpc: chainlink_pha
             for rel in targets:
                 datasets[rel]["chainlink"]["status"] = "rpc_not_configured"
             return False, [], [f"WARNING ${cfg.v3.rpc_url_env} is not set: Chainlink phase switches not checked "
-                               f"({len(targets)} feeds)"]
+                               f"({len(targets)} feeds); Chainlink reads after the last check will carry "
+                               "chainlink_phase_unverified (use --phase-table without a node, --strict to fail)"]
         rpc = chainlink_phases.Rpc(url)
-    changed, log, msgs = False, [], []
+    changed, log, msgs, ok = False, [], [], 0
     for rel in targets:
         cl = datasets[rel]["chainlink"]
         try:
@@ -842,8 +847,122 @@ def _refresh_phases(cfg: AppConfig, datasets: dict[str, Any], rpc: chainlink_pha
                 log.append({"at": _now(), "dataset": rel, "action": "chainlink_phase_switch", "proxy": new["proxy"],
                             "phase": s["phase"], "block": s["block"], "block_ts": s["ts"]})
         datasets[rel]["chainlink"] = {**new, "status": "ok"}
-    msgs.append(f"Chainlink phases checked for {len(targets)} feeds ({rpc.calls} RPC calls)")
+        ok += 1
+    msgs.append(f"Chainlink phases checked for {ok} of {len(targets)} feeds ({rpc.calls} RPC calls, "
+                f"{getattr(rpc, 'retries', 0)} retried after a refusal)")
     return changed, log, msgs
+
+
+def _phase_targets(datasets: dict[str, Any], only: str | None) -> list[str]:
+    """Chainlink datasets with one feed proxy: the API filters their rounds by phase (``DatasetInfo.has_phases``)."""
+    return [rel for rel, d in datasets.items() if (d.get("chainlink") or {}).get("proxy") and (not only or only in rel)]
+
+
+_PHASE_TABLE_COLUMNS = {"file": ("fichier", "file"), "proxy": ("proxy",), "phase": ("phase",),
+                        "block": ("premier_bloc", "first_block", "block"),
+                        "ts": ("horodatage_utc", "first_block_utc", "ts")}
+
+
+def load_phase_table(path: Path, sha256: str, checked_at: str) -> dict[str, dict[str, Any]]:
+    """The phase switches of every feed from a published table, refused unless the file's SHA-256 is ``sha256``.
+
+    The CSV has one row per switch: dataset file, proxy, phase, first block of the phase and its UTC time. The table
+    published with the data version cited by the article (``table_des_phases_chainlink.csv`` on
+    https://fair.deepmining.ch/versions/a87252328cd8246d/, ``dev_c5_table_des_phases_chainlink.csv`` in the evaluation
+    material) names the columns ``fichier, proxy, phase, premier_bloc, horodatage_utc``; English names are also read. ``checked_at`` is
+    the chain time up to which the table is known complete; it becomes the feed's ``verified_ts``, as after an
+    on-chain check: a Chainlink read after it carries ``chainlink_phase_unverified``. Raises ValueError when the file
+    does not match or is inconsistent.
+    """
+    raw = path.read_bytes()
+    digest = hashlib.sha256(raw).hexdigest()
+    if digest != sha256.strip().lower():
+        raise ValueError(f"{path.name}: SHA-256 {digest} is not the expected {sha256.strip().lower()}")
+    try:
+        checked = datetime.fromisoformat(checked_at.strip().replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError(f"--phase-table-checked-at {checked_at!r} is not an ISO 8601 time") from None
+    if checked.tzinfo is None:
+        raise ValueError(f"--phase-table-checked-at {checked_at!r} has no time zone (write it in UTC, ending in Z)")
+    reader = csv.DictReader(io.StringIO(raw.decode("utf-8-sig")))
+    names = {k: next((c for c in cands if c in (reader.fieldnames or [])), None)
+             for k, cands in _PHASE_TABLE_COLUMNS.items()}
+    if None in names.values():
+        raise ValueError(f"{path.name}: missing column(s) {[k for k, v in names.items() if v is None]}")
+    table: dict[str, dict[str, Any]] = {}
+    for n, row in enumerate(reader, start=2):
+        try:
+            rel, proxy = row[names["file"]].strip(), row[names["proxy"]].strip().lower()
+            sw = {"phase": int(row[names["phase"]]), "block": int(row[names["block"]]),
+                  "ts": datetime.fromisoformat(row[names["ts"]].strip().replace("Z", "+00:00"))
+                  .astimezone(timezone.utc).isoformat()}
+        except (TypeError, ValueError, AttributeError):
+            raise ValueError(f"{path.name}, line {n}: unreadable row") from None
+        t = table.setdefault(rel, {"proxy": proxy, "switches": []})
+        if t["proxy"] != proxy:
+            raise ValueError(f"{path.name}, line {n}: {rel} has two proxies ({t['proxy']}, {proxy})")
+        t["switches"].append(sw)
+    if not table:
+        raise ValueError(f"{path.name}: no row")
+    for rel, t in table.items():
+        sw = sorted(t["switches"], key=lambda s: s["phase"])
+        if [s["phase"] for s in sw] != list(range(1, len(sw) + 1)):
+            raise ValueError(f"{path.name}: the phases of {rel} are not 1, 2, ... without gap")
+        if any(a["block"] > b["block"] or a["ts"] > b["ts"] for a, b in zip(sw, sw[1:])):
+            raise ValueError(f"{path.name}: the switches of {rel} go back in time")
+        if datetime.fromisoformat(sw[-1]["ts"]) > checked:
+            raise ValueError(f"{path.name}: {rel} switches after --phase-table-checked-at {checked.isoformat()}")
+        t.update(switches=sw, verified_ts=checked.astimezone(timezone.utc).isoformat())
+    return table
+
+
+def _apply_phase_table(datasets: dict[str, Any], table: dict[str, dict[str, Any]], label: str,
+                       only: str | None) -> tuple[bool, list[dict[str, Any]], list[str]]:
+    """Use the published phase table instead of the node: no RPC call. A feed the table does not cover, or covers
+    with another proxy, keeps its previous table and is reported. A table read earlier from the chain is kept when it
+    goes further: the file must then list the same switches."""
+    changed, log, msgs, ok = False, [], [], 0
+    targets = _phase_targets(datasets, only)
+    for rel in targets:
+        cl = datasets[rel]["chainlink"]
+        t = table.get(rel)
+        if t is None or t["proxy"] != cl["proxy"]:
+            why = "not in the phase table" if t is None else f"proxy {t['proxy']} in the table, {cl['proxy']} in the data"
+            cl["status"] = "phase_table_mismatch"
+            msgs.append(f"WARNING {rel}: Chainlink phases not set ({why})")
+            continue
+        known = [[s["phase"], s["block"]] for s in cl.get("switches") or []]
+        given = [[s["phase"], s["block"]] for s in t["switches"]]
+        if known and given[:len(known)] != known and known[:len(given)] != given:
+            cl["status"] = "phase_table_mismatch"
+            msgs.append(f"WARNING {rel}: the phase table differs from the switches already read on-chain; "
+                        "keeping those")
+            continue
+        if len(known) > len(given) or (len(known) == len(given) and (cl.get("verified_ts") or "") > t["verified_ts"]):
+            cl["status"] = "ok"   # the store already knows as much (from the chain, up to a later time)
+            ok += 1
+            continue
+        for phase, block in given[len(known):]:
+            changed = True
+            sw = t["switches"][phase - 1]
+            log.append({"at": _now(), "dataset": rel, "action": "chainlink_phase_switch", "proxy": t["proxy"],
+                        "phase": phase, "block": block, "block_ts": sw["ts"], "source": label})
+        datasets[rel]["chainlink"] = {"proxy": t["proxy"], "switches": t["switches"], "verified_block": None,
+                                      "verified_ts": t["verified_ts"], "status": "ok", "source": label}
+        ok += 1
+    msgs.append(f"Chainlink phases taken from {label} for {ok} of {len(targets)} feeds (no RPC call)")
+    return changed, log, msgs
+
+
+def phase_problems(datasets: dict[str, Any], only: str | None = None) -> list[str]:
+    """Feeds whose phase switches are not known: the API would flag their reads ``chainlink_phase_unverified`` and
+    read rounds of a phase the proxy may not have served."""
+    out = []
+    for rel in sorted(_phase_targets(datasets, only)):
+        cl = datasets[rel]["chainlink"]
+        if cl.get("status") != "ok" or not cl.get("switches") or not cl.get("verified_ts"):
+            out.append(f"{rel} ({cl.get('status') or 'phase switches never read'})")
+    return out
 
 
 def _refresh_complete_until(cfg: AppConfig, datasets: dict[str, Any], rpc: chainlink_phases.Rpc | None,
@@ -886,7 +1005,10 @@ def _refresh_complete_until(cfg: AppConfig, datasets: dict[str, Any], rpc: chain
 
 def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: bool = False,
              dry_run: bool = False, verify: bool = False,
-             rpc: chainlink_phases.Rpc | None = None) -> list[SyncResult]:
+             rpc: chainlink_phases.Rpc | None = None,
+             phase_table: tuple[dict[str, dict[str, Any]], str] | None = None) -> list[SyncResult]:
+    """Sync the store. ``phase_table``: (table from ``load_phase_table``, label) used instead of the node for the
+    Chainlink phase switches."""
     cfg = cfg or get_config()
     root = cfg.v3.parquet_path
     root.mkdir(parents=True, exist_ok=True)
@@ -937,7 +1059,12 @@ def run_sync(cfg: AppConfig | None = None, only: str | None = None, rebuild: boo
                 _write_manifest(root, datasets)
         if rpc is None and os.environ.get(cfg.v3.rpc_url_env, ""):
             rpc = chainlink_phases.Rpc(os.environ[cfg.v3.rpc_url_env])
-        phases_changed, phase_log, msgs = (False, [], []) if dry_run else _refresh_phases(cfg, datasets, rpc, only)
+        if dry_run:
+            phases_changed, phase_log, msgs = False, [], []
+        elif phase_table is not None:
+            phases_changed, phase_log, msgs = _apply_phase_table(datasets, phase_table[0], phase_table[1], only)
+        else:
+            phases_changed, phase_log, msgs = _refresh_phases(cfg, datasets, rpc, only)
         if not dry_run:
             msgs += _refresh_complete_until(cfg, datasets, rpc, only)
         results.append(SyncResult("chainlink phases", "checked", notes=msgs))
@@ -962,8 +1089,31 @@ def main() -> None:
     ap.add_argument("--verify", action="store_true",
                     help="also compare a full SHA-256 of the CSV bytes consumed so far (reads every file once)")
     ap.add_argument("--only", help="only datasets whose relative path contains this text")
+    ap.add_argument("--strict", action="store_true",
+                    help="exit with status 2 when the Chainlink phase switches of a feed are not known after the run "
+                         "(node not set or refusing, or feed missing from --phase-table): the API would then flag "
+                         "its Chainlink reads chainlink_phase_unverified and could serve other prices")
+    ap.add_argument("--phase-table", type=Path, metavar="FILE",
+                    help="CSV of the phase switches of every feed, as published with a data version: used instead of "
+                         "reading them from the node (no RPC call)")
+    ap.add_argument("--phase-table-sha256", metavar="HEX", help="expected SHA-256 of --phase-table (required)")
+    ap.add_argument("--phase-table-checked-at", metavar="UTC",
+                    help="chain time up to which --phase-table is known complete, e.g. 2026-11-01T20:30:35Z "
+                         "(required): Chainlink reads after it are flagged chainlink_phase_unverified")
     args = ap.parse_args()
-    for r in run_sync(only=args.only, rebuild=args.rebuild, verify=args.verify):
+    phase_table = None
+    if args.phase_table is not None:
+        if not args.phase_table_sha256 or not args.phase_table_checked_at:
+            ap.error("--phase-table needs --phase-table-sha256 and --phase-table-checked-at")
+        try:
+            table = load_phase_table(args.phase_table, args.phase_table_sha256, args.phase_table_checked_at)
+        except (OSError, ValueError) as e:
+            ap.error(f"--phase-table: {e}")
+        phase_table = (table, f"phase table {args.phase_table.name} (sha256 {args.phase_table_sha256.strip().lower()[:16]})")
+    elif args.phase_table_sha256 or args.phase_table_checked_at:
+        ap.error("--phase-table-sha256 and --phase-table-checked-at go with --phase-table")
+    cfg = get_config()
+    for r in run_sync(cfg, only=args.only, rebuild=args.rebuild, verify=args.verify, phase_table=phase_table):
         if r.rel in ("chainlink phases", "native copies"):
             for m in r.notes:
                 print(m, flush=True)
@@ -976,6 +1126,15 @@ def main() -> None:
                   "see quality in /v3/datasets", flush=True)
         for n in r.notes:
             print(f"WARNING {r.rel}: {n}", flush=True)
+    if args.strict:
+        problems = phase_problems(load_manifest(cfg.v3.parquet_path)["datasets"], args.only)
+        if problems:
+            print(f"ERROR the Chainlink phase switches of {len(problems)} feed(s) are not known: "
+                  + "; ".join(problems) + ". The data is synced, but the API would flag their reads "
+                  "chainlink_phase_unverified and could serve rounds of a phase the proxy did not serve. Run the sync "
+                  f"again (it resumes), with a node that serves historical state in ${cfg.v3.rpc_url_env}, or give the "
+                  "phase table published with the data version (--phase-table).", file=sys.stderr, flush=True)
+            raise SystemExit(2)
 
 
 if __name__ == "__main__":

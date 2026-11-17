@@ -22,10 +22,10 @@ router = APIRouter(prefix="/v1")
         "coherence score. Each row includes:\n\n"
         "- **timestamp** — Chainlink observation timestamp used as the time axis\n"
         "- **dex_price_usd** — best DEX price at or before that timestamp "
-        "(levels `0a → 0b → 2`; `null` if no DEX source is available)\n"
+        "(levels `0a → 0b → 1 → 2`; `null` if no DEX source is available)\n"
         "- **chainlink_price_usd** — Chainlink oracle price at that timestamp\n"
         "- **deviation** — `|dex − cl| / cl`; `null` when either price is missing\n"
-        "- **dex_branch** — source level used for the DEX price (`0a`, `0b`, `2`, or `null`)\n"
+        "- **dex_branch** — source level used for the DEX price (`0a`, `0b`, `1`, `2`, or `null`)\n"
         "- **warnings** — any issues encountered while computing the DEX price\n\n"
         "Results are capped at `limit` (max 10 000)."
     ),

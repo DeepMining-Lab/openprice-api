@@ -22,37 +22,93 @@ from __future__ import annotations
 
 import bisect
 import json
+import time
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 PHASE_ID_SELECTOR = "0x58303b10"            # keccak256("phaseId()")[:4]
 LATEST_ROUND_DATA_SELECTOR = "0xfeaf968c"   # keccak256("latestRoundData()")[:4]
 GET_ROUND_DATA_SELECTOR = "0x9a6fc8f5"      # keccak256("getRoundData(uint80)")[:4]
 
 
+# Sent with every call: several public JSON-RPC providers answer HTTP 403 to a request without a User-Agent.
+USER_AGENT = "openprice-api-sync (+https://github.com/DeepMining-Lab/openprice-api)"
+# Answers that mean "slow down" rather than "no": the call is retried after a pause.
+RETRY_HTTP_STATUS = frozenset({429, 502, 503, 504})
+RATE_LIMIT_CODES = frozenset({-32005, -32029, -32090, 429})
+RATE_LIMIT_WORDS = ("rate limit", "rate-limit", "ratelimit", "too many requests", "limit exceeded", "request limit",
+                    "throttl", "capacity exceeded", "try again later")
+
+
 class RpcError(Exception):
     """A JSON-RPC failure. The message never contains the node URL (it can carry an access token)."""
 
 
+def _rate_limited(error: Any) -> bool:
+    if not isinstance(error, dict):
+        return False
+    msg = str(error.get("message", "")).lower()
+    return error.get("code") in RATE_LIMIT_CODES or any(w in msg for w in RATE_LIMIT_WORDS)
+
+
+def _retry_after(headers: Any) -> float | None:
+    try:
+        v = float((headers or {}).get("Retry-After"))
+    except (TypeError, ValueError):
+        return None
+    return v if v >= 0 else None
+
+
 class Rpc:
-    def __init__(self, url: str, timeout: float = 15.0):
+    """JSON-RPC client of the sync. A call refused for its rate (HTTP 429, 502, 503, 504, a JSON-RPC rate-limit
+    error) or lost on the network is retried up to ``max_attempts`` times, after ``Retry-After`` when the node sends
+    it, else after 1, 2, 4... s (at most ``max_wait`` s), so that a free public node can serve a whole sync run."""
+
+    def __init__(self, url: str, timeout: float = 15.0, max_attempts: int = 8, max_wait: float = 30.0,
+                 sleep: Callable[[float], None] = time.sleep):
         self._url = url
         self._timeout = timeout
+        self._max_attempts = max(1, max_attempts)
+        self._max_wait = max_wait
+        self._sleep = sleep
         self.calls = 0
+        self.retries = 0
+
+    def _pause(self, attempt: int, hinted: float | None) -> None:
+        self.retries += 1
+        self._sleep(min(self._max_wait, hinted if hinted is not None else 2.0 ** (attempt - 1)))
 
     def _call(self, method: str, params: list[Any]) -> Any:
         self.calls += 1
         body = json.dumps({"jsonrpc": "2.0", "id": self.calls, "method": method, "params": params}).encode()
-        req = urllib.request.Request(self._url, data=body, headers={"Content-Type": "application/json"})
-        try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                out = json.load(resp)
-        except Exception as e:  # network, HTTP or JSON error: report the kind only
-            raise RpcError(f"{method}: {type(e).__name__}") from None
-        if "error" in out:
-            raise RpcError(f"{method}: {str(out['error'].get('message', 'error'))[:120]}")
-        return out.get("result")
+        for attempt in range(1, self._max_attempts + 1):
+            last = attempt == self._max_attempts
+            req = urllib.request.Request(self._url, data=body,
+                                         headers={"Content-Type": "application/json", "User-Agent": USER_AGENT})
+            try:
+                with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                    out = json.load(resp)
+            except urllib.error.HTTPError as e:  # report the status only: the body may echo the URL
+                if e.code in RETRY_HTTP_STATUS and not last:
+                    self._pause(attempt, _retry_after(e.headers))
+                    continue
+                raise RpcError(f"{method}: HTTP {e.code}") from None
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+                if not last:
+                    self._pause(attempt, None)
+                    continue
+                raise RpcError(f"{method}: {type(e).__name__}") from None
+            except Exception as e:  # unreadable answer: report the kind only
+                raise RpcError(f"{method}: {type(e).__name__}") from None
+            if "error" in out:
+                if _rate_limited(out["error"]) and not last:
+                    self._pause(attempt, None)
+                    continue
+                raise RpcError(f"{method}: {str(out['error'].get('message', 'error'))[:120]}")
+            return out.get("result")
+        raise RpcError(f"{method}: no answer")  # not reached: the last attempt returns or raises
 
     def block_number(self) -> int:
         return int(self._call("eth_blockNumber", []), 16)

@@ -722,14 +722,14 @@ const I18N = {
     fragAria: 'Flag de fragilité',
     fragTipHtml: (thr) => `
       <span class="tip-title">Flag de fragilité</span>
-      <span style="display:block;margin-bottom:.6rem;">Le flag de fragilité est un indicateur binaire qui distingue un prix &laquo;&nbsp;exploitable&nbsp;&raquo; d'un prix &laquo;&nbsp;fragile&nbsp;&raquo;. Il est activé lorsque l'Indice de Confiance passe sous un seuil calibré empiriquement (C&nbsp;&lt;&nbsp;${thr}), déterminé par analyse statistique de l'écart aux prix de référence des bourses centralisées. Contrairement à la grille qualitative, dont les seuils sont indicatifs, ce seuil est justifié par les données. Il est fiable à la granularité horaire&nbsp;; aux granularités jour et minute, il est peu discriminant et doit être interprété avec prudence.</span>
+      <span style="display:block;margin-bottom:.6rem;">Le flag de fragilité est un indicateur binaire qui distingue un prix &laquo;&nbsp;exploitable&nbsp;&raquo; d'un prix &laquo;&nbsp;fragile&nbsp;&raquo;. Il est activé lorsque l'Indice de Confiance passe sous un seuil calibré empiriquement (C&nbsp;&lt;&nbsp;${thr}), déterminé par analyse statistique de l'écart aux prix de référence des bourses centralisées. Il est fiable à la granularité horaire&nbsp;; aux granularités jour et minute, il est peu discriminant et doit être interprété avec prudence.</span>
       <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--err) 15%, transparent);color:var(--err);">fragile</span><span>À ne pas utiliser tel quel pour un usage financier.</span></span>
       <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--ok) 15%, transparent);color:var(--ok);">exploitable</span><span>Exploitable au regard du critère calibré.</span></span>`,
     ssMeta: {
       S_stat: { label: 'Qualité statistique', desc: 'Z-score MAD sur fenêtre 7 jours' },
       S_liq:  { label: 'Liquidité',           desc: 'Profondeur TVL × slippage' },
       S_coh:  { label: 'Cohérence oracle',    desc: 'Déviation DEX vs Chainlink' },
-      S_peg:  { label: 'Stabilité du peg',    desc: 'Écart du stablecoin au dollar (V2)' },
+      S_peg:  { label: 'Stabilité du peg',    desc: 'Écart du stablecoin au dollar' },
     },
     accProvenance: 'Provenance &amp; traçabilité',
     accParams: 'Paramètres &amp; pondérations',
@@ -797,7 +797,7 @@ const I18N = {
       composition_mode: 'Mode de composition',
     },
     dataStatus: {
-      observed: 'observé', reconstructed: 'reconstruit (R1)', rejected_outlier: 'rejeté (aberrant)',
+      observed: 'observé', reconstructed: 'reconstruit (R1)',
       oracle_fallback: 'repli oracle', unavailable: 'indisponible',
     },
     locale: 'fr-FR',
@@ -873,14 +873,14 @@ const I18N = {
     fragAria: 'Fragility flag',
     fragTipHtml: (thr) => `
       <span class="tip-title">Fragility flag</span>
-      <span style="display:block;margin-bottom:.6rem;">The fragility flag is a binary indicator that separates a &laquo;&nbsp;usable&nbsp;&raquo; price from a &laquo;&nbsp;fragile&nbsp;&raquo; one. It is set when the confidence index drops below an empirically calibrated threshold (C&nbsp;&lt;&nbsp;${thr}), determined by statistical analysis of the deviation from centralized-exchange reference prices. Unlike the qualitative grid, whose thresholds are indicative, this one is data-justified. It is reliable at hourly granularity; at day and minute granularity it is not very discriminant and should be read with caution.</span>
+      <span style="display:block;margin-bottom:.6rem;">The fragility flag is a binary indicator that separates a &laquo;&nbsp;usable&nbsp;&raquo; price from a &laquo;&nbsp;fragile&nbsp;&raquo; one. It is set when the confidence index drops below an empirically calibrated threshold (C&nbsp;&lt;&nbsp;${thr}), determined by statistical analysis of the deviation from centralized-exchange reference prices. It is reliable at hourly granularity; at day and minute granularity it is not very discriminant and should be read with caution.</span>
       <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--err) 15%, transparent);color:var(--err);">fragile</span><span>Not to be used as-is for a financial purpose.</span></span>
       <span class="tip-row"><span class="tip-tag" style="background:color-mix(in srgb, var(--ok) 15%, transparent);color:var(--ok);">usable</span><span>Usable per the calibrated criterion.</span></span>`,
     ssMeta: {
       S_stat: { label: 'Statistical quality', desc: 'MAD Z-score over a 7-day window' },
       S_liq:  { label: 'Liquidity',           desc: 'TVL depth × slippage' },
       S_coh:  { label: 'Oracle coherence',    desc: 'DEX vs Chainlink deviation' },
-      S_peg:  { label: 'Peg stability',       desc: 'Stablecoin deviation from the dollar (V2)' },
+      S_peg:  { label: 'Peg stability',       desc: 'Stablecoin deviation from the dollar' },
     },
     accProvenance: 'Provenance &amp; traceability',
     accParams: 'Parameters &amp; weights',
@@ -948,7 +948,7 @@ const I18N = {
       composition_mode: 'Composition mode',
     },
     dataStatus: {
-      observed: 'observed', reconstructed: 'reconstructed (R1)', rejected_outlier: 'rejected (outlier)',
+      observed: 'observed', reconstructed: 'reconstructed (R1)',
       oracle_fallback: 'oracle fallback', unavailable: 'unavailable',
     },
     locale: 'en-US',
@@ -1498,7 +1498,7 @@ function renderPrice(d) {
   const bi    = BRANCH_INFO[d.branch_level] || { label: d.branch_label, cls: 'b-4' };
   const dsMeta = t('dataStatus')[d.data_status];
   const dsLabel = dsMeta || d.data_status;
-  const dsColor = { observed: 'var(--ok)', reconstructed: 'var(--warn)', rejected_outlier: 'var(--err)', oracle_fallback: 'var(--warn)', unavailable: 'var(--muted)' }[d.data_status] || 'var(--muted)';
+  const dsColor = { observed: 'var(--ok)', reconstructed: 'var(--warn)', oracle_fallback: 'var(--warn)', unavailable: 'var(--muted)' }[d.data_status] || 'var(--muted)';
   const price = fmt(d.price_usd);
   const tReq  = d.timestamp_requested || d.timestamp;
   const lag   = lagSeconds(tReq, d.timestamp_observed);
@@ -1569,7 +1569,7 @@ function renderConfidence(c, price) {
   const mode  = c.coherence_mode || c.composition_mode;
 
   const pct   = (score * 100).toFixed(1);
-  const color = scoreColor(score);
+  const color = confColor(c);
   const R = 50, circ = 2 * Math.PI * R;
   const fill = score * circ;
 
@@ -1977,6 +1977,15 @@ function warningListHtml(warnings) {
 function scoreColor(v) {
   if (v == null) return 'var(--muted)';
   return v >= 0.7 ? 'var(--ok)' : v >= 0.4 ? 'var(--warn)' : 'var(--err)';
+}
+
+// C takes the colour of its fragility flag, which applies the threshold of the price's granularity
+// (v3.fragility_c_threshold_by_granularity): a fixed grid would show an hourly C of 0.78 in green next to "fragile".
+// Without a flag (V1, or no calibrated threshold) C stays neutral.
+function confColor(c) {
+  if (c && c.fragility_flag === true) return 'var(--err)';
+  if (c && c.fragility_flag === false) return 'var(--ok)';
+  return 'var(--accent)';
 }
 
 function fmt(n) {

@@ -1,6 +1,6 @@
 api:
   name: "OpenPrice API"
-  version: "0.1.0"
+  version: "3.1.1"          # shown in the OpenAPI description; not part of config_sha256 (app/v3/record.py)
   default_limit: 1000
   max_limit: 10000
 

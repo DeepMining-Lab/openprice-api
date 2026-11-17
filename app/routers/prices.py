@@ -230,7 +230,7 @@ def _to_response(
     summary="Price at a specific timestamp",
     description=(
         "Returns the best available price for the given asset at or before `timestamp`, "
-        "following the source hierarchy `0a → 0b → 2 → 3 → 4`.\n\n"
+        "following the source hierarchy `0a → 0b → 1 → 2 → 3 → 4`.\n\n"
         "**Granularity:**\n"
         "- `raw` (default) — latest single observation at or before T\n"
         "- `minute` — VWMP over T ± 30 s; expands to ± 1 min, 2.5 min, 7.5 min if empty\n"

@@ -7,8 +7,13 @@ real datasets nor ``~/openprice/parquet`` are touched.
 from __future__ import annotations
 
 import csv
+import email.message
+import hashlib
+import io
 import json
 import math
+import sys
+import urllib.error
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -884,6 +889,152 @@ class TestChainlinkPhases:
         res = [r for r in sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0, 2: 300}, head=900))
                if r.rel == "link/chainlink_link_usd.csv"][0]
         assert res.dups_removed == 1
+
+
+# --- Phase table published with a data version, strict sync, RPC client (v3.1.1) ------------------------------
+
+CHECKED = (T0 + timedelta(seconds=BLOCK_S * 900)).isoformat()   # the chain head of FakeRpc(..., head=900)
+
+
+def _phase_table(tmp_path: Path, rows: list[list], name: str = "phases.csv",
+                 header=("fichier", "proxy", "phase", "premier_bloc", "horodatage_utc")) -> tuple[Path, str]:
+    """A phase table as published with the evaluated data version (French headers), and its SHA-256."""
+    p = tmp_path / name
+    with p.open("w", newline="") as f:
+        w = csv.writer(f, lineterminator="\n")
+        w.writerow(header)
+        w.writerows(rows)
+    return p, hashlib.sha256(p.read_bytes()).hexdigest()
+
+
+def _switch_rows(proxy: str = PROXY) -> list[list]:
+    """The switches of FakeRpc({1: 0, 2: 300}), as the published table writes them."""
+    return [["link/chainlink_link_usd.csv", proxy, p, b, (T0 + timedelta(seconds=BLOCK_S * b)).isoformat()]
+            for p, b in ((1, 0), (2, 300))]
+
+
+class TestPublishedPhaseTable:
+    def test_the_table_gives_the_store_and_the_answers_of_an_on_chain_read(self, v3cfg, tmp_path, monkeypatch):
+        monkeypatch.delenv(v3cfg.v3.rpc_url_env, raising=False)
+        _phase_feed(v3cfg)
+        sync_mod.run_sync(v3cfg, rpc=FakeRpc({1: 0, 2: 300}, head=900))
+        on_chain = sync_mod.load_manifest(v3cfg.v3.parquet_path)
+        minutes = (47, 62, 126, 190)   # phase 1, phase 2, a tie of phase 2, after the check (unverified)
+        expected = [service_mod.Service(v3cfg).price_at("LINK", T0 + timedelta(minutes=m))[0].model_dump(mode="json")
+                    for m in minutes]
+        v3cfg.v3.parquet_root = str(tmp_path / "parquet_from_table")   # a fresh store from the same CSV, no node
+        store_mod.reset_store(); service_mod.reset_service()
+        path, sha = _phase_table(tmp_path, _switch_rows())
+        res = sync_mod.run_sync(v3cfg, phase_table=(sync_mod.load_phase_table(path, sha, CHECKED), "test table"))
+        assert any("taken from test table for 1 of 1 feeds (no RPC call)" in n for r in res for n in r.notes)
+        m = sync_mod.load_manifest(v3cfg.v3.parquet_path)
+        cl = m["datasets"]["link/chainlink_link_usd.csv"]["chainlink"]
+        assert cl["status"] == "ok" and sync_mod.phase_problems(m["datasets"]) == []
+        assert cl["switches"] == on_chain["datasets"]["link/chainlink_link_usd.csv"]["chainlink"]["switches"]
+        assert cl["verified_ts"] == on_chain["datasets"]["link/chainlink_link_usd.csv"]["chainlink"]["verified_ts"]
+        assert m["version"] == on_chain["version"]   # the switches enter the data version, not where they came from
+        got = [service_mod.Service(v3cfg).price_at("LINK", T0 + timedelta(minutes=m))[0].model_dump(mode="json")
+               for m in minutes]
+        for d in got + expected:   # the second store has another parquet_root, one of the hashed parameters
+            d["provenance"].pop("config_sha256")
+        assert got == expected
+        assert "chainlink_phase_unverified" in [w["code"] for w in got[-1]["warnings"]]
+
+    def test_a_table_that_does_not_match_is_refused(self, tmp_path):
+        path, sha = _phase_table(tmp_path, _switch_rows())
+        with pytest.raises(ValueError, match="SHA-256"):
+            sync_mod.load_phase_table(path, "0" * 64, CHECKED)
+        with pytest.raises(ValueError, match="time zone"):
+            sync_mod.load_phase_table(path, sha, "2024-01-01T03:00:00")
+        before_switch = (T0 + timedelta(seconds=BLOCK_S * 299)).isoformat()
+        with pytest.raises(ValueError, match="after --phase-table-checked-at"):
+            sync_mod.load_phase_table(path, sha, before_switch)
+        gap = _switch_rows()
+        gap[1][2] = 3
+        with pytest.raises(ValueError, match="without gap"):
+            sync_mod.load_phase_table(*_phase_table(tmp_path, gap, "gap.csv"), CHECKED)
+        english = _phase_table(tmp_path, _switch_rows(), "english.csv",
+                               header=("file", "proxy", "phase", "first_block", "first_block_utc"))
+        table = sync_mod.load_phase_table(*english, CHECKED)
+        assert [s["block"] for s in table["link/chainlink_link_usd.csv"]["switches"]] == [0, 300]
+
+    def test_strict_sync_fails_when_a_feed_has_no_phase_table(self, v3cfg, tmp_path, monkeypatch, capsys):
+        monkeypatch.delenv(v3cfg.v3.rpc_url_env, raising=False)
+        _phase_feed(v3cfg)
+        monkeypatch.setattr(sys, "argv", ["sync"])
+        sync_mod.main()                                    # without --strict: a warning only
+        assert "is not set" in capsys.readouterr().out
+        monkeypatch.setattr(sys, "argv", ["sync", "--strict"])
+        with pytest.raises(SystemExit) as e:
+            sync_mod.main()
+        assert e.value.code == 2
+        assert "link/chainlink_link_usd.csv (rpc_not_configured)" in capsys.readouterr().err
+        path, sha = _phase_table(tmp_path, _switch_rows(proxy="0x" + "bb" * 20))   # another proxy
+        monkeypatch.setattr(sys, "argv", ["sync", "--strict", "--phase-table", str(path), "--phase-table-sha256", sha,
+                                          "--phase-table-checked-at", CHECKED])
+        with pytest.raises(SystemExit) as e:
+            sync_mod.main()
+        assert e.value.code == 2 and "(phase_table_mismatch)" in capsys.readouterr().err
+        path, sha = _phase_table(tmp_path, _switch_rows(), "right.csv")
+        monkeypatch.setattr(sys, "argv", ["sync", "--strict", "--phase-table", str(path), "--phase-table-sha256", sha,
+                                          "--phase-table-checked-at", CHECKED])
+        sync_mod.main()                                    # the right table: no error
+        monkeypatch.setattr(sys, "argv", ["sync", "--phase-table", str(path)])
+        with pytest.raises(SystemExit) as e:               # the table needs its SHA-256 and its check time
+            sync_mod.main()
+        assert e.value.code == 2
+
+
+class TestRpcClient:
+    @staticmethod
+    def _urlopen(answers: list, seen: list):
+        def fake(req, timeout):
+            seen.append(req)
+            a = answers.pop(0)
+            if isinstance(a, Exception):
+                raise a
+            return io.BytesIO(json.dumps(a).encode())
+        return fake
+
+    def test_every_call_carries_a_user_agent(self, monkeypatch):
+        from app.v3 import chainlink_phases as cp
+        seen: list = []
+        monkeypatch.setattr(cp.urllib.request, "urlopen", self._urlopen([{"result": "0x10"}], seen))
+        assert cp.Rpc("http://node.invalid").block_number() == 16
+        assert seen[0].get_header("User-agent") == cp.USER_AGENT
+
+    def test_a_call_refused_for_its_rate_is_retried(self, monkeypatch):
+        from app.v3 import chainlink_phases as cp
+        hdrs = email.message.Message()
+        hdrs["Retry-After"] = "3"
+        answers = [urllib.error.HTTPError("http://node.invalid", 429, "Too Many Requests", hdrs, None),
+                   {"error": {"code": -32005, "message": "rate limit exceeded"}},
+                   {"result": "0x10"}]
+        waits: list = []
+        monkeypatch.setattr(cp.urllib.request, "urlopen", self._urlopen(answers, []))
+        rpc = cp.Rpc("http://node.invalid", sleep=waits.append)
+        assert rpc.block_number() == 16
+        assert (rpc.calls, rpc.retries, waits) == (1, 2, [3.0, 2.0])
+
+    def test_a_refusal_is_not_retried_and_the_error_never_shows_the_url(self, monkeypatch):
+        from app.v3 import chainlink_phases as cp
+        url = "https://node.invalid/v1/SECRET-TOKEN"
+        answers = [urllib.error.HTTPError(url, 403, "Forbidden", email.message.Message(), None)]
+        waits: list = []
+        monkeypatch.setattr(cp.urllib.request, "urlopen", self._urlopen(answers, []))
+        with pytest.raises(cp.RpcError) as e:
+            cp.Rpc(url, sleep=waits.append).block_number()
+        assert str(e.value) == "eth_blockNumber: HTTP 403" and waits == []
+
+    def test_retries_stop_after_max_attempts(self, monkeypatch):
+        from app.v3 import chainlink_phases as cp
+        answers = [urllib.error.HTTPError("http://node.invalid", 503, "Unavailable", email.message.Message(), None)
+                   for _ in range(3)]
+        waits: list = []
+        monkeypatch.setattr(cp.urllib.request, "urlopen", self._urlopen(answers, []))
+        with pytest.raises(cp.RpcError, match="HTTP 503"):
+            cp.Rpc("http://node.invalid", max_attempts=3, sleep=waits.append).block_number()
+        assert waits == [1.0, 2.0]
 
 
 # ---------------------------------------------------------------------------

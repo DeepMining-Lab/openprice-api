@@ -278,9 +278,11 @@ class SLiqLegV3(BaseModel):
                                                   "leg's TVL when that TVL is in ETH).")
     tvl_usd: float | None = Field(None, description="TVL that S_TVL scores.")
     slippage_column: str | None = Field(None, description="CSV column holding the slippage.", examples=["slip_1k"])
-    slippage: float | None = Field(None, description="Relative price impact of the extraction's reference order, as "
-                                                     "read in the row (0.0032 = 0.32 %). Null when the column is "
-                                                     "empty: the leg value is then s_tvl alone.",
+    slippage: float | None = Field(None, description="Relative cost of the extraction's reference order (1 000 USDC "
+                                                     "or USDT on a pool quoted in a stablecoin, 1 WETH on a TOKEN/WETH "
+                                                     "pool), pool fee included, as read in the row (0.0032 = 0.32 %): "
+                                                     "1 - received / expected at the block's reference price. Null "
+                                                     "when the column is empty: the leg value is then s_tvl alone.",
                                    examples=[0.0031904093500543])
     s_tvl: float | None = Field(None, description="TVL score in [0, 1], computed from tvl_usd with tvl_score_mode.",
                                 examples=[1.0])

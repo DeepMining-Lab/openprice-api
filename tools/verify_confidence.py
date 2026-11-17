@@ -22,6 +22,9 @@ rule the record names). The CSV files are read as the API reads them: rows with 
 and duplicated events are dropped (same transaction hash and log index for a swap, same phase and round for a
 Chainlink answer; the first CSV row is kept).
 
+Numbers are compared with a relative tolerance of 1e-12 (``REL_TOL``), so that a port of these formulas to another
+language passes; ``--strict`` compares them exactly (tolerance 0): with Python, the record is recomputed bit for bit.
+
 Exit status: 0 when every check passes, 1 otherwise.
 """
 
@@ -37,7 +40,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-REL_TOL = 1e-12  # another language's exp/log/pow may differ from Python's in the last bits
+REL_TOL = 1e-12  # another language's exp/log/pow may differ from Python's in the last bits; --strict sets it to 0
 
 
 def same(a: Any, b: Any) -> bool:
@@ -427,8 +430,12 @@ def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("files", nargs="+", help="response files (JSON, JSON array or JSON lines); '-' reads stdin")
     ap.add_argument("--data", metavar="DIR", help="also check the inputs against the dataset CSV files in DIR")
+    ap.add_argument("--strict", action="store_true",
+                    help="compare numbers exactly (tolerance 0) instead of within a relative 1e-12")
     ap.add_argument("-v", "--verbose", action="store_true", help="list every check")
     args = ap.parse_args(argv)
+    global REL_TOL
+    REL_TOL = 0.0 if args.strict else 1e-12
 
     responses = load_responses(args.files)
     reports: list[Report] = []
@@ -470,7 +477,8 @@ def main(argv: list[str] | None = None) -> int:
             print(f"     {'ok ' if ok else 'BAD'} {name}" + (f": {detail}" if detail else ""))
     checked = sum(1 for r in reports if r.checks)
     print(f"{checked} response(s) checked, {failed} with a failed check"
-          + (f", {len(reports) - checked} without an index" if len(reports) > checked else ""))
+          + (f", {len(reports) - checked} without an index" if len(reports) > checked else "")
+          + (" (strict: exact equality)" if args.strict else ""))
     return 1 if failed else 0
 
 

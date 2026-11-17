@@ -79,7 +79,8 @@ Sub-minute granularity is intentionally excluded: Ethereum blocks are ~12 s apar
 For each `(asset, T, granularity)`, the pipeline:
 
 1. Selects the best non-zombie pool (same pool-selection logic as the source hierarchy).
-2. Queries all swaps in `[T − Δ/2, T + Δ/2]`.
+2. Queries all swaps in `[T − Δ/2, T + Δ/2)`: the start is included, the end excluded (`window_bound_policy` =
+   `left_closed_right_open` in the provenance).
 3. Applies the MAD outlier filter with `sigma_mad` from config. The filter removes isolated outliers when the window
    holds at least three swaps and a majority of organic ones. It does not protect a window dominated by a sandwich
    attack: see the case of 2 May 2022 (COMP, block 14696909), where the three swaps of the window are those of the
@@ -105,7 +106,7 @@ If no swap is found in the initial window, the pipeline expands progressively:
 | `hour` | 1 h → 2 h → 4 h → 8 h |
 | `day` | no expansion: falls directly to the next source level |
 
-After all expansion steps are exhausted, the pipeline falls to the next branch level (`0a → 0b → 2 → 3 → 4`).
+After all expansion steps are exhausted, the pipeline falls to the next branch level (`0a → 0b → 1 → 2 → 3 → 4`).
 
 ### Response fields (windowed granularities)
 
@@ -159,7 +160,6 @@ requires for evidentiary use (mémoire §6.2.5):
 |---------------|---------|
 | `observed` | Price found directly in the initial target window (or raw point read) |
 | `reconstructed` | Price obtained only after the window had to expand (R1, `expansion_step ≥ 1`) |
-| `rejected_outlier` | Every swap in the window was flagged by the MAD filter; the value is the unfiltered fallback and should be treated with caution |
 | `oracle_fallback` | Chainlink oracle (level 3): no viable DEX source |
 | `unavailable` | No reliable source (level 4); `price_usd` is `null` |
 
@@ -264,10 +264,20 @@ with:
 slip_max = 0.005
 ```
 
-`slip(T)` is read from the `slip_1k` column when present (1 000 USD
-reference order). If `slip_1k` is absent, `slip_10k` is used as the
-canonical fallback. The absolute value is applied defensively; slippage
-values are stored as decimals in the CSV files.
+`slip(T)` is the simulated execution cost of the extraction's reference order, read in the `slip_1k` column of
+the row: `1 − received / expected`, where "received" is what the pool returns for the order (QuoterV2
+`quoteExactInputSingle` with the pool's fee tier on Uniswap V3, the constant-product formula with its 997/1000 fee
+factor on Uniswap V2 and SushiSwap V2, `get_dy` on Curve) and "expected" is the order converted at the block's
+reference price. The order is fixed by the extraction script: 1 000 units of the quote stablecoin (USDC, USDT, or
+crvUSD on Curve) on a pool quoted in a stablecoin, 1 WETH on a TOKEN/WETH or TOKEN/ETH pool. **The cost includes the
+pool fee**, and the API uses the value as it is (it does not remove the fee). On a Uniswap V3 pool the reference
+price is the pool's price after the block's last swap, so the fee is a floor: S_slip cannot exceed
+`exp(−0.0005 / 0.005)` = 0.905 on the ETH/USDC 0.05 % pool and `exp(−0.003 / 0.005)` = 0.549 on a 0.3 % pool. On a
+Uniswap V2 or SushiSwap V2 pool the reference price is the execution price of the block's last swap, which already
+includes the fee in that swap's direction, so the cost can fall below the fee. The column is chosen
+per file, from its header: `slip_1k`, or `slip_10k` for a file without `slip_1k`; an empty `slip_1k` value (before
+QuoterV2, deployed in December 2021) is not replaced by `slip_10k`, and the leg's S_liq is then S_TVL alone. The
+absolute value is applied defensively; slippage values are stored as decimals in the CSV files.
 
 ```
 S_liq = sqrt(S_TVL × S_slip)
@@ -685,6 +695,10 @@ several market-stress dates (LUNA, the Aug-2024 flash crash, the Mar-2023 USDC d
   The confidence calibration of 2026-10-29 then changes 230: 224 S_coh and C values and 28 `fragility_flag`
   values (and the threshold reported in 74 `hour`/`minute`/`day` responses); no price, source level or warning.
   `v3_golden.jsonl` pins V3 as configured;
+* `v3_golden_provenance.jsonl` holds the same 245 responses with their provenance record, as `capture_v3.py`
+  captured them on `v3.1.0` (commit `36eea1b`, data version `5e73d650a7a4a2aa`). `tests/test_v3_golden_provenance.py`
+  runs the published verifier on them without the data: `tools/verify_confidence.py --strict` recomputes the 233
+  indices exactly (the 12 others have no index: 6 Chainlink prices, level `3`, and 6 typed nulls, level `4`);
 * `tests/test_v3_oracle.py` recomputes S_stat and the day VWMP in plain Python from the stored rows on the dates
   of the validity audit (S_stat 0.840, 0.872 and 0.944 on 2022-05-12, 2024-08-05 and 2025-06-01, where V1/V2
   gave 0.000, 0.000 and 0.837), and `tests/test_v3_docs.py` checks that this README states the parameters of
@@ -696,11 +710,18 @@ store and the golden files are present (`OPENPRICE_CONFIG` selects another store
 ### Build and run
 
 ```bash
-.venv/bin/python -m app.v3.sync        # ~2 min the first time; then incremental
+export OPENPRICE_RPC_URL=<Ethereum node that serves historical state>   # for the Chainlink phase switches
+.venv/bin/python -m app.v3.sync --strict  # ~2 min the first time; then incremental
 .venv/bin/uvicorn app.main:app         # /v3/... is served next to /v1 and /v2
 curl "http://127.0.0.1:8000/v3/prices/LINK/at?timestamp=2025-06-01T12:00:00Z"
 curl  http://127.0.0.1:8000/v3/ready
 ```
+
+`--strict` makes the sync exit with status 2 when the Chainlink phase switches of a feed could not be read (no
+node, or a node that refuses the calls): without them the API flags its Chainlink reads `chainlink_phase_unverified`
+and can serve rounds of a phase the proxy did not serve (see [Chainlink aggregator phases](#chainlink-aggregator-phases)).
+A free public provider is enough: the sync sends a `User-Agent` and retries a call refused for its rate. Without any
+node, give the phase table published with a data version (`--phase-table`, below).
 
 | Endpoint | Description |
 |---|---|
@@ -900,7 +921,29 @@ one the proxy did not serve.
 Among rounds of the served phase sharing a timestamp, the latest round wins (what the proxy returned).
 
 The sync reads the switches through the node URL in `$OPENPRICE_RPC_URL` (`v3.rpc_url_env`), which is never
-written to a file of the repository or of the store; the API itself never calls the node.
+written to a file of the repository or of the store; the API itself never calls the node. Every call carries a
+`User-Agent` (several public providers answer HTTP 403 without one), and a call refused for its rate (HTTP 429,
+502, 503, 504 or a JSON-RPC rate-limit error) is retried up to 8 times, after the node's `Retry-After` or after 1, 2,
+4... s (30 s at most).
+
+Without a node, the switches can be taken from a published table instead (no RPC call):
+
+```bash
+curl -fsSO https://fair.deepmining.ch/versions/a87252328cd8246d/table_des_phases_chainlink.csv
+.venv/bin/python -m app.v3.sync --strict \
+  --phase-table table_des_phases_chainlink.csv \
+  --phase-table-sha256 36ff68b9284eb5323c2f6af9205854f95e3a4afd759a680037fcf322e473fb5a \
+  --phase-table-checked-at 2026-11-01T20:30:35Z
+```
+
+The table has one row per switch (dataset file, proxy, phase, first block, UTC time of that block). The one
+published with the data version `a87252328cd8246d` names the columns `fichier, proxy, phase, premier_bloc,
+horodatage_utc` and lists 40 switches of the 7 feeds; `2026-11-01T20:30:35Z` is the last on-chain check recorded in
+that version's manifest. The sync refuses a file whose SHA-256 is not the one given,
+a feed whose proxy differs from the data, phases that are not 1, 2, ... in time order, and a switch after
+`--phase-table-checked-at`, the chain time up to which the table is known complete: it becomes the feed's
+`verified_ts`, as after an on-chain check, so a Chainlink read after it carries `chainlink_phase_unverified`. The
+switches enter the data version (`file_version`) exactly as when they are read on-chain; the check time does not.
 
 ### How the store works
 
